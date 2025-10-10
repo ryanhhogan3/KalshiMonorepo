@@ -1,6 +1,6 @@
 import websockets
 import asyncio
-import env_auth_headers 
+from auth import env_auth_headers 
 
 # WebSocket URL
 ws_url = "wss://demo-api.kalshi.co/trade-api/ws/v2"  # Demo environment
