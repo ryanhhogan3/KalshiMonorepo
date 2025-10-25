@@ -11,3 +11,4 @@ venv/
 .venv/
 env/
 ENV/
+secrets/
