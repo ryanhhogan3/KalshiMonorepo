@@ -18,6 +18,11 @@ class ClickHouseSink:
         host = p.hostname or "localhost"
         port = p.port or (8443 if scheme == "https" else 8123)
 
+        # column orders to keep ClickHouse happy
+        self._cols_ev = ["type","sid","seq","market_id","market_ticker","side","price","qty","ts","ingest_ts"]
+        self._cols_lt = ["market_id","market_ticker","side","price","size","ts","ingest_ts"]
+
+
         # Build client using host/port (no url=)
         # interface http covers both http and https automatically
         self.client = clickhouse_connect.get_client(
@@ -60,15 +65,64 @@ class ClickHouseSink:
         if len(self._buf_ev["type"]) >= self.batch_rows or (now - self._t) >= self.flush_secs:
             await self.flush()
 
+    def _insert_compat(self, table: str, buf: dict, cols: list[str]):
+        """
+        Handle different clickhouse-connect versions:
+        1) Try column-oriented kw 'columnar' (newer)
+        2) Try 'column_oriented' (older)
+        3) Fallback to row-oriented data
+        """
+        data_cols = [buf[c] for c in cols]           # list of columns
+        try:
+            # newer versions
+            self.client.insert(
+                table, data_cols,
+                column_names=cols,
+                columnar=True,
+                database=self.client.database,
+            )
+            return
+        except TypeError:
+            pass
+        try:
+            # some older versions used 'column_oriented'
+            self.client.insert(
+                table, data_cols,
+                column_names=cols,
+                column_oriented=True,
+                database=self.client.database,
+            )
+            return
+        except TypeError:
+            pass
+        # Oldest versions: only row-oriented supported
+        rows = list(zip(*data_cols))                 # transpose to rows
+        self.client.insert(
+            table, rows,
+            column_names=cols,
+            database=self.client.database,
+        )
+
+
     async def flush(self):
-        # Flush events
+        # events buffer
         if self._buf_ev["type"]:
             b = self._buf_ev
             self._buf_ev = self._new_ev()
             self._t = asyncio.get_event_loop().time()
-            self.client.insert(self.table_events, b, database=self.client.database)
-        # Flush latest_levels
+            try:
+                self._insert_compat(self.table_events, b, self._cols_ev)
+            except Exception as e:
+                print(f"[CH][events] insert failed: {e!r}; rows={len(b['type'])}")
+                raise
+
+        # latest_levels buffer
         if self._buf_lt["market_id"]:
             b = self._buf_lt
             self._buf_lt = self._new_lt()
-            self.client.insert(self.table_latest, b, database=self.client.database)
+            try:
+                self._insert_compat(self.table_latest, b, self._cols_lt)
+            except Exception as e:
+                print(f"[CH][latest] insert failed: {e!r}; rows={len(b['market_id'])}")
+                raise
+
