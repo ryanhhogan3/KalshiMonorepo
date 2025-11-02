@@ -1,13 +1,15 @@
-# market_worker.py
+import os, sys, asyncio, json, time, sys
 import argparse
-import asyncio
-import json
-import os
-import sys
-import time
+from kalshi.websocket.ws_runtime import KalshiWSRuntime
 from typing import Optional
+from kalshi.websocket.order_book import OrderBook
 
-from ws_runtime import KalshiWSRuntime, build_orderbook_subscribe
+THIS_DIR = os.path.dirname(__file__)
+SRC_ROOT = os.path.abspath(os.path.join(THIS_DIR, "..", ".."))
+if SRC_ROOT not in sys.path:
+    sys.path.append(SRC_ROOT)
+
+#if you’re using the new subscribe helper, import it too (optional)
 
 DEFAULT_TICKER = "KXBTCMAXY-25-DEC31-129999.99"
 
@@ -32,20 +34,22 @@ class MarketWorker:
         self.ndjson_path = ndjson_path
 
         self.rt = KalshiWSRuntime()
+        self._have_snapshot = set()
+        self._sid_for_ticker = {}
         self._tasks: list[asyncio.Task] = []
         self._stopping = asyncio.Event()
         self._last_print_ts = 0.0
         self._ndjson_fp = None
 
     async def start(self):
-        if self.ndjson_path:
-            os.makedirs(os.path.dirname(self.ndjson_path), exist_ok=True)
-            self._ndjson_fp = open(self.ndjson_path, "a", encoding="utf-8")
-
         await self.rt.start()
-        await asyncio.sleep(1.0)  # allow connect
-        await self.rt.send(build_orderbook_subscribe(ticker=self.ticker))
+        # 1) start consumer first
         self._tasks.append(asyncio.create_task(self._consumer(), name="consumer"))
+        await asyncio.sleep(0.2)  # tiny settle, optional
+
+        # 2) then subscribe
+        print(f"[WS] subscribing to {self.ticker}")
+        await self.rt.subscribe_markets([self.ticker])
 
     async def stop(self):
         self._stopping.set()
@@ -58,42 +62,58 @@ class MarketWorker:
         await self.rt.stop()
 
     async def _consumer(self):
-        """Print-only consumer (no DB)."""
-        min_interval = 1.0 / self.rate_limit_hz if self.rate_limit_hz else 0.0
-
         while not self._stopping.is_set():
             try:
                 raw = await self.rt.queue.get()
+                m = json.loads(raw)
+                typ = m.get("type")
 
-                # optional capture
-                if self._ndjson_fp:
-                    self._ndjson_fp.write(raw)
-                    if not raw.endswith("\n"):
-                        self._ndjson_fp.write("\n")
-
-                # rate limit prints if requested
-                now = time.time()
-                if min_interval and (now - self._last_print_ts) < min_interval:
-                    continue
-                self._last_print_ts = now
-
-                if self.raw:
-                    sys.stdout.write(raw + ("\n" if not raw.endswith("\n") else ""))
-                    sys.stdout.flush()
+                if typ == "subscribed":
+                    sid = m["msg"]["sid"]
+                    # start a short timer to verify snapshot arrives
+                    asyncio.create_task(self._ensure_snapshot(sid))
+                    print(f"[SUB] sid={sid}")
                     continue
 
-                try:
-                    msg = json.loads(raw)
-                except Exception:
-                    print(raw)
+                if typ == "orderbook_snapshot":
+                    sid = m["sid"]
+                    self._have_snapshot.add(sid)
+                    # (optional) remember which ticker if present on snapshot
+                    if "market_ticker" in m.get("msg", {}):
+                        self._sid_for_ticker[sid] = m["msg"]["market_ticker"]
+                    print(f"[SNAP] sid={sid} seq={m['seq']}")
+                    # (you can also pretty-print the snapshot here if you want)
                     continue
 
-                print(_json_dumps(msg, pretty=self.pretty))
+                if typ == "orderbook_delta":
+                    sid = m["sid"]
+                    if sid not in self._have_snapshot:
+                        # got a delta before seeing the snapshot → force a resubscribe to get a fresh snapshot
+                        print(f"[WARN] delta before snapshot (sid={sid}, seq={m.get('seq')}). Resubscribing…")
+                        await self.rt.subscribe_markets([self.ticker])
+                        continue
+                    # normal delta handling/printing
+                    print(json.dumps(m, separators=(",", ":")))
+                    continue
+
+                if typ == "error":
+                    print(f"[ERR] {json.dumps(m, separators=(',',':'))}")
+                    continue
+
+                # default: print unknown frames for visibility
+                print(json.dumps(m, separators=(",", ":")))
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"[worker] consumer error: {e!r}", file=sys.stderr)
+                print(f"[worker] consumer error: {e!r}")
+
+    async def _ensure_snapshot(self, sid: int, timeout: float = 1.0):
+        await asyncio.sleep(timeout)
+        if sid not in self._have_snapshot:
+            print(f"[WARN] no snapshot within {timeout:.1f}s for sid={sid}. Resubscribing…")
+            await self.rt.subscribe_markets([self.ticker])
+
 
 async def main():
     parser = argparse.ArgumentParser()
