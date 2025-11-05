@@ -46,9 +46,11 @@ async def main():
 
     rt = KalshiWSRuntime()
     ch = ClickHouseSink()  # hot
-    pq = ParquetSink(os.getenv("PARQUET_DIR","./data"),
-                     rotate_secs=float(os.getenv("PARQUET_ROTATE_SECS","300")),
-                     max_rows=int(os.getenv("PARQUET_MAX_ROWS","250000")))  # cold
+    pq = ParquetSink(os.getenv("PARQUET_DIR", "./data"),
+        max_bytes=100*1024*1024,  # or set from env if you want
+        size_check_every=1000,    # optional, can be set from env
+        compression_ratio=0.35    # optional, can be set from env
+    )
     print(f"[RUN] markets={tickers}")
 
     await rt.start()
