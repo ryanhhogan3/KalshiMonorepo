@@ -31,8 +31,8 @@ if SRC_ROOT not in sys.path:
 
 from databases.processing.clickhouse_sink import ClickHouseSink
 from databases.processing.parquet_sink import ParquetSink
-from kalshi.websocket.ws_runtime import KalshiWSRuntime
-from kalshi.websocket.order_book import OrderBook
+from kalshifolder.websocket.ws_runtime import KalshiWSRuntime
+from kalshifolder.websocket.order_book import OrderBook
 
 def now_utc(): return datetime.now(timezone.utc)
 

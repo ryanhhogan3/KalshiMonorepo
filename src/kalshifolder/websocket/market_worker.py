@@ -1,8 +1,8 @@
 import os, sys, asyncio, json, time, sys
 import argparse
-from kalshi.websocket.ws_runtime import KalshiWSRuntime
+from kalshifolder.websocket.ws_runtime import KalshiWSRuntime
 from typing import Optional
-from kalshi.websocket.order_book import OrderBook
+from kalshifolder.websocket.order_book import OrderBook
 
 THIS_DIR = os.path.dirname(__file__)
 SRC_ROOT = os.path.abspath(os.path.join(THIS_DIR, "..", ".."))
