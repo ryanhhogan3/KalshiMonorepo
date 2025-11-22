@@ -3,6 +3,8 @@ import asyncio, os
 from datetime import datetime, timezone
 import urllib.parse as up
 import clickhouse_connect
+from .clickhouse_bootstrap import ensure_clickhouse_schema
+from .clickhouse_health import assert_clickhouse_ready
 
 
 class ClickHouseSink:
@@ -33,6 +35,20 @@ class ClickHouseSink:
             database=db,
             interface="http",
             secure=(scheme == "https"),
+        )
+
+        self.client = clickhouse_connect.get_client(...)
+
+        # Ensure schema exists and matches what this sink expects
+        ensure_clickhouse_schema(self.client, db=db)
+
+        # Fail-fast if ClickHouse is in a bad state (e.g., broken parts)
+        max_broken = int(os.getenv("CH_MAX_BROKEN_PARTS", "0"))
+        assert_clickhouse_ready(
+            self.client,
+            db=db,
+            tables=("orderbook_events", "latest_levels"),
+            max_broken_parts=max_broken,
         )
 
         self.table_events = "orderbook_events"
