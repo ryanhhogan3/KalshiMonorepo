@@ -2,6 +2,10 @@ import os, sys, asyncio
 from datetime import datetime, timezone
 from dotenv import load_dotenv, find_dotenv
 from typing import Dict
+from databases.processing.clickhouse_sink import ClickHouseSink
+from databases.processing.parquet_sink import ParquetSink
+from kalshifolder.websocket.ws_runtime import KalshiWSRuntime
+from kalshifolder.websocket.order_book import OrderBook
 
 
 # JSON loader (fast path if orjson is available)
@@ -29,10 +33,6 @@ SRC_ROOT = os.path.abspath(os.path.join(THIS_DIR, "..", ".."))
 if SRC_ROOT not in sys.path:
     sys.path.append(SRC_ROOT)
 
-from databases.processing.clickhouse_sink import ClickHouseSink
-from databases.processing.parquet_sink import ParquetSink
-from kalshifolder.websocket.ws_runtime import KalshiWSRuntime
-from kalshifolder.websocket.order_book import OrderBook
 
 def now_utc(): return datetime.now(timezone.utc)
 
