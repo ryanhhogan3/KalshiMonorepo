@@ -36,9 +36,6 @@ class ClickHouseSink:
             interface="http",
             secure=(scheme == "https"),
         )
-
-        self.client = clickhouse_connect.get_client(...)
-
         # Ensure schema exists and matches what this sink expects
         ensure_clickhouse_schema(self.client, db=db)
 
