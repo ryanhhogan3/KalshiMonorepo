@@ -21,6 +21,25 @@ from clickhouse_connect.driver.exceptions import DatabaseError, OperationalError
 
 log = logging.getLogger(__name__)
 
+def _has_system_broken_parts(client: Client) -> bool:
+    """
+    Return True if system.broken_parts exists in this ClickHouse instance.
+    Some builds / configs may not have it, in which case we should skip
+    broken-parts checks instead of failing health.
+    """
+    try:
+        result = client.query(
+            """
+            SELECT count(*)
+            FROM system.tables
+            WHERE database = 'system' AND name = 'broken_parts'
+            """
+        )
+        return result.result_rows[0][0] > 0
+    except (DatabaseError, OperationalError):
+        # If even this small check fails, assume it's not usable.
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -124,9 +143,16 @@ def check_broken_parts(
     """
     Check that the number of broken parts in MergeTree tables is <= max_broken_parts.
 
-    A non-zero count of broken parts is often a sign of corruption or rough shutdown.
-    For mission-critical contexts, it's reasonable to demand exactly 0.
+    If system.broken_parts is not available in this ClickHouse build/config,
+    we log a warning and skip this check (returning no issues).
     """
+    # First, see if this CH instance even has system.broken_parts
+    if not _has_system_broken_parts(client):
+        msg = "system.broken_parts is not available; skipping broken parts health check"
+        log.warning(msg)
+        # Not considered a health failure; just no signal.
+        return []
+
     table_list = list(tables)
     if not table_list:
         return []
@@ -145,6 +171,8 @@ def check_broken_parts(
             parameters={"db": db},
         )
     except (DatabaseError, OperationalError) as exc:
+        # At this point we know the table SHOULD exist, so if it fails now,
+        # treat this as a health issue.
         msg = f"Broken parts check failed: {exc}"
         log.error(msg)
         return [msg]
