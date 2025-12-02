@@ -1,0 +1,75 @@
+# Docker Compose for local development and testing
+
+version: '3.8'
+
+services:
+  # ClickHouse database
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    environment:
+      CLICKHOUSE_DB: kalshi
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: default_password
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./src/databases/storage/clickhouse_ddl.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Kalshi streamer application
+  streamer:
+    build: .
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      # Credentials (load from .env file)
+      PROD_KEYID: ${PROD_KEYID}
+      PROD_KEYFILE: ${PROD_KEYFILE}
+      
+      # Markets
+      MARKET_TICKERS: ${MARKET_TICKERS:-KXBTCMAXY-25-DEC31-129999.99,FEDFUNDS-DEC25}
+      
+      # WebSocket
+      WS_URL: ${WS_URL:-wss://api.elections.kalshi.com/trade-api/ws/v2}
+      WS_HOSTNAME: ${WS_HOSTNAME:-api.elections.kalshi.com}
+      
+      # ClickHouse (use 'clickhouse' as hostname inside Docker network)
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-default_password}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-kalshi}
+
+      CH_URL: http://clickhouse:8123
+      CH_USER: ${CLICKHOUSE_USER:-default}
+      CH_PASSWORD: ${CLICKHOUSE_PASSWORD:-default_password}
+      
+      # Batching
+      BATCH_ROWS: ${BATCH_ROWS:-2000}
+      BATCH_FLUSH_SECS: ${BATCH_FLUSH_SECS:-0.010}
+      
+      # Parquet
+      PARQUET_DIR: ${PARQUET_DIR:-/app/data}
+      
+      # Optional
+      USE_ORJSON: ${USE_ORJSON:-1}
+    volumes:
+      # Mount data directory for persistent Parquet files
+      - ./data:/app/data
+      # Mount .env file (read-only)
+      - ./.env:/app/.env:ro
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  clickhouse_data:
