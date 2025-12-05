@@ -1,10 +1,9 @@
 # Docker Compose for local development and testing
 
-version: '3.8'
-
 services:
   # ClickHouse database
   clickhouse:
+    container_name: clickhouse
     image: clickhouse/clickhouse-server:latest
     ports:
       - "8123:8123"
@@ -26,6 +25,7 @@ services:
   # Kalshi streamer application
   streamer:
     build: .
+    container_name: kalshi_streamer
     depends_on:
       clickhouse:
         condition: service_healthy
