@@ -395,3 +395,23 @@ This system is a **production-ready, real-time market data ingestion pipeline** 
 - Scales to multiple markets and high-frequency updates
 
 For cloud deployment, ensure ClickHouse is running, credentials are configured, and the application can access both Kalshi's API and your ClickHouse instance.
+
+---
+
+## Failure Behavior
+
+**ClickHouse down or memory errors**
+
+- The streamer continues running and does NOT crash on insert errors.
+- Inserts are retried with exponential backoff on the client side.
+- If a batch is too large and hits `MEMORY_LIMIT_EXCEEDED`, the batch is automatically split into smaller batches and retried.
+- After a maximum number of attempts, the batch is dropped and an error is logged with the key `clickhouse_insert_gave_up`.
+- While ClickHouse is unavailable or rejecting inserts, the streamer will continue consuming WebSocket messages; there is currently no upstream backpressure to Kalshi when storage is failing.
+
+**WebSocket disconnected**
+
+- The streamer attempts to reconnect with exponential backoff (1s, 2s, 4s, ... up to a configured cap), with jitter added to avoid reconnection storms.
+- While disconnected, no new events are stored to ClickHouse or Parquet until the connection is re-established and the buffers are flushed.
+- Heartbeat logs (`streamer_heartbeat`) provide periodic visibility into total events processed, insert failures, and last successful insert time to help with debugging and alerting.
+
+All logs include timestamps, log levels, and module names, and are written to rotating files as documented in `LOGGING_GUIDE.md`.
