@@ -79,6 +79,28 @@ async def main():
         snapshots_received = 0
         deltas_received = 0
 
+        # heartbeat / monitoring
+        events_total = 0
+        last_ws_message_ts = None
+
+        async def heartbeat_loop():
+            while True:
+                try:
+                    session_logger.info(
+                        "streamer_heartbeat",
+                        extra={
+                            "events_total": events_total,
+                            "insert_failures": getattr(ch, "insert_failures", None),
+                            "last_insert_ts": str(getattr(ch, "last_insert_ts", None)) if getattr(ch, "last_insert_ts", None) else None,
+                            "last_ws_message_ts": str(last_ws_message_ts) if last_ws_message_ts else None,
+                        },
+                    )
+                except Exception:
+                    logger.exception("Failed to emit heartbeat")
+                await asyncio.sleep(60)
+
+        heartbeat_task = asyncio.create_task(heartbeat_loop())
+
         try:
             while True:
                 raw = await rt.queue.get()
@@ -111,6 +133,7 @@ async def main():
 
                     # emit snapshot rows (immutable truth)
                     ingest_ts = now_utc()
+                    last_ws_message_ts = ingest_ts
                     # ClickHouse (batch)
                     for side in ("yes","no"):
                         for price, size in msg.get(side, []):
@@ -152,6 +175,7 @@ async def main():
 
                     ts = datetime.fromisoformat(msg["ts"].replace("Z","+00:00"))
                     ingest_ts = now_utc()
+                    last_ws_message_ts = ingest_ts
                     
                     session_logger.debug(f"Delta: {ob.ticker} {msg['side']} {msg['price']} delta={msg['delta']} => {abs_size}")
 
@@ -190,6 +214,13 @@ async def main():
             session.log_event(f"Unexpected error in main loop: {e}", level="error")
             raise
         finally:
+            # stop heartbeat
+            try:
+                heartbeat_task.cancel()
+                await heartbeat_task
+            except Exception:
+                pass
+
             session.log_event("Flushing remaining data to sinks...")
             await ch.flush()
             await pq.flush()
