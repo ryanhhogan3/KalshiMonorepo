@@ -16,6 +16,7 @@ services:
     volumes:
       - clickhouse_data:/var/lib/clickhouse
       - ./src/databases/storage/clickhouse_ddl.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./clickhouse_config/memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8123/ping"]
       interval: 5s
@@ -70,6 +71,11 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    healthcheck:
+      test: ["CMD", "python", "-m", "kalshifolder.healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
 volumes:
   clickhouse_data:
