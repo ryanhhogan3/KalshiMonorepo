@@ -1,0 +1,7 @@
+<yandex>
+    <!-- Limit server memory usage to a portion of RAM -->
+    <max_server_memory_usage_to_ram_ratio>0.7</max_server_memory_usage_to_ram_ratio>
+
+    <!-- Per-query memory limit in bytes (~4GB here) -->
+    <max_memory_usage>4000000000</max_memory_usage>
+</yandex>
