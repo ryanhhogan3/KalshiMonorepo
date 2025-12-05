@@ -1,6 +1,8 @@
 # src/kalshi/websocket/ws_runtime.py
-import asyncio, base64, json, os, ssl, time
+import asyncio, base64, json, os, ssl, time, random, logging
 from typing import Dict, Optional
+
+log = logging.getLogger(__name__)
 
 import certifi, websockets
 from websockets.exceptions import ConnectionClosed
@@ -122,11 +124,10 @@ class KalshiWSRuntime:
 
     # ---- loop ----
     async def _run_loop(self):
-        backoff = 0.5
+        backoff = 1.0
         while not self._stop.is_set():
             try:
-                if self.verbose:
-                    print("[WS] connecting...")
+                log.info("ws_connecting", extra={"url": self.ws_url})
                 async with websockets.connect(
                     self.ws_url,
                     additional_headers=self._signed_headers(),  # <-- match name
@@ -138,22 +139,24 @@ class KalshiWSRuntime:
                 ) as ws:
                     self._ws = ws
                     self._connected.set()
-                    if self.verbose:
-                        print("[WS] connected")
-                    backoff = 0.5
+                    log.info("ws_connected")
+                    # reset backoff on successful connection
+                    backoff = 1.0
 
                     async for raw in ws:
                         # raw is a str frame; push to queue
                         await self.queue.put(raw)
 
             except Exception as e:
-                if self.verbose:
-                    print(f"[WS] error: {e!r}")
+                # Log warning with backoff hint and truncated error
+                log.warning("ws_error", extra={"error": str(e)[:500], "backoff_sec": backoff})
             finally:
                 self._ws = None
                 self._connected.clear()
                 if not self._stop.is_set():
-                    await asyncio.sleep(backoff)
+                    # add small jitter to avoid synchronized reconnect storms
+                    sleep_for = backoff + random.uniform(0, backoff * 0.1)
+                    await asyncio.sleep(sleep_for)
                     backoff = min(backoff * 2, self._backoff_max)
 
     # ---- helpers ----
