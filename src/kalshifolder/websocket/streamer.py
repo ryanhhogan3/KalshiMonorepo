@@ -6,6 +6,8 @@ from databases.processing.clickhouse_sink import ClickHouseSink
 from databases.processing.parquet_sink import ParquetSink
 from kalshifolder.websocket.ws_runtime import KalshiWSRuntime
 from kalshifolder.websocket.order_book import OrderBook
+from logging_config import get_logger, setup_session_logger
+from workflow_logger import AsyncWorkflowSession
 
 
 # JSON loader (fast path if orjson is available)
@@ -20,12 +22,16 @@ except Exception:
 env_path = find_dotenv(usecwd=True)
 load_dotenv(env_path or None)
 
+# Initialize logging
+session_logger = setup_session_logger()
+logger = get_logger(__name__)
+
 def _dbg_env():
-    print("[ENV] MARKETS   =", os.getenv("MARKET_TICKERS"))
-    print("[ENV] CH_URL    =", os.getenv("CLICKHOUSE_URL"))
-    print("[ENV] CH_USER   =", os.getenv("CLICKHOUSE_USER"))
-    print("[ENV] CH_PWDLEN =", len(os.getenv("CLICKHOUSE_PASSWORD") or ""))
-    print("[ENV] USE_CH    =", os.getenv("USE_CLICKHOUSE","1"))
+    session_logger.info("=== Environment Configuration ===")
+    session_logger.info(f"MARKETS: {os.getenv('MARKET_TICKERS')}")
+    session_logger.info(f"CH_URL: {os.getenv('CLICKHOUSE_URL')}")
+    session_logger.info(f"CH_USER: {os.getenv('CLICKHOUSE_USER')}")
+    session_logger.info(f"CH_DATABASE: {os.getenv('CLICKHOUSE_DATABASE')}")
 
 # If you ever run this file directly (not with -m), ensure src is on sys.path:
 THIS_DIR = os.path.dirname(__file__)
