@@ -70,12 +70,12 @@ class KalshiWSRuntime:
         ]
 
     # ---- lifecycle ----
-    async def start(self) -> None:
-        """Idempotently start the WS loop."""
+    async def start(self, session_logger=None) -> None:
+        """Idempotently start the WS loop (supervised). Optionally pass a session_logger for session-scoped logs."""
         if self._run_task and not self._run_task.done():
             return
         self._stop.clear()
-        self._run_task = asyncio.create_task(self._run_loop(), name="kalshi_ws_run")
+        self._run_task = asyncio.create_task(self.run_forever(session_logger=session_logger), name="kalshi_ws_run")
 
     async def stop(self) -> None:
         """Stop loop and close the socket cleanly."""
@@ -122,42 +122,75 @@ class KalshiWSRuntime:
         }
         await self.send(payload)
 
-    # ---- loop ----
-    async def _run_loop(self):
+    # ---- loop helpers ----
+    async def _run_once(self):
+        """Establish one WS connection and consume until it closes or errors."""
+        log.info("ws_connecting", extra={"url": self.ws_url})
+        try:
+            async with websockets.connect(
+                self.ws_url,
+                additional_headers=self._signed_headers(),
+                ssl=self.ssl_ctx,
+                server_hostname=self.server_hostname,
+                open_timeout=25,
+                ping_interval=self.ping_interval,
+                ping_timeout=self.ping_timeout,
+            ) as ws:
+                self._ws = ws
+                self._connected.set()
+                log.info("ws_connected")
+                async for raw in ws:
+                    await self.queue.put(raw)
+        finally:
+            # ensure state is cleared when connection ends or errors
+            try:
+                self._ws = None
+            except Exception:
+                pass
+            try:
+                self._connected.clear()
+            except Exception:
+                pass
+
+    async def run_forever(self, session_logger=None):
+        """Supervising reconnect loop. Accepts an optional session_logger for session-scoped logs."""
         backoff = 1.0
         while not self._stop.is_set():
             try:
-                log.info("ws_connecting", extra={"url": self.ws_url})
-                async with websockets.connect(
-                    self.ws_url,
-                    additional_headers=self._signed_headers(),  # <-- match name
-                    ssl=self.ssl_ctx,                            # <-- correct attribute
-                    server_hostname=self.server_hostname,
-                    open_timeout=25,
-                    ping_interval=self.ping_interval,
-                    ping_timeout=self.ping_timeout,
-                ) as ws:
-                    self._ws = ws
-                    self._connected.set()
-                    log.info("ws_connected")
-                    # reset backoff on successful connection
-                    backoff = 1.0
-
-                    async for raw in ws:
-                        # raw is a str frame; push to queue
-                        await self.queue.put(raw)
-
+                await self._run_once()
+                # if _run_once returns cleanly (socket closed without exception)
+                if session_logger:
+                    session_logger.warning("ws_run_once_exited_cleanly")
+                else:
+                    log.warning("ws_run_once_exited_cleanly")
+                # brief pause then reset backoff
+                await asyncio.sleep(5)
+                backoff = 1.0
             except Exception as e:
-                # Log warning with backoff hint and truncated error
-                log.warning("ws_error", extra={"error": str(e)[:500], "backoff_sec": backoff})
-            finally:
-                self._ws = None
-                self._connected.clear()
-                if not self._stop.is_set():
-                    # add small jitter to avoid synchronized reconnect storms
-                    sleep_for = backoff + random.uniform(0, backoff * 0.1)
-                    await asyncio.sleep(sleep_for)
-                    backoff = min(backoff * 2, self._backoff_max)
+                # compute jittered sleep and log via session_logger when available
+                sleep_for = backoff + random.uniform(0, backoff * 0.1)
+                if session_logger:
+                    try:
+                        session_logger.exception(
+                            "ws_error",
+                            extra={"context": "ws_consumer", "error": str(e)[:500], "reconnecting_in": sleep_for},
+                        )
+                    except Exception:
+                        log.exception("ws_error (session_logger failed): %s", str(e))
+                else:
+                    try:
+                        log.exception(
+                            "ws_error",
+                            extra={"context": "ws_consumer", "error": str(e)[:500], "reconnecting_in": sleep_for},
+                        )
+                    except Exception:
+                        log.error("ws_error: %s; reconnecting_in=%s", str(e), sleep_for)
+
+                if self._stop.is_set():
+                    break
+
+                await asyncio.sleep(sleep_for)
+                backoff = min(backoff * 2, 60.0)
 
     # ---- helpers ----
     async def wait_connected(self, timeout: float = 10.0) -> None:
