@@ -1,4 +1,3 @@
-# Docker Compose for local development and testing
 
 services:
   # ClickHouse database
@@ -15,12 +14,14 @@ services:
     volumes:
       - clickhouse_data:/var/lib/clickhouse
       - ./src/databases/storage/clickhouse_ddl.sql:/docker-entrypoint-initdb.d/init.sql
-      - ./clickhouse_config/memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
+#      - ./clickhouse_config/memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8123/ping"]
-      interval: 5s
-      timeout: 3s
+      test: ["CMD-SHELL", "clickhouse-client --query='SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
       retries: 5
+      start_period: 30s
+
 
   # Kalshi streamer application
   streamer:
@@ -33,14 +34,14 @@ services:
       # Credentials (load from .env file)
       PROD_KEYID: ${PROD_KEYID}
       PROD_KEYFILE: ${PROD_KEYFILE}
-      
+
       # Markets
       MARKET_TICKERS: ${MARKET_TICKERS:-KXBTCMAXY-25-DEC31-129999.99,FEDFUNDS-DEC25}
-      
+
       # WebSocket
       WS_URL: ${WS_URL:-wss://api.elections.kalshi.com/trade-api/ws/v2}
       WS_HOSTNAME: ${WS_HOSTNAME:-api.elections.kalshi.com}
-      
+
       # ClickHouse (use 'clickhouse' as hostname inside Docker network)
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
@@ -50,14 +51,14 @@ services:
       CH_URL: http://clickhouse:8123
       CH_USER: ${CLICKHOUSE_USER:-default}
       CH_PASSWORD: ${CLICKHOUSE_PASSWORD:-default_password}
-      
+
       # Batching
       BATCH_ROWS: ${BATCH_ROWS:-2000}
       BATCH_FLUSH_SECS: ${BATCH_FLUSH_SECS:-0.010}
-      
+
       # Parquet
       PARQUET_DIR: ${PARQUET_DIR:-/app/data}
-      
+
       # Optional
       USE_ORJSON: ${USE_ORJSON:-1}
     volumes:
@@ -71,11 +72,5 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-    healthcheck:
-      test: ["CMD", "python", "-m", "kalshifolder.healthcheck"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-
 volumes:
   clickhouse_data:
