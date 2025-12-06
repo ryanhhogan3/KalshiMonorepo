@@ -190,7 +190,7 @@ class ClickHouseSink:
         for attempt in range(1, max_attempts + 1):
             try:
                 # prefer row-oriented insert with explicit column names
-                self.client.insert(table, rows=row_tuples, column_names=cols)
+                self.client.insert(table, row_tuples, column_names=cols)
                 # update sink metrics
                 try:
                     self.inserts_total += len(rows)
