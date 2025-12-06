@@ -1,7 +1,7 @@
 # Use Python 3.11 slim image
 FROM python:3.11-slim
 
-# Set working directory
+# Base working directory
 WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -21,8 +21,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the application
+# Copy the rest of the application code
 COPY . .
 
-# Default command
-CMD ["python", "-m", "kalshifolder.websocket.streamer"]
+# 👉 IMPORTANT: switch into src so `kalshifolder` is importable
+WORKDIR /app/src
+
+# Default command: use the logged streamer
+CMD ["python", "-m", "kalshifolder.websocket.streamer_logged"]
