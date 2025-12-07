@@ -33,7 +33,7 @@ services:
     environment:
       # Credentials (load from .env file)
       PROD_KEYID: ${PROD_KEYID}
-      PROD_KEYFILE: ${PROD_KEYFILE}
+      PROD_KEYFILE: /run/secrets/prod_key.pem
 
       # Markets
       MARKET_TICKERS: ${MARKET_TICKERS:-KXBTCMAXY-25-DEC31-129999.99,FEDFUNDS-DEC25}
@@ -66,6 +66,8 @@ services:
       - ./data:/app/data
       # Mount .env file (read-only)
       - ./.env:/app/.env:ro
+      # NEW: mount the host prod key into the container
+      - /home/ubuntu/.kalshi/prod_key.pem:/run/secrets/prod_key.pem:ro
     restart: unless-stopped
     logging:
       driver: "json-file"
