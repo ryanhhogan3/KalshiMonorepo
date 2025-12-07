@@ -5,7 +5,7 @@ from typing import Dict, Optional
 log = logging.getLogger(__name__)
 
 import certifi, websockets
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, ConnectionClosedError
 from dotenv import load_dotenv
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding
@@ -50,6 +50,12 @@ class KalshiWSRuntime:
         self.sid_to_ticker: Dict[int, str] = {}
         self._backoff_max = 30.0
         self.verbose = bool(int(os.getenv("WS_VERBOSE", "1")))
+
+        # Track markets for auto-resubscribe on reconnect
+        self._subscribed_markets: set[str] = set()
+
+        # Track last WS message time (monotonic seconds)
+        self._last_ws_message_monotonic: float = time.monotonic()
 
     # ---- signing ----
     def _signed_headers(self):
@@ -121,6 +127,24 @@ class KalshiWSRuntime:
             },
         }
         await self.send(payload)
+        # remember subscriptions so we can re-subscribe after reconnects
+        try:
+            self._subscribed_markets.update(tickers)
+        except Exception:
+            # defensive: make sure subscription tracking never raises
+            log.exception("failed_to_track_subscriptions")
+
+    async def _resubscribe_all(self) -> None:
+        """Re-send subscribe commands for all tracked markets after a reconnect."""
+        if not self._subscribed_markets:
+            return
+        tickers = list(self._subscribed_markets)
+        try:
+            # use a non-blocking id to avoid colliding with callers
+            await self.subscribe_markets(tickers, _id=9999)
+            log.info("resubscribed_markets", extra={"count": len(tickers)})
+        except Exception:
+            log.exception("resubscribe_failed")
 
     # ---- loop helpers ----
     async def _run_once(self):
@@ -139,7 +163,18 @@ class KalshiWSRuntime:
                 self._ws = ws
                 self._connected.set()
                 log.info("ws_connected")
+                # re-subscribe to any previously requested markets
+                try:
+                    await self._resubscribe_all()
+                except Exception:
+                    log.exception("_resubscribe_all_failed_on_connect")
+
                 async for raw in ws:
+                    # update last-received timestamp for heartbeat/no-activity checks
+                    try:
+                        self._last_ws_message_monotonic = time.monotonic()
+                    except Exception:
+                        pass
                     await self.queue.put(raw)
         finally:
             # ensure state is cleared when connection ends or errors
@@ -166,6 +201,32 @@ class KalshiWSRuntime:
                 # brief pause then reset backoff
                 await asyncio.sleep(5)
                 backoff = 1.0
+            except ConnectionClosedError as e:
+                # explicit websocket connection-closed handling
+                sleep_for = backoff + random.uniform(0, backoff * 0.1)
+                if session_logger:
+                    try:
+                        session_logger.info(
+                            "ws_connection_closed",
+                            extra={"context": "ws_consumer", "reason": str(e)[:500], "reconnecting_in": sleep_for},
+                        )
+                    except Exception:
+                        log.exception("ws_connection_closed (session_logger failed): %s", str(e))
+                else:
+                    try:
+                        log.info(
+                            "ws_connection_closed",
+                            extra={"context": "ws_consumer", "reason": str(e)[:500], "reconnecting_in": sleep_for},
+                        )
+                    except Exception:
+                        log.error("ws_connection_closed: %s; reconnecting_in=%s", str(e), sleep_for)
+
+                if self._stop.is_set():
+                    break
+
+                await asyncio.sleep(sleep_for)
+                backoff = min(backoff * 2, 60.0)
+
             except Exception as e:
                 # compute jittered sleep and log via session_logger when available
                 sleep_for = backoff + random.uniform(0, backoff * 0.1)
@@ -191,6 +252,23 @@ class KalshiWSRuntime:
 
                 await asyncio.sleep(sleep_for)
                 backoff = min(backoff * 2, 60.0)
+
+        # loop exit: clear connected flag
+        try:
+            self._connected.clear()
+        except Exception:
+            pass
+
+    @property
+    def last_ws_message_age(self) -> float:
+        """Return seconds since last WS message was received (monotonic).
+
+        If no message has been received yet, returns a large value based on process start.
+        """
+        try:
+            return time.monotonic() - self._last_ws_message_monotonic
+        except Exception:
+            return float("inf")
 
     # ---- helpers ----
     async def wait_connected(self, timeout: float = 10.0) -> None:
