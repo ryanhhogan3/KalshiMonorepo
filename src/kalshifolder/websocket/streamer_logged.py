@@ -89,23 +89,23 @@ async def main():
                     # Compose an inline message so it's visible in plain logs
                     last_insert = ch.last_insert_ts if hasattr(ch, 'last_insert_ts') else None
                     last_insert_s = last_insert.isoformat() if last_insert else "-"
-                    last_ws_s = last_ws_message_ts.isoformat() if last_ws_message_ts else "-"
+                    ws_age = rt.last_ws_message_age
+                    last_ws_s = f"{ws_age:.1f}s" if ws_age != float('inf') else "-"
                     msg = (
                         f"streamer_heartbeat events_total={events_total} "
                         f"insert_failures={ch.insert_failures} "
-                        f"last_insert_ts={last_insert_s} last_ws_message_ts={last_ws_s}"
+                        f"last_insert_ts={last_insert_s} last_ws_message_age={last_ws_s}"
                     )
                     session_logger.info(msg)
 
                     # No-activity warnings (1 hour threshold)
                     now_utc = datetime.now(timezone.utc)
-                    if last_ws_message_ts:
-                        age_ws = (now_utc - last_ws_message_ts).total_seconds()
-                        if age_ws > 3600:
-                            session_logger.warning(
-                                f"no_ws_activity age_seconds={age_ws:.0f}",
-                                extra={"age_seconds": age_ws},
-                            )
+                    age_ws = ws_age
+                    if age_ws != float('inf') and age_ws > 3600:
+                        session_logger.warning(
+                            f"no_ws_activity age_seconds={age_ws:.0f}",
+                            extra={"age_seconds": age_ws},
+                        )
 
                     if getattr(ch, "last_insert_ts", None):
                         age_insert = (now_utc - ch.last_insert_ts).total_seconds()
