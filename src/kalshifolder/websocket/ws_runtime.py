@@ -204,22 +204,24 @@ class KalshiWSRuntime:
             except ConnectionClosedError as e:
                 # explicit websocket connection-closed handling
                 sleep_for = backoff + random.uniform(0, backoff * 0.1)
+                text = str(e)[:500]
                 if session_logger:
                     try:
                         session_logger.info(
                             "ws_connection_closed",
-                            extra={"context": "ws_consumer", "reason": str(e)[:500], "reconnecting_in": sleep_for},
+                            extra={"context": "ws_consumer", "reason": text, "reconnecting_in": sleep_for},
                         )
                     except Exception:
-                        log.exception("ws_connection_closed (session_logger failed): %s", str(e))
+                        log.exception("ws_connection_closed (session_logger failed): %s", text)
                 else:
                     try:
                         log.info(
                             "ws_connection_closed",
-                            extra={"context": "ws_consumer", "reason": str(e)[:500], "reconnecting_in": sleep_for},
+                            extra={"context": "ws_consumer", "reason": text, "reconnecting_in": sleep_for},
+                            
                         )
                     except Exception:
-                        log.error("ws_connection_closed: %s; reconnecting_in=%s", str(e), sleep_for)
+                        log.error("ws_connection_closed: %s; reconnecting_in=%s", text, sleep_for)
 
                 if self._stop.is_set():
                     break
@@ -228,24 +230,36 @@ class KalshiWSRuntime:
                 backoff = min(backoff * 2, 60.0)
 
             except Exception as e:
-                # compute jittered sleep and log via session_logger when available
+                # generic error handling with explicit message and structured extras
                 sleep_for = backoff + random.uniform(0, backoff * 0.1)
+                text = str(e)[:500]
+                msg = f"ws_error error={text} reconnecting_in={sleep_for:.1f}s"
+
                 if session_logger:
                     try:
+                        # .exception() logs stack trace automatically
                         session_logger.exception(
-                            "ws_error",
-                            extra={"context": "ws_consumer", "error": str(e)[:500], "reconnecting_in": sleep_for},
+                            msg,
+                            extra={
+                                "context": "ws_consumer",
+                                "error": text,
+                                "reconnecting_in": sleep_for,
+                            },
                         )
                     except Exception:
-                        log.exception("ws_error (session_logger failed): %s", str(e))
+                        log.exception("ws_error (session_logger failed): %s", text)
                 else:
                     try:
                         log.exception(
-                            "ws_error",
-                            extra={"context": "ws_consumer", "error": str(e)[:500], "reconnecting_in": sleep_for},
+                            msg,
+                            extra={
+                                "context": "ws_consumer",
+                                "error": text,
+                                "reconnecting_in": sleep_for,
+                            },
                         )
                     except Exception:
-                        log.error("ws_error: %s; reconnecting_in=%s", str(e), sleep_for)
+                        log.error("ws_error: %s; reconnecting_in=%s", text, sleep_for)
 
                 if self._stop.is_set():
                     break
