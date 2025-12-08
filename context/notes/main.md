@@ -43,3 +43,11 @@ tail -f /var/log/clickhouse-server/clickhouse-server.log
 
 B. Tail Error only log
 tail -f /var/log/clickhouse-server/clickhouse-server.err.log
+
+
+## EC2 and Docker Storage Commands
+# Global disk usage
+df -h
+
+# Docker-level usage
+docker system df
