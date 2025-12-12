@@ -34,6 +34,7 @@ These are your database engine logs.
 Inspectable with:
 
 1. docker exec -it clickhouse bash
+    --> type: clickhouse
 2. ls /var/log/clickhouse-server
 
 two files stored here: clickhouse-server.err.log  clickhouse-server.log
