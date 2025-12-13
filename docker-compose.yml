@@ -1,4 +1,3 @@
-
 services:
   # ClickHouse database
   clickhouse:
@@ -34,6 +33,7 @@ services:
       # Credentials (load from .env file)
       PROD_KEYID: ${PROD_KEYID}
       PROD_KEYFILE: /run/secrets/prod_keys.pem
+
       # Markets
       MARKET_TICKERS: ${MARKET_TICKERS:-KXBTCMAXY-25-DEC31-129999.99,FEDFUNDS-DEC25}
 
@@ -50,6 +50,7 @@ services:
       CH_URL: http://clickhouse:8123
       CH_USER: ${CLICKHOUSE_USER:-default}
       CH_PASSWORD: ${CLICKHOUSE_PASSWORD:-default_password}
+      USE_CH: 1            # ✅ this is the “other chat” requirement
 
       # Batching
       BATCH_ROWS: ${BATCH_ROWS:-2000}
@@ -65,7 +66,7 @@ services:
       - ./data:/app/data
       # Mount .env file (read-only)
       - ./.env:/app/.env:ro
-      # NEW: mount the host prod key into the container
+      # prod key from host
       - /home/ubuntu/.kalshi/prod_keys.pem:/run/secrets/prod_keys.pem:ro
       
     restart: unless-stopped
@@ -74,5 +75,6 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
 volumes:
   clickhouse_data:
