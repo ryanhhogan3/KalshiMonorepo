@@ -23,7 +23,7 @@ A. Session Logs (one file per run)
 --Reading App Logs Under /app/logs
 These logs are inside the streamer container, not ClickHouse.
 
-Enter the streamer container:
+# Enter the streamer container:
 docker exec -it kalshi_streamer bash
 
 Inside:
@@ -52,3 +52,15 @@ df -h
 
 # Docker-level usage
 docker system df
+
+## Github Commands
+# After a fresh push from local files, use these in Ec2
+
+# 1. Update code
+git pull
+
+# 2. Stop old containers
+docker compose down
+
+# 3. Rebuild image(s) with the new code and start
+docker compose up -d --build
