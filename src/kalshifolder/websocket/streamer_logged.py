@@ -77,9 +77,10 @@ async def main():
         session.log_event(f"Subscribing to markets: {tickers}")
         await rt.subscribe_markets(tickers)
 
-        # state
-        books: Dict[int, OrderBook] = {}      # sid -> OrderBook
-        sid_to_ticker: Dict[int, str] = {}    # convenience
+        # --- state ---
+        # IMPORTANT: key by ticker, not sid, because Kalshi reuses sids across markets
+        books: Dict[str, OrderBook] = {}      # ticker -> OrderBook
+
         events_processed = 0
         snapshots_received = 0
         deltas_received = 0
@@ -170,16 +171,20 @@ async def main():
                     events_processed += 1
                     sid = int(m["sid"])
                     msg = m["msg"]
-                    ob = books.get(sid)
+                    ticker = msg["market_ticker"]
+                    market_id = msg["market_id"]
+
+                    ob = books.get(ticker)
                     if ob is None:
-                        ob = OrderBook(msg["market_id"], msg["market_ticker"])
-                        books[sid] = ob
-                        sid_to_ticker[sid] = msg["market_ticker"]
-                        session.log_event(f"Created orderbook for {msg['market_ticker']} (sid={sid})")
+                        ob = OrderBook(market_id, ticker)
+                        books[ticker] = ob
+                        session.log_event(
+                            f"Created orderbook for {ticker} (sid={sid}, market_id={market_id})"
+                        )
 
                     ob.apply_snapshot(msg, m["seq"])
                     session_logger.debug(
-                        f"Snapshot received for {msg['market_ticker']}: "
+                        f"Snapshot received for {ticker}: "
                         f"seq={m['seq']}, sides={'yes' if msg.get('yes') else '?'}, "
                         f"{'no' if msg.get('no') else '?'}"
                     )
@@ -189,7 +194,6 @@ async def main():
                     events_total += 1
 
                     # Update per-ticker stats
-                    ticker = msg["market_ticker"]
                     stats = ticker_stats.setdefault(
                         ticker,
                         {
@@ -213,8 +217,8 @@ async def main():
                                     "type": "snapshot",
                                     "sid": sid,
                                     "seq": m["seq"],
-                                    "market_id": msg["market_id"],
-                                    "market_ticker": msg["market_ticker"],
+                                    "market_id": market_id,
+                                    "market_ticker": ticker,
                                     "side": side,
                                     "price": int(price),
                                     "qty": int(size),
@@ -225,8 +229,8 @@ async def main():
                             # latest absolute
                             await ch.upsert_latest(
                                 {
-                                    "market_id": msg["market_id"],
-                                    "market_ticker": msg["market_ticker"],
+                                    "market_id": market_id,
+                                    "market_ticker": ticker,
                                     "side": side,
                                     "price": int(price),
                                     "size": int(size),
@@ -240,8 +244,8 @@ async def main():
                                     "type": "snapshot",
                                     "sid": sid,
                                     "seq": m["seq"],
-                                    "market_id": msg["market_id"],
-                                    "market_ticker": msg["market_ticker"],
+                                    "market_id": market_id,
+                                    "market_ticker": ticker,
                                     "side": side,
                                     "price": int(price),
                                     "qty": int(size),
@@ -256,11 +260,71 @@ async def main():
                     events_processed += 1
                     sid = int(m["sid"])
                     msg = m["msg"]
-                    ob = books.get(sid)
-                    if ob is None:
+
+                    ticker = msg.get("market_ticker")
+                    market_id = msg.get("market_id")
+
+                    if not ticker:
                         session.log_event(
-                            f"Delta received before snapshot for sid={sid}",
+                            f"Delta without market_ticker for sid={sid}: {msg}",
                             level="warning",
+                        )
+                        continue
+
+                    ob = books.get(ticker)
+                    if ob is None:
+                        # We never saw a snapshot for this ticker in this session
+                        session.log_event(
+                            f"Delta received before snapshot for ticker={ticker}, sid={sid}",
+                            level="warning",
+                        )
+                        # Optionally request a fresh snapshot for this ticker
+                        now_mono = time.monotonic()
+                        last_mono = last_resnapshot_monotonic.get(ticker, 0.0)
+                        if now_mono - last_mono > RESNAPSHOT_MIN_INTERVAL:
+                            try:
+                                await rt.subscribe_markets([ticker], _id=9001)
+                                last_resnapshot_monotonic[ticker] = now_mono
+                                session.log_event(
+                                    f"Requested resnapshot for {ticker} after delta-before-snapshot",
+                                    level="warning",
+                                )
+                            except Exception as e:
+                                session.log_event(
+                                    f"Failed to request resnapshot for {ticker}: {e}",
+                                    level="error",
+                                )
+                        # Still ingest the raw delta with whatever IDs we have
+                        ts = datetime.fromisoformat(msg["ts"].replace("Z", "+00:00"))
+                        ingest_ts = now_utc()
+
+                        await ch.add_event(
+                            {
+                                "type": "delta",
+                                "sid": sid,
+                                "seq": m["seq"],
+                                "market_id": market_id,
+                                "market_ticker": ticker,
+                                "side": msg["side"],
+                                "price": int(msg["price"]),
+                                "qty": int(msg["delta"]),
+                                "ts": ts,
+                                "ingest_ts": ingest_ts,
+                            }
+                        )
+                        await pq.add(
+                            {
+                                "type": "delta",
+                                "sid": sid,
+                                "seq": m["seq"],
+                                "market_id": market_id,
+                                "market_ticker": ticker,
+                                "side": msg["side"],
+                                "price": int(msg["price"]),
+                                "qty": int(msg["delta"]),
+                                "ts": ts.isoformat(),
+                                "indigest_ts": ingest_ts.isoformat(),
+                            }
                         )
                         continue
 
@@ -270,7 +334,6 @@ async def main():
                     events_total += 1
 
                     # Update per-ticker stats (for both good and bad deltas)
-                    ticker = ob.ticker
                     stats = ticker_stats.setdefault(
                         ticker,
                         {
@@ -289,8 +352,8 @@ async def main():
                     abs_size = ob.apply_delta(msg["side"], msg["price"], msg["delta"], m["seq"])
 
                     if abs_size is None:
-                        # --- problem delta: log + resnapshot, BUT STILL INGEST RAW DELTA ---
-                        key = (ob.ticker, msg["side"], msg["price"])
+                        # problem delta: log + resnapshot, BUT STILL INGEST RAW DELTA
+                        key = (ticker, msg["side"], msg["price"])
                         gap_warn_counts[key] += 1
                         count = gap_warn_counts[key]
 
@@ -298,7 +361,7 @@ async def main():
                         if count in (1, 10, 100, 1000):
                             session.log_event(
                                 (
-                                    f"[x{count}] Sequence gap or negative level for {ob.ticker} "
+                                    f"[x{count}] Sequence gap or negative level for {ticker} "
                                     f"side={msg['side']} price={msg['price']} "
                                     f"delta={msg['delta']} seq={m.get('seq')}"
                                 ),
@@ -307,30 +370,29 @@ async def main():
 
                         # Resnapshot logic (rate-limited per ticker)
                         now_mono = time.monotonic()
-                        last_mono = last_resnapshot_monotonic.get(ob.ticker, 0.0)
+                        last_mono = last_resnapshot_monotonic.get(ticker, 0.0)
                         if now_mono - last_mono > RESNAPSHOT_MIN_INTERVAL:
                             try:
-                                # This reuses your existing subscribe with snapshot=True
-                                await rt.subscribe_markets([ob.ticker], _id=9000)
-                                last_resnapshot_monotonic[ob.ticker] = now_mono
+                                await rt.subscribe_markets([ticker], _id=9000)
+                                last_resnapshot_monotonic[ticker] = now_mono
                                 session.log_event(
-                                    f"Requested resnapshot for {ob.ticker} after gap/negative level",
+                                    f"Requested resnapshot for {ticker} after gap/negative level",
                                     level="warning",
                                 )
                             except Exception as e:
                                 session.log_event(
-                                    f"Failed to request resnapshot for {ob.ticker}: {e}",
+                                    f"Failed to request resnapshot for {ticker}: {e}",
                                     level="error",
                                 )
 
-                        # ✅ Always store the raw delta in the immutable event table & parquet
+                        # Always store the raw delta in the immutable event table & parquet
                         await ch.add_event(
                             {
                                 "type": "delta",
                                 "sid": sid,
                                 "seq": m["seq"],
                                 "market_id": ob.market_id,
-                                "market_ticker": ob.ticker,
+                                "market_ticker": ticker,
                                 "side": msg["side"],
                                 "price": int(msg["price"]),
                                 "qty": int(msg["delta"]),
@@ -345,7 +407,7 @@ async def main():
                                 "sid": sid,
                                 "seq": m["seq"],
                                 "market_id": ob.market_id,
-                                "market_ticker": ob.ticker,
+                                "market_ticker": ticker,
                                 "side": msg["side"],
                                 "price": int(msg["price"]),
                                 "qty": int(msg["delta"]),
@@ -357,9 +419,9 @@ async def main():
                         # Do NOT touch latest_levels if we don't trust the book
                         continue
 
-                    # --- happy path: book update ok, we ingest + update latest_levels ---
+                    # happy path: book update ok, we ingest + update latest_levels
                     session_logger.debug(
-                        f"Delta: {ob.ticker} {msg['side']} {msg['price']} "
+                        f"Delta: {ticker} {msg['side']} {msg['price']} "
                         f"delta={msg['delta']} => {abs_size}"
                     )
 
@@ -370,7 +432,7 @@ async def main():
                             "sid": sid,
                             "seq": m["seq"],
                             "market_id": ob.market_id,
-                            "market_ticker": ob.ticker,
+                            "market_ticker": ticker,
                             "side": msg["side"],
                             "price": int(msg["price"]),
                             "qty": int(msg["delta"]),
@@ -382,7 +444,7 @@ async def main():
                     await ch.upsert_latest(
                         {
                             "market_id": ob.market_id,
-                            "market_ticker": ob.ticker,
+                            "market_ticker": ticker,
                             "side": msg["side"],
                             "price": int(msg["price"]),
                             "size": int(abs_size),
@@ -397,7 +459,7 @@ async def main():
                             "sid": sid,
                             "seq": m["seq"],
                             "market_id": ob.market_id,
-                            "market_ticker": ob.ticker,
+                            "market_ticker": ticker,
                             "side": msg["side"],
                             "price": int(msg["price"]),
                             "qty": int(msg["delta"]),
