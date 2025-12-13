@@ -354,7 +354,7 @@ async def main():
                             }
                         )
 
-                        # 🚫 Do NOT touch latest_levels if we don't trust the book
+                        # Do NOT touch latest_levels if we don't trust the book
                         continue
 
                     # --- happy path: book update ok, we ingest + update latest_levels ---
