@@ -47,6 +47,7 @@ services:
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-default_password}
       CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-kalshi}
 
+      # Other Chat (ClickHouse) (Can delete if not needed)
       CH_URL: http://clickhouse:8123
       CH_USER: ${CLICKHOUSE_USER:-default}
       CH_PASSWORD: ${CLICKHOUSE_PASSWORD:-default_password}
