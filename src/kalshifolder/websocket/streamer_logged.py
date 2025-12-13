@@ -264,8 +264,32 @@ async def main():
                         )
                         continue
 
+                    # Parse exchange ts once, we always want to store it
+                    ts = datetime.fromisoformat(msg["ts"].replace("Z", "+00:00"))
+                    ingest_ts = now_utc()
+                    events_total += 1
+
+                    # Update per-ticker stats (for both good and bad deltas)
+                    ticker = ob.ticker
+                    stats = ticker_stats.setdefault(
+                        ticker,
+                        {
+                            "snapshots": 0,
+                            "deltas": 0,
+                            "events": 0,
+                            "last_ts": None,
+                            "last_ingest_ts": None,
+                        },
+                    )
+                    stats["deltas"] += 1
+                    stats["events"] += 1
+                    stats["last_ts"] = ts
+                    stats["last_ingest_ts"] = ingest_ts
+
                     abs_size = ob.apply_delta(msg["side"], msg["price"], msg["delta"], m["seq"])
+
                     if abs_size is None:
+                        # --- problem delta: log + resnapshot, BUT STILL INGEST RAW DELTA ---
                         key = (ob.ticker, msg["side"], msg["price"])
                         gap_warn_counts[key] += 1
                         count = gap_warn_counts[key]
@@ -299,34 +323,45 @@ async def main():
                                     level="error",
                                 )
 
-                        # Skip this bad delta; do NOT insert anything to ClickHouse
+                        # ✅ Always store the raw delta in the immutable event table & parquet
+                        await ch.add_event(
+                            {
+                                "type": "delta",
+                                "sid": sid,
+                                "seq": m["seq"],
+                                "market_id": ob.market_id,
+                                "market_ticker": ob.ticker,
+                                "side": msg["side"],
+                                "price": int(msg["price"]),
+                                "qty": int(msg["delta"]),
+                                "ts": ts,
+                                "ingest_ts": ingest_ts,
+                            }
+                        )
+
+                        await pq.add(
+                            {
+                                "type": "delta",
+                                "sid": sid,
+                                "seq": m["seq"],
+                                "market_id": ob.market_id,
+                                "market_ticker": ob.ticker,
+                                "side": msg["side"],
+                                "price": int(msg["price"]),
+                                "qty": int(msg["delta"]),
+                                "ts": ts.isoformat(),
+                                "ingest_ts": ingest_ts.isoformat(),
+                            }
+                        )
+
+                        # 🚫 Do NOT touch latest_levels if we don't trust the book
                         continue
 
-                    ts = datetime.fromisoformat(msg["ts"].replace("Z", "+00:00"))
-                    ingest_ts = now_utc()
-                    events_total += 1
-
+                    # --- happy path: book update ok, we ingest + update latest_levels ---
                     session_logger.debug(
                         f"Delta: {ob.ticker} {msg['side']} {msg['price']} "
                         f"delta={msg['delta']} => {abs_size}"
                     )
-
-                    # Update per-ticker stats
-                    ticker = ob.ticker
-                    stats = ticker_stats.setdefault(
-                        ticker,
-                        {
-                            "snapshots": 0,
-                            "deltas": 0,
-                            "events": 0,
-                            "last_ts": None,
-                            "last_ingest_ts": None,
-                        },
-                    )
-                    stats["deltas"] += 1
-                    stats["events"] += 1
-                    stats["last_ts"] = ts
-                    stats["last_ingest_ts"] = ingest_ts
 
                     # immutable event
                     await ch.add_event(
