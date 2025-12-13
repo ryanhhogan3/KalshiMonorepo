@@ -64,3 +64,94 @@ docker compose down
 
 # 3. Rebuild image(s) with the new code and start
 docker compose up -d --build
+
+From inside the repo:
+
+cd ~/apps/KalshiMonorepo
+
+# 1) Make sure EVERYTHING is tracked (even uncommitted tweaks)
+git add -A
+
+# 2) Commit the current EC2 state
+git commit -m "EC2 backup before pulling new upstream changes"
+
+
+Now create a clearly-named backup branch:
+
+# 3) Create a backup branch from this commit
+git branch ec2-backup-$(date +%Y%m%d)
+
+# 4) Push it to GitHub so it's safe even if EC2 dies
+git push -u origin ec2-backup-$(date +%Y%m%d)
+
+
+You now have:
+
+origin/ec2-backup-20251212 (for example)
+
+That branch contains exactly the EC2 code as it was before updating.
+
+You can always restore it via:
+
+git switch ec2-backup-20251212
+
+2. Reset EC2 to the latest code from GitHub
+
+Now we want EC2 to match remote main (the new code you merged and tested elsewhere).
+
+cd ~/apps/KalshiMonorepo
+
+# 1) Go to main branch
+git switch main
+
+# 2) Make sure we have latest from GitHub
+git fetch origin
+
+# 3) Hard reset EC2 main to *exactly* match origin/main
+git reset --hard origin/main
+
+
+At this point:
+
+Your EC2 repo = exact same code as on GitHub main
+
+Your old EC2 customizations are safely saved on ec2-backup-YYYYMMDD
+
+Nothing in /home/ubuntu/.kalshi/prod_keys.pem or your .env is touched by git.
+
+3. Redeploy the new code with Docker
+
+From the repo:
+
+cd ~/apps/KalshiMonorepo
+
+# Stop old containers
+docker compose down
+
+# Rebuild images with new code
+docker compose build
+
+# Start everything again
+docker compose up -d
+
+
+Check the containers:
+
+docker ps
+
+
+Then tail the streamer logs to confirm it’s running with the new code:
+
+docker logs -f kalshi_streamer
+
+
+You should see:
+
+The full list of markets
+
+The new ticker_health heartbeat lines
+
+The improved gap / resnapshot warnings
+
+
+### Clickhouse Queries:
