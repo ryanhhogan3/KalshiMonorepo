@@ -1,8 +1,8 @@
 import os, sys, asyncio, time
 from datetime import datetime, timezone
 from dotenv import load_dotenv, find_dotenv
-from typing import Dict
-from collections import defaultdict
+from typing import Dict, List, Any
+from collections import defaultdict, deque
 
 from databases.processing.clickhouse_sink import ClickHouseSink
 from databases.processing.parquet_sink import ParquetSink
@@ -51,6 +51,7 @@ def now_utc() -> datetime:
 async def main():
     async with AsyncWorkflowSession("KalshiMonorepo Streamer") as session:
         _dbg_env()
+
         tickers = [t.strip() for t in os.getenv("MARKET_TICKERS", "").split(",") if t.strip()]
         if not tickers:
             session.log_event("MARKET_TICKERS not set in .env", level="error")
@@ -73,13 +74,24 @@ async def main():
         await rt.wait_connected()
         session.log_event("Connected to Kalshi WebSocket")
 
+        # ---------------------------------------------------------------------
+        # OPTION A (correct): subscribe each ticker individually so Kalshi gives
+        # a distinct sid per ticker (instead of collapsing multiple tickers into one sid)
+        # ---------------------------------------------------------------------
         await asyncio.sleep(0.2)
-        session.log_event(f"Subscribing to markets: {tickers}")
-        await rt.subscribe_markets(tickers)
+        session.log_event(f"Subscribing to markets individually: {tickers}")
+        for i, t in enumerate(tickers, start=1):
+            await rt.subscribe_markets([t], _id=1000 + i)
+            await asyncio.sleep(0.05)
 
         # --- state ---
-        # IMPORTANT: key by ticker, not sid, because Kalshi reuses sids across markets
-        books: Dict[str, OrderBook] = {}      # ticker -> OrderBook
+        # CRITICAL FIX: key by sid (authoritative). Kalshi routes updates by sid.
+        books: Dict[int, OrderBook] = {}               # sid -> OrderBook
+        sid_to_ticker: Dict[int, str] = {}             # sid -> ticker (guard rail)
+        sid_to_market_id: Dict[int, str] = {}          # sid -> market_id (guard rail)
+
+        # Buffer for "delta before snapshot" (per sid)
+        pending_deltas: Dict[int, deque] = defaultdict(lambda: deque(maxlen=5000))
 
         events_processed = 0
         snapshots_received = 0
@@ -98,7 +110,6 @@ async def main():
         async def heartbeat_loop():
             while True:
                 try:
-                    # Compose an inline message so it's visible in plain logs
                     last_insert = getattr(ch, "last_insert_ts", None)
                     last_insert_s = last_insert.isoformat() if last_insert else "-"
                     ws_age = rt.last_ws_message_age
@@ -110,24 +121,8 @@ async def main():
                     )
                     session_logger.info(msg)
 
-                    # No-activity warnings (1 hour threshold)
                     now_dt = datetime.now(timezone.utc)
-                    age_ws = ws_age
-                    if age_ws != float("inf") and age_ws > 3600:
-                        session_logger.warning(
-                            f"no_ws_activity age_seconds={age_ws:.0f}",
-                            extra={"age_seconds": age_ws},
-                        )
 
-                    if getattr(ch, "last_insert_ts", None):
-                        age_insert = (now_dt - ch.last_insert_ts).total_seconds()
-                        if age_insert > 3600:
-                            session_logger.warning(
-                                f"no_insert_activity age_seconds={age_insert:.0f}",
-                                extra={"age_seconds": age_insert},
-                            )
-
-                    # Per-ticker summary (only if not too many tickers)
                     if ticker_stats and len(ticker_stats) <= 25:
                         parts = []
                         for ticker, stats in ticker_stats.items():
@@ -151,6 +146,40 @@ async def main():
 
         heartbeat_task = asyncio.create_task(heartbeat_loop())
 
+        async def _ingest_delta_row(*, sid: int, seq: int, market_id: str, ticker: str, msg: dict):
+            """Insert a raw delta into CH + Parquet (immutable events)."""
+            ts = datetime.fromisoformat(msg["ts"].replace("Z", "+00:00"))
+            ingest_ts = now_utc()
+
+            await ch.add_event(
+                {
+                    "type": "delta",
+                    "sid": sid,
+                    "seq": seq,
+                    "market_id": market_id,
+                    "market_ticker": ticker,
+                    "side": msg["side"],
+                    "price": int(msg["price"]),
+                    "qty": int(msg["delta"]),
+                    "ts": ts,
+                    "ingest_ts": ingest_ts,
+                }
+            )
+            await pq.add(
+                {
+                    "type": "delta",
+                    "sid": sid,
+                    "seq": seq,
+                    "market_id": market_id,
+                    "market_ticker": ticker,
+                    "side": msg["side"],
+                    "price": int(msg["price"]),
+                    "qty": int(msg["delta"]),
+                    "ts": ts.isoformat(),
+                    "ingest_ts": ingest_ts.isoformat(),
+                }
+            )
+
         try:
             while True:
                 raw = await rt.queue.get()
@@ -161,35 +190,48 @@ async def main():
                     continue
 
                 typ = m.get("type")
+
                 if typ == "subscribed":
-                    sid = m["msg"]["sid"]
+                    sid = int(m["msg"]["sid"])
                     session.log_event(f"Subscription confirmed for sid={sid}")
                     continue
 
+                # ---------------------------
+                # SNAPSHOT
+                # ---------------------------
                 if typ == "orderbook_snapshot":
                     snapshots_received += 1
                     events_processed += 1
+
                     sid = int(m["sid"])
+                    seq = int(m["seq"])
                     msg = m["msg"]
                     ticker = msg["market_ticker"]
                     market_id = msg["market_id"]
 
-                    ob = books.get(ticker)
+                    # Guard rail: sid should never represent multiple tickers
+                    if sid in sid_to_ticker and sid_to_ticker[sid] != ticker:
+                        session_logger.error(
+                            f"SID_COLLISION sid={sid} was={sid_to_ticker[sid]} now={ticker} "
+                            f"(this would corrupt data; refusing to overwrite mapping)"
+                        )
+                        # In this edge case, do not apply snapshot to avoid mixing markets.
+                        continue
+
+                    sid_to_ticker[sid] = ticker
+                    sid_to_market_id[sid] = market_id
+
+                    ob = books.get(sid)
                     if ob is None:
                         ob = OrderBook(market_id, ticker)
-                        books[ticker] = ob
+                        books[sid] = ob
                         session.log_event(
                             f"Created orderbook for {ticker} (sid={sid}, market_id={market_id})"
                         )
 
-                    ob.apply_snapshot(msg, m["seq"])
-                    session_logger.debug(
-                        f"Snapshot received for {ticker}: "
-                        f"seq={m['seq']}, sides={'yes' if msg.get('yes') else '?'}, "
-                        f"{'no' if msg.get('no') else '?'}"
-                    )
+                    # Apply snapshot to book
+                    ob.apply_snapshot(msg, seq)
 
-                    # emit snapshot rows (immutable truth)
                     ingest_ts = now_utc()
                     events_total += 1
 
@@ -209,14 +251,14 @@ async def main():
                     stats["last_ts"] = ingest_ts
                     stats["last_ingest_ts"] = ingest_ts
 
-                    # ClickHouse (batch)
+                    # Emit snapshot rows
                     for side in ("yes", "no"):
                         for price, size in msg.get(side, []):
                             await ch.add_event(
                                 {
                                     "type": "snapshot",
                                     "sid": sid,
-                                    "seq": m["seq"],
+                                    "seq": seq,
                                     "market_id": market_id,
                                     "market_ticker": ticker,
                                     "side": side,
@@ -226,7 +268,6 @@ async def main():
                                     "ingest_ts": ingest_ts,
                                 }
                             )
-                            # latest absolute
                             await ch.upsert_latest(
                                 {
                                     "market_id": market_id,
@@ -238,12 +279,11 @@ async def main():
                                     "ingest_ts": ingest_ts,
                                 }
                             )
-                            # parquet archive (events schema)
                             await pq.add(
                                 {
                                     "type": "snapshot",
                                     "sid": sid,
-                                    "seq": m["seq"],
+                                    "seq": seq,
                                     "market_id": market_id,
                                     "market_ticker": ticker,
                                     "side": side,
@@ -253,87 +293,76 @@ async def main():
                                     "ingest_ts": ingest_ts.isoformat(),
                                 }
                             )
+
+                    # If we buffered deltas before this snapshot arrived, replay them now
+                    if pending_deltas.get(sid):
+                        session_logger.warning(
+                            f"Replaying {len(pending_deltas[sid])} buffered deltas for {ticker} (sid={sid})"
+                        )
+                        while pending_deltas[sid]:
+                            dm = pending_deltas[sid].popleft()
+                            dmsg = dm["msg"]
+                            dseq = int(dm["seq"])
+
+                            # Apply delta to book
+                            abs_size = ob.apply_delta(dmsg["side"], dmsg["price"], dmsg["delta"], dseq)
+
+                            # Always ingest raw delta
+                            await _ingest_delta_row(
+                                sid=sid,
+                                seq=dseq,
+                                market_id=market_id,
+                                ticker=ticker,
+                                msg=dmsg,
+                            )
+
+                            # Update latest_levels only if book update was valid
+                            if abs_size is not None:
+                                ts = datetime.fromisoformat(dmsg["ts"].replace("Z", "+00:00"))
+                                ingest_ts2 = now_utc()
+                                await ch.upsert_latest(
+                                    {
+                                        "market_id": market_id,
+                                        "market_ticker": ticker,
+                                        "side": dmsg["side"],
+                                        "price": int(dmsg["price"]),
+                                        "size": int(abs_size),
+                                        "ts": ts,
+                                        "ingest_ts": ingest_ts2,
+                                    }
+                                )
+
                     continue
 
+                # ---------------------------
+                # DELTA
+                # ---------------------------
                 if typ == "orderbook_delta":
                     deltas_received += 1
                     events_processed += 1
+
                     sid = int(m["sid"])
+                    seq = int(m["seq"])
                     msg = m["msg"]
 
-                    ticker = msg.get("market_ticker")
-                    market_id = msg.get("market_id")
-
-                    if not ticker:
-                        session.log_event(
-                            f"Delta without market_ticker for sid={sid}: {msg}",
-                            level="warning",
-                        )
-                        continue
-
-                    ob = books.get(ticker)
+                    ob = books.get(sid)
                     if ob is None:
-                        # We never saw a snapshot for this ticker in this session
-                        session.log_event(
-                            f"Delta received before snapshot for ticker={ticker}, sid={sid}",
-                            level="warning",
-                        )
-                        # Optionally request a fresh snapshot for this ticker
-                        now_mono = time.monotonic()
-                        last_mono = last_resnapshot_monotonic.get(ticker, 0.0)
-                        if now_mono - last_mono > RESNAPSHOT_MIN_INTERVAL:
-                            try:
-                                await rt.subscribe_markets([ticker], _id=9001)
-                                last_resnapshot_monotonic[ticker] = now_mono
-                                session.log_event(
-                                    f"Requested resnapshot for {ticker} after delta-before-snapshot",
-                                    level="warning",
-                                )
-                            except Exception as e:
-                                session.log_event(
-                                    f"Failed to request resnapshot for {ticker}: {e}",
-                                    level="error",
-                                )
-                        # Still ingest the raw delta with whatever IDs we have
-                        ts = datetime.fromisoformat(msg["ts"].replace("Z", "+00:00"))
-                        ingest_ts = now_utc()
-
-                        await ch.add_event(
-                            {
-                                "type": "delta",
-                                "sid": sid,
-                                "seq": m["seq"],
-                                "market_id": market_id,
-                                "market_ticker": ticker,
-                                "side": msg["side"],
-                                "price": int(msg["price"]),
-                                "qty": int(msg["delta"]),
-                                "ts": ts,
-                                "ingest_ts": ingest_ts,
-                            }
-                        )
-                        await pq.add(
-                            {
-                                "type": "delta",
-                                "sid": sid,
-                                "seq": m["seq"],
-                                "market_id": market_id,
-                                "market_ticker": ticker,
-                                "side": msg["side"],
-                                "price": int(msg["price"]),
-                                "qty": int(msg["delta"]),
-                                "ts": ts.isoformat(),
-                                "indigest_ts": ingest_ts.isoformat(),
-                            }
-                        )
+                        # We don't yet know ticker/market_id; buffer this delta until snapshot arrives
+                        pending_deltas[sid].append({"seq": seq, "msg": msg})
+                        if len(pending_deltas[sid]) in (1, 10, 100, 1000):
+                            session_logger.warning(
+                                f"[x{len(pending_deltas[sid])}] Delta received before snapshot for sid={sid}; buffering"
+                            )
                         continue
 
-                    # Parse exchange ts once, we always want to store it
+                    ticker = ob.ticker
+                    market_id = ob.market_id
+
+                    # Update per-ticker stats
                     ts = datetime.fromisoformat(msg["ts"].replace("Z", "+00:00"))
                     ingest_ts = now_utc()
                     events_total += 1
 
-                    # Update per-ticker stats (for both good and bad deltas)
                     stats = ticker_stats.setdefault(
                         ticker,
                         {
@@ -349,26 +378,24 @@ async def main():
                     stats["last_ts"] = ts
                     stats["last_ingest_ts"] = ingest_ts
 
-                    abs_size = ob.apply_delta(msg["side"], msg["price"], msg["delta"], m["seq"])
+                    abs_size = ob.apply_delta(msg["side"], msg["price"], msg["delta"], seq)
 
                     if abs_size is None:
-                        # problem delta: log + resnapshot, BUT STILL INGEST RAW DELTA
                         key = (ticker, msg["side"], msg["price"])
                         gap_warn_counts[key] += 1
                         count = gap_warn_counts[key]
 
-                        # Throttled warning logging: 1st, 10th, 100th, 1000th occurrence
                         if count in (1, 10, 100, 1000):
                             session.log_event(
                                 (
                                     f"[x{count}] Sequence gap or negative level for {ticker} "
                                     f"side={msg['side']} price={msg['price']} "
-                                    f"delta={msg['delta']} seq={m.get('seq')}"
+                                    f"delta={msg['delta']} seq={seq}"
                                 ),
                                 level="warning",
                             )
 
-                        # Resnapshot logic (rate-limited per ticker)
+                        # Resnapshot logic (rate-limited)
                         now_mono = time.monotonic()
                         last_mono = last_resnapshot_monotonic.get(ticker, 0.0)
                         if now_mono - last_mono > RESNAPSHOT_MIN_INTERVAL:
@@ -385,86 +412,34 @@ async def main():
                                     level="error",
                                 )
 
-                        # Always store the raw delta in the immutable event table & parquet
-                        await ch.add_event(
-                            {
-                                "type": "delta",
-                                "sid": sid,
-                                "seq": m["seq"],
-                                "market_id": ob.market_id,
-                                "market_ticker": ticker,
-                                "side": msg["side"],
-                                "price": int(msg["price"]),
-                                "qty": int(msg["delta"]),
-                                "ts": ts,
-                                "ingest_ts": ingest_ts,
-                            }
+                        # Always store the raw delta
+                        await _ingest_delta_row(
+                            sid=sid,
+                            seq=seq,
+                            market_id=market_id,
+                            ticker=ticker,
+                            msg=msg,
                         )
-
-                        await pq.add(
-                            {
-                                "type": "delta",
-                                "sid": sid,
-                                "seq": m["seq"],
-                                "market_id": ob.market_id,
-                                "market_ticker": ticker,
-                                "side": msg["side"],
-                                "price": int(msg["price"]),
-                                "qty": int(msg["delta"]),
-                                "ts": ts.isoformat(),
-                                "ingest_ts": ingest_ts.isoformat(),
-                            }
-                        )
-
-                        # Do NOT touch latest_levels if we don't trust the book
+                        # Do NOT update latest_levels if we don't trust the book
                         continue
 
-                    # happy path: book update ok, we ingest + update latest_levels
-                    session_logger.debug(
-                        f"Delta: {ticker} {msg['side']} {msg['price']} "
-                        f"delta={msg['delta']} => {abs_size}"
+                    # Happy path: store delta + update latest_levels
+                    await _ingest_delta_row(
+                        sid=sid,
+                        seq=seq,
+                        market_id=market_id,
+                        ticker=ticker,
+                        msg=msg,
                     )
-
-                    # immutable event
-                    await ch.add_event(
-                        {
-                            "type": "delta",
-                            "sid": sid,
-                            "seq": m["seq"],
-                            "market_id": ob.market_id,
-                            "market_ticker": ticker,
-                            "side": msg["side"],
-                            "price": int(msg["price"]),
-                            "qty": int(msg["delta"]),
-                            "ts": ts,
-                            "ingest_ts": ingest_ts,
-                        }
-                    )
-                    # update latest absolute
                     await ch.upsert_latest(
                         {
-                            "market_id": ob.market_id,
+                            "market_id": market_id,
                             "market_ticker": ticker,
                             "side": msg["side"],
                             "price": int(msg["price"]),
                             "size": int(abs_size),
                             "ts": ts,
                             "ingest_ts": ingest_ts,
-                        }
-                    )
-                    # archive event
-                    await pq.add(
-                        {
-                            "type": "delta",
-                            "sid": sid,
-                            "seq": m["seq"],
-                            "market_id": ob.market_id,
-                            "market_ticker": ticker,
-                            "side": msg["side"],
-                            "price": int(msg["price"]),
-                            "qty": int(msg["delta"]),
-                            "ts": ts.isoformat(),
-                            "ingest_ts": ingest_ts.isoformat(),
                         }
                     )
 
@@ -476,7 +451,6 @@ async def main():
                         )
                     continue
 
-                # ignore other frame types; log unknown frames
                 session_logger.debug(f"Unknown frame type: {typ}")
 
         except KeyboardInterrupt:
@@ -485,7 +459,6 @@ async def main():
             session.log_event(f"Unexpected error in main loop: {e}", level="error")
             raise
         finally:
-            # stop heartbeat
             try:
                 heartbeat_task.cancel()
                 await heartbeat_task
@@ -493,9 +466,19 @@ async def main():
                 pass
 
             session.log_event("Flushing remaining data to sinks...")
-            await ch.flush()
-            await pq.flush()
-            await rt.stop()
+            try:
+                await ch.flush()
+            except Exception:
+                logger.exception("Failed to flush ClickHouse sink")
+            try:
+                await pq.flush()
+            except Exception:
+                logger.exception("Failed to flush Parquet sink")
+            try:
+                await rt.stop()
+            except Exception:
+                logger.exception("Failed to stop WebSocket runtime")
+
             session.log_event(
                 f"Final stats: {events_processed} events processed "
                 f"({snapshots_received} snapshots, {deltas_received} deltas)"
