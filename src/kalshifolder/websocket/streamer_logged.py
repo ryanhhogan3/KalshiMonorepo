@@ -429,6 +429,19 @@ async def main():
                                 level="warning",
                             )
 
+                        # Record reject in the orderbook; only request resnapshot
+                        # when the per-ticker recent rejects reach threshold.
+                        should_resnap = False
+                        try:
+                            should_resnap = ob.record_reject(now_ts=time.time())
+                        except Exception:
+                            # If anything goes wrong, fall back to conservative behavior
+                            should_resnap = True
+
+                        if not should_resnap:
+                            # Not enough recent rejects yet; do not request resnapshot
+                            continue
+
                         # Request resnapshot (rate-limited)
                         now_mono = time.monotonic()
                         last_mono = last_resnapshot_monotonic.get(ticker, 0.0)
