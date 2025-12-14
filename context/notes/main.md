@@ -155,3 +155,20 @@ The improved gap / resnapshot warnings
 
 
 ### Clickhouse Queries:
+clear tables (fast, irreversible):
+docker exec -it clickhouse clickhouse-client -q "
+  TRUNCATE TABLE kalshi.orderbook_events;
+  TRUNCATE TABLE kalshi.latest_levels;
+"
+
+### QA Queries
+Option A (best) — Run QA inside the same Docker network
+
+This avoids host networking + auth drift.
+
+docker exec -it kalshi_streamer /bin/sh -lc 'python3 /app/src/databases/qa/qa_clickhouse.py --hours 1 --days 7'
+
+If you want a “daily health” quick check:
+
+docker exec -it kalshi_streamer /bin/sh -lc \
+'python3 /app/src/databases/qa/qa_clickhouse.py --hours 6 --days 2'
