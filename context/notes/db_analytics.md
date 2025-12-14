@@ -206,3 +206,15 @@ docker exec -it clickhouse clickhouse-client --format PrettyCompact -q "
 
 docker exec -it clickhouse clickhouse-client --format PrettyCompact -q "SELECT market_ticker, uniqExactIf((sid, seq), type='snapshot') AS snapshot_events, uniqExactIf((sid, seq), type='delta') AS delta_events, round(snapshot_events / greatest(delta_events, 1), 3) AS snaps_per_delta_event, max(ts) AS last_ts FROM kalshi.orderbook_events GROUP BY market_ticker ORDER BY snaps_per_delta_event DESC;"
 
+12. Ensure no missing tickers for data within CH in the last 30 minutes
+
+docker exec -it clickhouse clickhouse-client --format PrettyCompact -q "
+SELECT
+  countIf(market_id = toUUID('00000000-0000-0000-0000-000000000000')) AS nil_market_id_rows,
+  count() AS rows,
+  round(nil_market_id_rows / rows, 6) AS frac_nil
+FROM kalshi.orderbook_events
+WHERE ts >= now() - INTERVAL 30 MINUTE;
+"
+
+
