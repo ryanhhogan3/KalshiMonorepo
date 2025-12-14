@@ -53,6 +53,7 @@ class KalshiWSRuntime:
 
         # Track markets for auto-resubscribe on reconnect
         self._subscribed_markets: set[str] = set()
+        self._resub_id_base: int = 20_000  # ids used for reconnect resubscribe calls
 
         # Track last WS message time (monotonic seconds)
         self._last_ws_message_monotonic: float = time.monotonic()
@@ -74,6 +75,27 @@ class KalshiWSRuntime:
             ("KALSHI-ACCESS-TIMESTAMP", ts),
             ("KALSHI-ACCESS-SIGNATURE", sig),
         ]
+    
+    async def subscribe_markets(self, tickers: list[str], *, _id: int = 42) -> None:
+        """
+        Subscribe markets.
+        IMPORTANT: We send one subscribe per ticker to avoid Kalshi bundling multiple tickers
+        under a single sid (which corrupts downstream state if keyed by sid).
+        """
+        tickers = [t.strip() for t in tickers if t and t.strip()]
+        if not tickers:
+            return
+
+        if len(tickers) > 1:
+            log.warning(
+                "subscribe_markets_called_with_multiple_tickers_splitting",
+                extra={"count": len(tickers), "id": _id},
+            )
+
+        # One subscribe per ticker, unique ids derived from the caller-provided _id
+        for i, t in enumerate(tickers):
+            await self.subscribe_market(t, _id=_id + i)
+            await asyncio.sleep(0.05)  # small spacing helps avoid bursts/rate limits
 
     # ---- lifecycle ----
     async def start(self, session_logger=None) -> None:
@@ -115,33 +137,19 @@ class KalshiWSRuntime:
         except ConnectionClosed:
             raise RuntimeError("WebSocket closed")
 
-    async def subscribe_markets(self, tickers: list[str], *, _id: int = 42) -> None:
-        payload = {
-            "id": _id,
-            "cmd": "subscribe",
-            "params": {
-                "channels": ["orderbook_delta"],
-                "market_tickers": tickers,
-                # hint to send an initial snapshot; ignored if unsupported
-                "snapshot": True,
-            },
-        }
-        await self.send(payload)
-        # remember subscriptions so we can re-subscribe after reconnects
-        try:
-            self._subscribed_markets.update(tickers)
-        except Exception:
-            # defensive: make sure subscription tracking never raises
-            log.exception("failed_to_track_subscriptions")
-
     async def _resubscribe_all(self) -> None:
-        """Re-send subscribe commands for all tracked markets after a reconnect."""
+        """Re-send subscribe commands for all tracked markets after a reconnect (one ticker per request)."""
         if not self._subscribed_markets:
             return
-        tickers = list(self._subscribed_markets)
+
+        tickers = sorted(self._subscribed_markets)
+        base = self._resub_id_base
+        self._resub_id_base += max(len(tickers), 1) + 1  # advance base for next reconnect
+
         try:
-            # use a non-blocking id to avoid colliding with callers
-            await self.subscribe_markets(tickers, _id=9999)
+            for i, t in enumerate(tickers):
+                await self.subscribe_market(t, _id=base + i)
+                await asyncio.sleep(0.05)
             log.info("resubscribed_markets", extra={"count": len(tickers)})
         except Exception:
             log.exception("resubscribe_failed")
