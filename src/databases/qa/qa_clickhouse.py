@@ -250,8 +250,8 @@ def sql_max_gap_seconds_per_ticker(db: str, hours: int) -> str:
     )
     SELECT
       market_ticker,
-      max(ts - prev_ts) AS max_gap_seconds,
-      quantileExact(0.99)(ts - prev_ts) AS p99_gap_seconds,
+            max(dateDiff('second', prev_ts, ts)) AS max_gap_seconds,
+            quantileExact(0.99)(dateDiff('second', prev_ts, ts)) AS p99_gap_seconds,
       count() AS points
     FROM ev
     WHERE prev_ts IS NOT NULL
