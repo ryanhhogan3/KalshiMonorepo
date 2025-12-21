@@ -1,6 +1,8 @@
 # src/databases/processing/clickhouse_sink.py
-import asyncio, os
+import asyncio, os, json
 from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from collections import deque
 import urllib.parse as up
 import clickhouse_connect
 from clickhouse_connect.driver.exceptions import DatabaseError, OperationalError
@@ -10,6 +12,36 @@ from .clickhouse_bootstrap import ensure_clickhouse_schema
 from .clickhouse_health import assert_clickhouse_ready
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class InsertStats:
+    insert_failures_total: int = 0
+    # timestamps (float seconds) of recent failures for windowed count
+    _recent_fail_ts: deque = field(default_factory=lambda: deque())
+    last_insert_error: str | None = None
+    last_insert_error_ts: float | None = None
+    last_success_insert_ts: float | None = None
+    inserts_total: int = 0
+    pending_rows: int = 0
+
+    def record_failure(self, error_msg: str, now_ts: float, window_s: int = 60):
+        self.insert_failures_total += 1
+        self.last_insert_error = error_msg[:500]
+        self.last_insert_error_ts = now_ts
+        self._recent_fail_ts.append(now_ts)
+        # purge old
+        cutoff = now_ts - window_s
+        while self._recent_fail_ts and self._recent_fail_ts[0] < cutoff:
+            self._recent_fail_ts.popleft()
+
+    def recent_fail_count(self) -> int:
+        return len(self._recent_fail_ts)
+
+    def record_success(self, now_ts: float, rows: int = 0):
+        self.last_success_insert_ts = now_ts
+        if rows:
+            self.inserts_total += rows
 
 
 class ClickHouseSink:
@@ -77,9 +109,18 @@ class ClickHouseSink:
         self._t = asyncio.get_event_loop().time()
         self._lock = asyncio.Lock()
         # Metrics for monitoring
+        # Insert stats object (used by streamer heartbeat)
+        self.insert_stats = InsertStats()
+
+        # Backwards compat aliases
         self.insert_failures = 0
         self.inserts_total = 0
         self.last_insert_ts = None
+
+        # Spool config
+        self.spool_dir = os.getenv("CLICKHOUSE_SPOOL_DIR", "/app/spool")
+        self.spool_max_bytes = int(os.getenv("CLICKHOUSE_SPOOL_MAX_BYTES", str(100 * 1024 * 1024)))
+        os.makedirs(self.spool_dir, exist_ok=True)
 
     def _new_ev(self):
         return {k: [] for k in ("type","sid","seq","market_id","market_ticker","side","price","qty","ts","ingest_ts")}
@@ -164,74 +205,123 @@ class ClickHouseSink:
             self._buffer_events = []
             self._t = asyncio.get_event_loop().time()
             # try to insert rows with retry & safety; never raise to caller
+            # record pending rows
+            self.insert_stats.pending_rows = len(batch)
             await self._insert_with_retry(self.table_events, batch, self._cols_ev)
+            self.insert_stats.pending_rows = 0
 
         # latest_levels buffer (columnar)
         if self._buf_lt["market_id"]:
             b = self._buf_lt
             self._buf_lt = self._new_lt()
-            try:
-                self._insert_compat(self.table_latest, b, self._cols_lt)
-            except Exception as e:
-                log.exception("clickhouse_latest_insert_failed: rows=%d", len(b.get("market_id", [])))
+            # convert columnar buffer to rows
+            rows = []
+            n = len(b.get("market_id", []))
+            for i in range(n):
+                row = {c: b[c][i] for c in self._cols_lt}
+                rows.append(row)
+            # record pending rows
+            self.insert_stats.pending_rows = len(rows)
+            await self._insert_with_retry(self.table_latest, rows, self._cols_lt)
+            self.insert_stats.pending_rows = 0
 
     async def _insert_with_retry(self, table, rows, cols):
-        """Insert a list of row dicts into ClickHouse with retries and batch-splitting on memory errors.
+        """Insert a list of row dicts into ClickHouse with retries and spool-on-giveup.
 
-        This will NOT raise to the caller; on repeated failure the batch is dropped after logging.
+        This will NOT raise to the caller; on repeated failure the batch is spooled to disk.
         """
-        max_attempts = 5
-        delay = 1.0
+        max_attempts = int(os.getenv("CLICKHOUSE_MAX_INSERT_ATTEMPTS", "5"))
+        delay = float(os.getenv("CLICKHOUSE_INSERT_BACKOFF_SECS", "1.0"))
+        jitter = float(os.getenv("CLICKHOUSE_INSERT_JITTER", "0.25"))
+        fail_window = int(os.getenv("CLICKHOUSE_INSERT_FAIL_WINDOW_S", "60"))
 
         # Build row-oriented list suitable for clickhouse client (list of tuples)
         # Ensure ordering of columns matches `cols`
-        row_tuples = [tuple(r.get(c) for c in cols) for r in rows]
+        def _sanitize_val(col, val):
+            # Never insert empty-string for UUID market_id; prefer None
+            if col == "market_id" and val == "":
+                return None
+            return val
+
+        row_tuples = [tuple(_sanitize_val(c, r.get(c)) for c in cols) for r in rows]
 
         for attempt in range(1, max_attempts + 1):
             try:
                 # prefer row-oriented insert with explicit column names
                 self.client.insert(table, row_tuples, column_names=cols)
-                # update sink metrics
+                # update sink metrics and insert_stats
                 try:
+                    now_ts = datetime.now(timezone.utc)
                     self.inserts_total += len(rows)
-                    self.last_insert_ts = datetime.now(timezone.utc)
+                    self.last_insert_ts = now_ts
+                    self.insert_stats.record_success(now_ts.timestamp(), rows=len(rows))
+                    # keep aliases in sync
+                    self.insert_failures = self.insert_stats.insert_failures_total
+                    self.inserts_total = self.insert_stats.inserts_total
                 except Exception:
                     pass
-                log.info("clickhouse_insert_ok", extra={"rows": len(rows), "attempt": attempt})
+                log.info(
+                    "clickhouse_insert_ok",
+                    extra={"rows": len(rows), "attempt": attempt, "table": table},
+                )
                 return
-            except (DatabaseError, OperationalError) as e:
-                msg = str(e)
-                category = self._classify_ch_error(msg)
+            except (DatabaseError, OperationalError, Exception) as e:
+                now = datetime.now(timezone.utc)
+                now_ts = now.timestamp()
+                msg = f"{e.__class__.__name__}: {str(e)}"
+                category = self._classify_ch_error(str(e))
+
+                # record failure in stats
+                try:
+                    self.insert_stats.record_failure(msg, now_ts, window_s=fail_window)
+                    # keep alias in sync
+                    self.insert_failures = self.insert_stats.insert_failures_total
+                except Exception:
+                    pass
+
+                # one structured log line per failure attempt
                 log.warning(
                     "clickhouse_insert_failed",
                     extra={
                         "rows": len(rows),
                         "attempt": attempt,
+                        "attempts_max": max_attempts,
+                        "table": table,
                         "category": category,
                         "error": msg[:500],
                     },
                 )
 
                 # If memory exceeded, try splitting batch in half (if possible)
-                if "MEMORY_LIMIT_EXCEEDED" in msg and len(rows) > 1:
+                if "MEMORY_LIMIT_EXCEEDED" in str(e) and len(rows) > 1:
                     mid = len(rows) // 2
                     await self._insert_with_retry(table, rows[:mid], cols)
                     await self._insert_with_retry(table, rows[mid:], cols)
                     return
 
                 if attempt == max_attempts:
-                    # final give-up: increment failure metric and log
+                    # final give-up: spool to disk for later replay
                     try:
-                        self.insert_failures += 1
+                        spooled_file = self._spool_rows(rows, cols)
+                        log.error(
+                            "clickhouse_insert_gave_up",
+                            extra={
+                                "rows": len(rows),
+                                "table": table,
+                                "category": category,
+                                "error": msg[:500],
+                                "spooled_file": spooled_file,
+                            },
+                        )
+                        # also ensure insert_stats totals reflect gave-up
+                        self.insert_stats.record_failure(msg, now_ts, window_s=fail_window)
+                        self.insert_failures = self.insert_stats.insert_failures_total
                     except Exception:
-                        pass
-                    log.error(
-                        "clickhouse_insert_gave_up",
-                        extra={"rows": len(rows), "category": category},
-                    )
+                        log.exception("Failed to spool rows after give-up")
                     return
 
-                await asyncio.sleep(delay)
+                # exponential backoff + jitter
+                await asyncio.sleep(delay + (jitter * (os.urandom(1)[0] / 255.0)))
                 delay *= 2
 
     def _classify_ch_error(self, msg: str) -> str:
@@ -242,4 +332,34 @@ class ClickHouseSink:
         if "NameResolutionError" in msg:
             return "dns_resolution"
         return "other"
+
+    def _spool_rows(self, rows: list[dict], cols: list[str]) -> str:
+        """Append rows as NDJSON to a spool file and rotate when exceeding size limit.
+
+        Returns the path of the spool file written to.
+        """
+        # write to current spool file
+        base = os.path.join(self.spool_dir, "spool_current.ndjson")
+        try:
+            with open(base, "a", encoding="utf8") as fh:
+                for r in rows:
+                    # include columns to make replay easier
+                    payload = {c: r.get(c) for c in cols}
+                    fh.write(json.dumps(payload, default=str))
+                    fh.write("\n")
+
+            # rotate if too large
+            try:
+                sz = os.path.getsize(base)
+                if sz > self.spool_max_bytes:
+                    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                    rotated = os.path.join(self.spool_dir, f"spool_{ts}.ndjson")
+                    os.replace(base, rotated)
+                    return rotated
+            except Exception:
+                pass
+            return base
+        except Exception:
+            log.exception("Failed to write spool file")
+            raise
 
