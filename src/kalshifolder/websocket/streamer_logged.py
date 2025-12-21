@@ -130,6 +130,8 @@ async def main():
 
         # Per-ticker heartbeat stats
         ticker_stats: Dict[str, Dict[str, object]] = {}
+        # Per-ticker sequence / gap / resnapshot metrics
+        ticker_seq_metrics: Dict[str, Dict[str, int]] = {}
 
         async def heartbeat_loop():
             while True:
@@ -161,7 +163,23 @@ async def main():
                                 f"delta={stats.get('deltas', 0)}, "
                                 f"age={age_s}"
                             )
-                        session_logger.info("ticker_health " + " | ".join(parts))
+                        # Enrich with sequence/gap/resnap metrics when available
+                        enriched = []
+                        for p in parts:
+                            enriched.append(p)
+                        for tkr in list(ticker_stats.keys()):
+                            m = ticker_seq_metrics.get(tkr)
+                            if not m:
+                                continue
+                            deltas = m.get('deltas_total', 0)
+                            resnaps = m.get('resnap_requests', 0)
+                            gap_count = m.get('gap_count', 0)
+                            gap_total = m.get('gap_total', 0)
+                            avg_gap = (gap_total / gap_count) if gap_count else 0
+                            enriched.append(
+                                f"{tkr}: deltas={deltas} resnaps={resnaps} avg_gap={avg_gap:.2f} max_gap={m.get('max_gap',0)}"
+                            )
+                        session_logger.info("ticker_health " + " | ".join(enriched))
 
                 except Exception:
                     logger.exception("Failed to emit heartbeat")
@@ -296,6 +314,13 @@ async def main():
 
                     ob.apply_snapshot(msg, seq)
 
+                    # Initialize / reset sequence metrics for this ticker
+                    m = ticker_seq_metrics.setdefault(
+                        ticker,
+                        {"last_seq": seq, "deltas_total": 0, "resnap_requests": 0, "gap_total": 0, "gap_count": 0, "max_gap": 0},
+                    )
+                    m["last_seq"] = seq
+
                     # Update ticker stats
                     stats = ticker_stats.setdefault(
                         ticker,
@@ -319,6 +344,24 @@ async def main():
                             d = pending_deltas[ticker].popleft()
                             dseq = d["seq"]
                             dmsg = d["msg"]
+
+                            # Update sequence metrics for replayed delta
+                            m = ticker_seq_metrics.setdefault(
+                                ticker,
+                                {"last_seq": None, "deltas_total": 0, "resnap_requests": 0, "gap_total": 0, "gap_count": 0, "max_gap": 0},
+                            )
+                            try:
+                                if m.get("last_seq") is not None:
+                                    gap = int(dseq) - int(m.get("last_seq")) - 1
+                                    if gap > 0:
+                                        m["gap_total"] += gap
+                                        m["gap_count"] += 1
+                                        if gap > m.get("max_gap", 0):
+                                            m["max_gap"] = gap
+                            except Exception:
+                                pass
+                            m["deltas_total"] = m.get("deltas_total", 0) + 1
+                            m["last_seq"] = int(dseq)
 
                             abs_size = ob.apply_delta(dmsg["side"], dmsg["price"], dmsg["delta"], dseq)
 
@@ -374,6 +417,24 @@ async def main():
                     if ob is None:
                         # We haven't seen a snapshot for this ticker yet; buffer the delta
                         pending_deltas[ticker].append({"seq": seq, "msg": msg})
+                        # Track seen deltas for this ticker even before snapshot
+                        m = ticker_seq_metrics.setdefault(
+                            ticker,
+                            {"last_seq": None, "deltas_total": 0, "resnap_requests": 0, "gap_total": 0, "gap_count": 0, "max_gap": 0},
+                        )
+                        m["deltas_total"] = m.get("deltas_total", 0) + 1
+                        try:
+                            m_last = m.get("last_seq")
+                            if m_last is not None:
+                                gap = int(seq) - int(m_last) - 1
+                                if gap > 0:
+                                    m["gap_total"] += gap
+                                    m["gap_count"] += 1
+                                    if gap > m.get("max_gap", 0):
+                                        m["max_gap"] = gap
+                        except Exception:
+                            pass
+                        m["last_seq"] = int(seq)
                         if len(pending_deltas[ticker]) in (1, 10, 100, 1000):
                             session_logger.warning(
                                 f"[x{len(pending_deltas[ticker])}] Delta before snapshot for {ticker}; buffering"
@@ -389,6 +450,9 @@ async def main():
                             try:
                                 await rt.subscribe_markets([ticker], _id=9001)
                                 last_resnapshot_monotonic[ticker] = now_mono
+                                # Record that we requested a resnapshot due to delta-before-snapshot
+                                ticker_seq_metrics.setdefault(ticker, {}).setdefault("resnap_requests", 0)
+                                ticker_seq_metrics[ticker]["resnap_requests"] = ticker_seq_metrics[ticker].get("resnap_requests", 0) + 1
                                 session.log_event(
                                     f"Requested resnapshot for {ticker} after delta-before-snapshot",
                                     level="warning",
@@ -409,6 +473,23 @@ async def main():
                     stats["last_ts"] = ts
                     stats["last_ingest_ts"] = now_utc()
 
+                    # Sequence / gap / resnap metrics
+                    m = ticker_seq_metrics.setdefault(
+                        ticker,
+                        {"last_seq": None, "deltas_total": 0, "resnap_requests": 0, "gap_total": 0, "gap_count": 0, "max_gap": 0},
+                    )
+                    try:
+                        if m.get("last_seq") is not None:
+                            gap = int(seq) - int(m.get("last_seq")) - 1
+                            if gap > 0:
+                                m["gap_total"] += gap
+                                m["gap_count"] += 1
+                                if gap > m.get("max_gap", 0):
+                                    m["max_gap"] = gap
+                    except Exception:
+                        pass
+                    m["deltas_total"] = m.get("deltas_total", 0) + 1
+                    m["last_seq"] = int(seq)
                     # Apply delta to book
                     abs_size = ob.apply_delta(msg["side"], msg["price"], msg["delta"], seq)
 
@@ -449,6 +530,9 @@ async def main():
                             try:
                                 await rt.subscribe_markets([ticker], _id=9000)
                                 last_resnapshot_monotonic[ticker] = now_mono
+                                # Record that we requested a resnapshot due to gap/negative-level
+                                ticker_seq_metrics.setdefault(ticker, {}).setdefault("resnap_requests", 0)
+                                ticker_seq_metrics[ticker]["resnap_requests"] = ticker_seq_metrics[ticker].get("resnap_requests", 0) + 1
                                 session.log_event(
                                     f"Requested resnapshot for {ticker} after gap/negative level",
                                     level="warning",
