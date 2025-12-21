@@ -185,6 +185,11 @@ Run monthly:
 chmod +x ~/maintenance.sh
 ./maintenance.sh
 
+sudo journalctl --vacuum-time=7d
+sudo bash -lc 'find /mnt/clickhouse/docker/containers -name "*-json.log" -exec truncate -s 0 {} \;'
+docker system prune -f
+df -h
+
 9️⃣ What I’d recommend next (for your setup)
 
 Given:
