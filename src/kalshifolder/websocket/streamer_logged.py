@@ -136,15 +136,41 @@ async def main():
         async def heartbeat_loop():
             while True:
                 try:
-                    last_insert = getattr(ch, "last_insert_ts", None)
-                    last_insert_s = last_insert.isoformat() if last_insert else "-"
+                    # ClickHouse insert stats
+                    istats = getattr(ch, "insert_stats", None)
+                    if istats:
+                        insert_failures_total = istats.insert_failures_total
+                        insert_failures_recent = istats.recent_fail_count()
+                        last_err_age = (
+                            f"{(datetime.now(timezone.utc).timestamp() - istats.last_insert_error_ts):.0f}s"
+                            if istats.last_insert_error_ts
+                            else "-"
+                        )
+                        last_err = istats.last_insert_error or "-"
+                        last_success = (
+                            datetime.fromtimestamp(istats.last_success_insert_ts, timezone.utc).isoformat()
+                            if istats.last_success_insert_ts
+                            else "-"
+                        )
+                        pending_rows = getattr(istats, "pending_rows", 0)
+                    else:
+                        insert_failures_total = getattr(ch, "insert_failures", 0)
+                        insert_failures_recent = 0
+                        last_err_age = "-"
+                        last_err = "-"
+                        last_success = getattr(ch, "last_insert_ts", "-")
+                        pending_rows = 0
+
                     ws_age = rt.last_ws_message_age
                     last_ws_s = f"{ws_age:.1f}s" if ws_age != float("inf") else "-"
 
                     session_logger.info(
                         f"streamer_heartbeat events_total={events_total} "
-                        f"insert_failures={ch.insert_failures} "
-                        f"last_insert_ts={last_insert_s} last_ws_message_age={last_ws_s}"
+                        f"insert_failures_total={insert_failures_total} "
+                        f"insert_failures_recent={insert_failures_recent} "
+                        f"pending_rows={pending_rows} last_success_insert={last_success} "
+                        f"last_insert_error_age={last_err_age} last_insert_error={last_err} "
+                        f"last_ws_message_age={last_ws_s}"
                     )
 
                     now_dt = datetime.now(timezone.utc)
