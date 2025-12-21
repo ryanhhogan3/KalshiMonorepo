@@ -13,6 +13,10 @@ docker restart
 # view streamer logs
 docker logs -f kalshi_streamer 
 
+# Verify ClickHouse is reachable and writing:
+curl -s http://localhost:8123/ping && echo
+docker exec -it clickhouse clickhouse-client --query "SELECT count() FROM kalshi.orderbook_events;"
+
 # Rotating file logs (inside the container)
 Inside the running container:
 /app/logs/
