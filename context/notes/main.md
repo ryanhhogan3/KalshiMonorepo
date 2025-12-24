@@ -1,6 +1,8 @@
 ## Connect with the EC2 instance via SSH
 ssh -i C:\Users\ryanh\Desktop\Code\AWS\Secrets\kalshiMonoEC2key.pem ubuntu@18.219.222.79
 
+ssh -i C:\Users\ryanh\Desktop\AWS\kalshiMonoEC2key.pem ubuntu@18.219.222.79
+
 # Once inside EC2
 # Reset docker container build
 docker compose down
@@ -176,3 +178,16 @@ If you want a “daily health” quick check:
 
 docker exec -it kalshi_streamer /bin/sh -lc \
 'python3 /app/src/databases/qa/qa_clickhouse.py --hours 6 --days 2'
+
+# This reclaims the space right now:
+
+docker exec -i clickhouse clickhouse-client <<'SQL'
+TRUNCATE TABLE system.trace_log;
+TRUNCATE TABLE system.text_log;
+TRUNCATE TABLE system.query_log;
+TRUNCATE TABLE system.processors_profile_log;
+TRUNCATE TABLE system.part_log;
+TRUNCATE TABLE system.metric_log;
+TRUNCATE TABLE system.asynchronous_metric_log;
+SYSTEM FLUSH LOGS;
+SQL
