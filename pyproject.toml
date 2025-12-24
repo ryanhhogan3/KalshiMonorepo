@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kalshi-monorepo-backtest"
+version = "0.1.0"
+description = "Backtest/replay scaffold for KalshiMonorepo"
+authors = [ { name = "dev", email = "dev@example.com" } ]
+readme = "README.md"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+where = ["src"]
