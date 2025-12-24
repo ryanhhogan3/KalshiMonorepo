@@ -12,3 +12,4 @@ venv/
 env/
 ENV/
 secrets/
+data/cache/
