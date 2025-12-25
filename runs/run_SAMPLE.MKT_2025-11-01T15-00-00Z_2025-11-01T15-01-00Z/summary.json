@@ -1,0 +1,13 @@
+{
+  "counters": {
+    "quote_count": 24,
+    "cancel_count": 0,
+    "modify_count": 0
+  },
+  "n_equity_points": 12,
+  "n_fills": 0,
+  "n_orders": 24,
+  "events": 13,
+  "snapshots": 1,
+  "deltas": 12
+}

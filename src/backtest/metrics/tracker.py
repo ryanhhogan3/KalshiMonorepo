@@ -43,7 +43,7 @@ class MetricsTracker:
     def incr(self, key: str, n: int = 1):
         self.counters[key] = self.counters.get(key, 0) + n
 
-    def dump(self):
+    def dump(self, stats: dict = None):
         # write summary.json and csvs
         summary = {
             'counters': self.counters,
@@ -51,6 +51,11 @@ class MetricsTracker:
             'n_fills': len(self.fills),
             'n_orders': len(self.orders),
         }
+        # merge in run-level stats if provided (events, snapshots, deltas, etc.)
+        if stats:
+            for k, v in stats.items():
+                # keep top-level numeric stats for easy consumption
+                summary[k] = v
         with open(os.path.join(self.run_dir, 'summary.json'), 'w') as fh:
             json.dump(summary, fh, indent=2)
 
@@ -61,18 +66,20 @@ class MetricsTracker:
             for r in self.equity_timeseries:
                 w.writerow(r)
 
-        # fills
-        if self.fills:
-            with open(os.path.join(self.run_dir, 'fills.csv'), 'w', newline='') as fh:
-                w = csv.DictWriter(fh, fieldnames=list(self.fills[0].keys()))
-                w.writeheader()
-                for r in self.fills:
-                    w.writerow(r)
+        # fills - always write header even if no fills
+        fills_path = os.path.join(self.run_dir, 'fills.csv')
+        fills_fields = ['order_id', 'side', 'price', 'size', 'ts_ms', 'reason']
+        with open(fills_path, 'w', newline='') as fh:
+            w = csv.DictWriter(fh, fieldnames=fills_fields)
+            w.writeheader()
+            for r in self.fills:
+                w.writerow(r)
 
-        # orders
-        if self.orders:
-            with open(os.path.join(self.run_dir, 'orders.csv'), 'w', newline='') as fh:
-                w = csv.DictWriter(fh, fieldnames=list(self.orders[0].keys()))
-                w.writeheader()
-                for r in self.orders:
-                    w.writerow(r)
+        # orders - always write header even if no orders
+        orders_path = os.path.join(self.run_dir, 'orders.csv')
+        orders_fields = ['order_id', 'side', 'price', 'size', 'status', 'created_ts_ms', 'updated_ts_ms']
+        with open(orders_path, 'w', newline='') as fh:
+            w = csv.DictWriter(fh, fieldnames=orders_fields)
+            w.writeheader()
+            for r in self.orders:
+                w.writerow(r)

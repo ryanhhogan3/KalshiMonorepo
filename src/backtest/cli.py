@@ -15,6 +15,16 @@ from backtest.sim.portfolio import Portfolio
 from backtest.metrics.tracker import MetricsTracker
 from backtest.sim.types import SimConfig
 from backtest.strategy.baseline_mm import strategy_step
+import re
+from pathlib import Path
+
+def safe_slug(s: str) -> str:
+    # Windows-safe: remove or replace characters not allowed in filenames
+    # < > : " / \ | ? *
+    return re.sub(r'[<>:"/\\|?*]', '-', s)
+
+def run_dir_name(market: str, start: str, end: str) -> str:
+    return f"run_{safe_slug(market)}_{safe_slug(start)}_{safe_slug(end)}"
 
 
 def parse_args(argv=None):
@@ -22,12 +32,18 @@ def parse_args(argv=None):
     sub = parser.add_subparsers(dest="cmd")
 
     run = sub.add_parser("run", help="Run a backtest")
+    run.add_argument(
+        "--path", "--fixture",
+        dest="path",
+        help="Path to parquet file (fixture) when --source parquet",
+        default=None,
+    )
     run.add_argument("--market", required=True)
     run.add_argument("--start", required=True)
     run.add_argument("--end", required=True)
     run.add_argument("--source", choices=["clickhouse", "parquet"], default="clickhouse")
     run.add_argument("--cache", action="store_true", help="Write a parquet cache for faster iteration")
-    run.add_argument("--fixture", help="Path to parquet fixture (for parquet source)")
+    run.add_argument("--out-dir", default="runs", help="Base output directory for run artifacts")
 
     gen = sub.add_parser("generate-fixture", help="Generate a small synthetic parquet fixture for smoke tests")
     gen.add_argument("--out", default=os.path.join("tests", "fixtures", "sample_market_1min.parquet"))
@@ -41,7 +57,17 @@ def cmd_run(args):
     tend = datetime.fromisoformat(args.end.replace("Z", "+00:00"))
 
     # event stream yields snapshot batches and delta events
-    stream = get_event_stream(source=args.source, market=args.market, t_start=tstart, t_end=tend, fixture_path=args.fixture, cache=args.cache)
+    stream = get_event_stream(
+    source=args.source,
+    market=args.market,
+    t_start=tstart,
+    t_end=tend,
+    fixture_path=args.path,   # <-- THIS is the missing piece
+    cache=args.cache,
+)
+    if args.source == "parquet" and not args.path:
+        raise SystemExit("For --source parquet you must provide --path (or --fixture) to a parquet file.")
+
 
     book = None
     prev_book = None
@@ -51,8 +77,11 @@ def cmd_run(args):
     broker = Broker()
     config = SimConfig()
     portfolio = Portfolio(cash=0.0, inventory=0.0)
-    run_dir = os.path.join('runs', f"run_{args.market}_{args.start}_{args.end}")
-    tracker = MetricsTracker(run_dir)
+    # anchor run directory at repository root so test runs and external invocations
+    # create outputs in a predictable location independent of current working dir
+    base_out = Path(args.out_dir)
+    run_dir = base_out / f"run_{safe_slug(args.market)}_{safe_slug(args.start)}_{safe_slug(args.end)}"
+    tracker = MetricsTracker(str(run_dir))
 
     # For the clickhouse path we may want to capture the full window to write cache.
     # get_event_stream currently yields snapshot then deltas. For clickhouse we'll also fetch the full window inside the reader.
@@ -118,15 +147,15 @@ def cmd_run(args):
             start_ms = int(tstart.timestamp() * 1000)
             end_ms = int(tend.timestamp() * 1000)
             rows = fetch_window(args.market, start_ms, end_ms)
-            cache_path = os.path.join('data', 'cache', f"{args.market}_{args.start}_{args.end}.parquet")
+            cache_path = os.path.join(repo_root, 'data', 'cache', f"{args.market}_{args.start}_{args.end}.parquet")
             os.makedirs(os.path.dirname(cache_path), exist_ok=True)
             write_cache(rows, cache_path)
             print(f"Wrote cache to {cache_path}")
         except Exception as e:
             print("Failed to write cache:", e)
-    # dump metrics
+    # dump metrics (include run-level stats for summary)
     try:
-        tracker.dump()
+        tracker.dump(stats=stats)
         print(f"Wrote run outputs to {run_dir}")
     except Exception:
         pass
