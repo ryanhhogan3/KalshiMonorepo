@@ -78,5 +78,30 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # Backtest runner - executes replay/backtest jobs on the same network as ClickHouse
+  backtest_runner:
+    build: .
+    container_name: backtest_runner
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      CH_URL: http://clickhouse:8123
+      # mount demo key on host into container if you need live REST/WS access
+      DEMO_KEYFILE: /run/secrets/demo_keys.pem
+    volumes:
+      - ./:/app:ro
+      - ./data:/app/data
+      - ./runs:/app/runs
+      - ./tests/fixtures:/app/tests/fixtures:ro
+      - ./.env:/app/.env:ro
+    command: ["tail", "-f", "/dev/null"]
+    restart: "no"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   clickhouse_data:
