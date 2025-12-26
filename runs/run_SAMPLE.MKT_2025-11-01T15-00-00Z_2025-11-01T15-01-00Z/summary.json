@@ -1,12 +1,18 @@
 {
   "counters": {
-    "quote_count": 24,
+    "quote_count": 2,
     "cancel_count": 0,
     "modify_count": 0
   },
   "n_equity_points": 12,
   "n_fills": 0,
-  "n_orders": 24,
+  "n_orders": 2,
+  "final_inventory": 0.0,
+  "final_cash": 0.0,
+  "final_equity": 0.0,
+  "max_abs_inventory": 0.0,
+  "max_drawdown": 0.0,
+  "avg_quoted_spread": 1.0,
   "events": 13,
   "snapshots": 1,
   "deltas": 12
