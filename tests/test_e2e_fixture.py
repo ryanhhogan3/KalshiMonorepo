@@ -45,6 +45,8 @@ def test_e2e_runs_and_writes_outputs(tmp_path):
     # verify artifact files exist
     import json
     summary = json.loads((run_dir / "summary.json").read_text())
+    c = summary["counters"]
+    assert (c["modify_count"] + c["cancel_count"]) > 0
     assert summary["events"] > 0
     assert summary["snapshots"] > 0
     assert (run_dir / "summary.json").exists()
