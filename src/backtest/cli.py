@@ -18,6 +18,10 @@ from backtest.strategy.baseline_mm import strategy_step
 import re
 from pathlib import Path
 
+
+# repository root for deterministic output paths
+repo_root = Path(__file__).resolve().parents[2]
+
 def safe_slug(s: str) -> str:
     # Windows-safe: remove or replace characters not allowed in filenames
     # < > : " / \ | ? *
@@ -44,7 +48,12 @@ def parse_args(argv=None):
     run.add_argument("--source", choices=["clickhouse", "parquet"], default="clickhouse")
     run.add_argument("--cache", action="store_true", help="Write a parquet cache for faster iteration")
     run.add_argument("--out-dir", default="runs", help="Base output directory for run artifacts")
-
+    run.add_argument("--tick", type=float, default=None, help="Price tick size")
+    run.add_argument("--order-size", type=int, default=None, help="Order size per quote")
+    run.add_argument("--max-inv", type=float, default=None, help="Max absolute inventory")
+    run.add_argument("--min-spread-ticks", type=int, default=None, help="Min spread (in ticks) required to quote both sides")
+    run.add_argument("--skew-k", type=float, default=None, help="Inventory skew coefficient (ticks per unit inventory, or your chosen meaning)")
+    
     gen = sub.add_parser("generate-fixture", help="Generate a small synthetic parquet fixture for smoke tests")
     gen.add_argument("--out", default=os.path.join("tests", "fixtures", "sample_market_1min.parquet"))
 
@@ -76,12 +85,30 @@ def cmd_run(args):
     # sim components
     broker = Broker()
     config = SimConfig()
+
+    # override defaults if CLI args were provided
+    if args.tick is not None:
+        config.tick = args.tick
+    if args.order_size is not None:
+        config.order_size = args.order_size
+    if args.max_inv is not None:
+        config.max_inv = args.max_inv
+    if args.min_spread_ticks is not None:
+        config.min_spread_ticks = args.min_spread_ticks
+    if args.skew_k is not None:
+        config.skew_k = args.skew_k
+
     portfolio = Portfolio(cash=0.0, inventory=0.0)
     # anchor run directory at repository root so test runs and external invocations
-    # create outputs in a predictable location independent of current working dir
-    base_out = Path(args.out_dir)
+    
+    out_dir = Path(args.out_dir)
+    base_out = out_dir if out_dir.is_absolute() else (repo_root / out_dir)
+    base_out.mkdir(parents=True, exist_ok=True)
     run_dir = base_out / f"run_{safe_slug(args.market)}_{safe_slug(args.start)}_{safe_slug(args.end)}"
     tracker = MetricsTracker(str(run_dir))
+
+    # persistent strategy state for working order ids
+    strategy_state = {'bid_id': None, 'ask_id': None}
 
     # For the clickhouse path we may want to capture the full window to write cache.
     # get_event_stream currently yields snapshot then deltas. For clickhouse we'll also fetch the full window inside the reader.
@@ -99,12 +126,27 @@ def cmd_run(args):
             stats["deltas"] += 1
 
             # strategy produces actions based on current book and portfolio
-            actions = strategy_step(book, portfolio.inventory, config, broker.all_orders())
+            actions = strategy_step(book, portfolio.inventory, config, broker.all_orders(), strategy_state)
             for act in actions:
                 o = broker.apply_action(act, ts_ms=ev.get('ts_ms'))
-                if o:
+                if act.kind == 'place' and o:
                     tracker.record_order(o)
                     tracker.incr('quote_count')
+                    # store placed order id in strategy state
+                    if act.side == 'buy':
+                        strategy_state['bid_id'] = o.order_id
+                    else:
+                        strategy_state['ask_id'] = o.order_id
+                elif act.kind == 'modify':
+                    tracker.incr('modify_count')
+                    # modify keeps the same order id in strategy_state
+                elif act.kind == 'cancel':
+                    tracker.incr('cancel_count')
+                    # clear state if we canceled a tracked id
+                    if act.side == 'buy' and strategy_state.get('bid_id') == act.order_id:
+                        strategy_state['bid_id'] = None
+                    if act.side == 'sell' and strategy_state.get('ask_id') == act.order_id:
+                        strategy_state['ask_id'] = None
 
             # check fills deterministically based on prev_book -> book and open orders
             fills = check_fills(prev_book, book, broker.all_orders(), slippage_ticks=config.slippage_ticks, tick_size=config.tick_size)
@@ -114,6 +156,11 @@ def cmd_run(args):
                 tracker.record_fill(f)
                 # remove filled order from broker
                 broker.cancel(f.order_id, ts_ms=f.ts_ms)
+                # if a working order was filled, clear it from strategy_state
+                if strategy_state.get('bid_id') == f.order_id:
+                    strategy_state['bid_id'] = None
+                if strategy_state.get('ask_id') == f.order_id:
+                    strategy_state['ask_id'] = None
 
             # record metrics at this ts
             mid = None
@@ -147,7 +194,7 @@ def cmd_run(args):
             start_ms = int(tstart.timestamp() * 1000)
             end_ms = int(tend.timestamp() * 1000)
             rows = fetch_window(args.market, start_ms, end_ms)
-            cache_path = os.path.join(repo_root, 'data', 'cache', f"{args.market}_{args.start}_{args.end}.parquet")
+            cache_path = os.path.join(str(repo_root), 'data', 'cache', f"{args.market}_{args.start}_{args.end}.parquet")
             os.makedirs(os.path.dirname(cache_path), exist_ok=True)
             write_cache(rows, cache_path)
             print(f"Wrote cache to {cache_path}")
