@@ -46,3 +46,7 @@ class SimConfig:
     fee_bps: float = 0.0
     slippage_ticks: int = 0
     seed: int = 0
+    # new config params for baseline strategy
+    order_size: float = 1.0
+    min_spread_ticks: int = 1
+    skew_k: float = 0.0  # ticks per unit inventory to skew quotes
