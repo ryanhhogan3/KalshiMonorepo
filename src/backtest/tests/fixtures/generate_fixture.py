@@ -48,6 +48,22 @@ def write_sample_parquet(path: str) -> None:
         t = t0 + timedelta(seconds=5 * i)
         ts_ms = int(t.timestamp() * 1000)
         seq_i = seq + i
+        # --- TOB shock to force cancel/replace ---
+        if i == 6:
+            # move best bid ABOVE snapshot best bid (99.5) so target bid should change
+            rows.append({
+                'market_ticker': 'SAMPLE.MKT',
+                'type': 'delta',
+                'sid': sid,
+                'seq': seq_i,
+                'ts_ms': ts_ms,
+                'ingest_ts': ts_ms,
+                'side': 'yes',
+                'price': 99.80,
+                'qty': 50,
+            })
+            continue
+        
         if i % 2 == 0:
             # update bid level
             rows.append({
@@ -61,6 +77,7 @@ def write_sample_parquet(path: str) -> None:
                 'price': 99.0 + 0.01 * i,
                 'qty': 100 - i,
             })
+            
         else:
             # update ask level
             rows.append({
