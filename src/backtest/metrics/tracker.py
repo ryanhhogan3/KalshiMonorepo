@@ -51,6 +51,56 @@ class MetricsTracker:
             'n_fills': len(self.fills),
             'n_orders': len(self.orders),
         }
+        # compute additional performance metrics if we have equity timeseries
+        final_inventory = None
+        final_cash = None
+        final_equity = None
+        max_abs_inventory = None
+        max_drawdown = None
+        if self.equity_timeseries:
+            final = self.equity_timeseries[-1]
+            final_inventory = final.get('inventory')
+            final_cash = final.get('cash')
+            final_equity = final.get('equity')
+            max_abs_inventory = max(abs(r.get('inventory', 0)) for r in self.equity_timeseries)
+            # compute peak-to-trough drawdown
+            peaks = []
+            running_max = float('-inf')
+            max_dd = 0.0
+            for r in self.equity_timeseries:
+                eq = r.get('equity', 0.0)
+                if eq > running_max:
+                    running_max = eq
+                dd = running_max - eq
+                if dd > max_dd:
+                    max_dd = dd
+            max_drawdown = max_dd
+
+        # compute average quoted spread from recorded orders when both sides present
+        avg_quoted_spread = None
+        if self.orders:
+            # group orders by created_ts_ms
+            groups = {}
+            for o in self.orders:
+                ts = o.get('created_ts_ms', 0)
+                groups.setdefault(ts, []).append(o)
+            spreads = []
+            for ts, items in groups.items():
+                bids = [it['price'] for it in items if it.get('side') in ('buy',) and it.get('price') is not None]
+                asks = [it['price'] for it in items if it.get('side') in ('sell',) and it.get('price') is not None]
+                if bids and asks:
+                    spread = min(asks) - max(bids)
+                    spreads.append(spread)
+            if spreads:
+                avg_quoted_spread = sum(spreads) / len(spreads)
+
+        # attach computed metrics
+        summary['final_inventory'] = final_inventory
+        summary['final_cash'] = final_cash
+        summary['final_equity'] = final_equity
+        summary['max_abs_inventory'] = max_abs_inventory
+        summary['max_drawdown'] = max_drawdown
+        summary['avg_quoted_spread'] = avg_quoted_spread
         # merge in run-level stats if provided (events, snapshots, deltas, etc.)
         if stats:
             for k, v in stats.items():
