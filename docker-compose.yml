@@ -14,7 +14,7 @@ services:
       - clickhouse_data:/var/lib/clickhouse
       - ./src/databases/storage/clickhouse_ddl.sql:/docker-entrypoint-initdb.d/init.sql
 #      - ./clickhouse_config/memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
-      - ./clickhouse_config/config.d:/etc/clickhouse-server/config.d:ro
+      - ./clickhouse_config/00-listen-all.xml:/etc/clickhouse-server/config.d/00-listen-all.xml:ro
     healthcheck:
       test: ["CMD-SHELL", "clickhouse-client --query='SELECT 1' || exit 1"]
       interval: 10s
@@ -87,6 +87,9 @@ services:
         condition: service_healthy
     environment:
       CH_URL: http://clickhouse:8123
+      CH_USER: ${CLICKHOUSE_USER:-default}
+      CH_PASSWORD: ${CLICKHOUSE_PASSWORD:-default_password}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-kalshi}
       # mount demo key on host into container if you need live REST/WS access
       DEMO_KEYFILE: /run/secrets/demo_keys.pem
     volumes:
