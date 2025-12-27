@@ -27,17 +27,33 @@ import json
 import requests
 from typing import Generator, Dict, Any, Optional, List
 import pandas as pd
+from requests.auth import HTTPBasicAuth
 
 
 def _ch_url() -> str:
     return os.getenv("CH_URL", "http://localhost:8123")
 
+def _ch_db() -> str:
+    # match docker-compose: CLICKHOUSE_DATABASE=kalshi
+    return os.getenv("CLICKHOUSE_DATABASE", os.getenv("CH_DATABASE", "kalshi"))
+
+def _auth():
+    user = os.getenv("CH_USER", os.getenv("CLICKHOUSE_USER", "default"))
+    pwd  = os.getenv("CH_PASSWORD", os.getenv("CLICKHOUSE_PASSWORD", "default_password"))
+    return HTTPBasicAuth(user, pwd)
+
 
 def _query(sql: str) -> List[Dict[str, Any]]:
     url = _ch_url()
-    # Use JSONEachRow for easy parsing
+    user = os.getenv("CH_USER", "default")
+    pwd  = os.getenv("CH_PASSWORD", "")
     sql = sql.strip() + " FORMAT JSONEachRow"
-    resp = requests.post(url, data=sql.encode("utf-8"), timeout=60)
+    resp = requests.post(
+        url,
+        data=sql.encode("utf-8"),
+        timeout=60,
+        auth=HTTPBasicAuth(user, pwd),
+    )
     resp.raise_for_status()
     rows: List[Dict[str, Any]] = []
     for line in resp.iter_lines(decode_unicode=True):
@@ -50,46 +66,59 @@ def _query(sql: str) -> List[Dict[str, Any]]:
             continue
     return rows
 
-
 def get_snapshot_before(market_ticker: str, t_start_unix_ms: int) -> Optional[Dict[str, Any]]:
-    """Find the latest snapshot seq and ts at or before t_start_unix_ms.
-
-    Returns a dict with 'seq' and 'ts_ms' and other fields from any one of the snapshot rows.
-    """
+    db = _ch_db()
     sql = (
-        "SELECT seq, ts_ms FROM orderbook_events "
-        f"WHERE market_ticker = '{market_ticker}' AND type = 'snapshot' AND ts_ms <= {t_start_unix_ms} "
-        "ORDER BY ts_ms DESC, seq DESC LIMIT 1"
+    "SELECT "
+    "  seq, "
+    "  toUnixTimestamp64Milli(ts) AS ts_ms "
+    "FROM kalshi.orderbook_events "
+    f"WHERE market_ticker = '{market_ticker}' "
+    "  AND type = 'snapshot' "
+    f"  AND ts <= toDateTime64({t_start_unix_ms}/1000.0, 3) "
+    "ORDER BY ts DESC, seq DESC "
+    "LIMIT 1"
     )
     rows = _query(sql)
     return rows[0] if rows else None
 
 
 def fetch_snapshot_rows(market_ticker: str, snapshot_seq: int) -> List[Dict[str, Any]]:
-    """Fetch all rows that belong to the snapshot sequence (same seq).
-
-    Returns list of rows (snapshot levels).
-    """
+    """Fetch all rows that belong to the snapshot sequence (same seq)."""
     sql = (
-        "SELECT * FROM orderbook_events "
-        f"WHERE market_ticker = '{market_ticker}' AND type = 'snapshot' AND seq = {snapshot_seq} "
-        "ORDER BY ts_ms ASC, seq ASC, sid ASC, side ASC, price ASC"
+        "SELECT "
+        "  market_ticker, type, sid, seq, "
+        "  toUnixTimestamp64Milli(ts) AS ts_ms, "
+        "  ingest_ts, "
+        "  side, "
+        "  if(side='no', 100 - price, price) AS price, "
+        "  if(side='no', -abs(qty), abs(qty)) AS qty "
+        "FROM kalshi.orderbook_events "
+        f"WHERE market_ticker = '{market_ticker}' "
+        "  AND type = 'snapshot' "
+        f"  AND seq = {snapshot_seq} "
+        "ORDER BY ts ASC, seq ASC, sid ASC, price ASC"
     )
     return _query(sql)
+
 
 
 def fetch_window(market_ticker: str, start_ts_ms: int, end_ts_ms: int) -> List[Dict[str, Any]]:
-    """Fetch all rows for a window [start_ts_ms, end_ts_ms] ordered deterministically.
-
-    Includes snapshot rows if they fall in the window.
-    """
+    db = _ch_db()
     sql = (
-        "SELECT * FROM orderbook_events "
-        f"WHERE market_ticker = '{market_ticker}' AND ts_ms >= {start_ts_ms} AND ts_ms <= {end_ts_ms} "
-        "ORDER BY ts_ms ASC, seq ASC, sid ASC, side ASC, price ASC"
-    )
-    return _query(sql)
+    "SELECT "
+    "  market_ticker, type, sid, seq, "
+    "  toUnixTimestamp64Milli(ts) AS ts_ms, "
+    "  side, price, qty "
+    "FROM kalshi.orderbook_events "
+    f"WHERE market_ticker = '{market_ticker}' "
+    f"  AND toUnixTimestamp64Milli(ts) >= {start_ts_ms} "
+    f"  AND toUnixTimestamp64Milli(ts) <= {end_ts_ms} "
+    "  AND ( (side='yes' AND qty>0) OR (side='no' AND qty<0) ) "
+    "ORDER BY ts_ms ASC, seq ASC, sid ASC, side ASC, price ASC"
+)
 
+    return _query(sql)
 
 def stream_events(market_ticker: str, start_ts_ms: int, end_ts_ms: int) -> Generator[Dict[str, Any], None, None]:
     """Generator over deterministic ordered rows between start and end (inclusive)."""
