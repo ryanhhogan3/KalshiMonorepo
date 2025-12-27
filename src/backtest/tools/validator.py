@@ -16,27 +16,31 @@ from datetime import datetime, timedelta
 import requests
 import json
 from typing import Dict, Any
+from requests.auth import HTTPBasicAuth
 
 
 def _ch_url() -> str:
     return os.getenv("CH_URL", "http://localhost:8123")
 
-
 def _query(sql: str):
-    url = _ch_url()
-    sql = sql.strip() + " FORMAT JSONEachRow"
-    resp = requests.post(url, data=sql.encode("utf-8"), timeout=30)
-    resp.raise_for_status()
-    rows = []
-    for line in resp.iter_lines(decode_unicode=True):
-        if not line:
-            continue
-        try:
-            rows.append(json.loads(line))
-        except Exception:
-            continue
-    return rows
+    url = os.getenv("CH_URL", "http://clickhouse:8123")
+    user = os.getenv("CH_USER", "default")
+    pwd = os.getenv("CH_PASSWORD", "")
 
+    sql = sql.strip()
+    if "FORMAT" not in sql.upper():
+        sql += " FORMAT JSONEachRow"
+
+    resp = requests.post(
+        url,
+        data=sql.encode("utf-8"),
+        timeout=30,
+        auth=HTTPBasicAuth(user, pwd),
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"ClickHouse HTTP {resp.status_code}: {resp.text[:1000]}")
+
+    return [json.loads(line) for line in resp.text.splitlines() if line.strip()]
 
 def run_check(market: str, minutes: int = 2):
     now = datetime.utcnow()
@@ -45,8 +49,8 @@ def run_check(market: str, minutes: int = 2):
     end_ms = int(now.timestamp() * 1000)
 
     sql = (
-        "SELECT price, qty FROM orderbook_events "
-        f"WHERE market_ticker = '{market}' AND ts_ms >= {start_ms} AND ts_ms <= {end_ms} "
+        "SELECT price, qty FROM kalshi.orderbook_events "
+        f"WHERE market_ticker = '{market}' AND ts > now() - INTERVAL {minutes} MINUTE"
     )
     rows = _query(sql)
 
