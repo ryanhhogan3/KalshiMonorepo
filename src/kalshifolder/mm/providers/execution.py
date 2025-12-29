@@ -72,13 +72,18 @@ class KalshiExecutionProvider:
         return headers
 
     def place_order(self, market_ticker: str, side: str, price: float, size: float, client_order_id: str):
-        path = '/v1/orders'
+        # OpenAPI: POST /portfolio/orders (CreateOrder)
+        path = '/portfolio/orders'
         url = self._endpoint(path)
+        # API expects fields like 'ticker' and 'count' in some variants; include both common names
         payload = {
             'market_ticker': market_ticker,
+            'ticker': market_ticker,
             'side': side,
             'price': self.format_price_for_api(price),
+            'price_cents': int(self.format_price_for_api(price) if isinstance(self.format_price_for_api(price), int) else round(self.format_price_for_api(price)*100)),
             'size': int(size),
+            'count': int(size),
             'client_order_id': client_order_id,
         }
         body = requests.utils.json.dumps(payload)
@@ -87,12 +92,20 @@ class KalshiExecutionProvider:
         try:
             r = requests.post(url, data=body, headers=headers, timeout=self.timeout)
             latency = int(time.time() * 1000) - t0
-            status = 'ACK' if r.status_code < 400 else 'REJECT'
+            status = 'ACK' if r.status_code in (200, 201) or r.status_code < 300 else 'REJECT'
             exchange_id = None
             try:
                 j = r.json()
-                # common keys
-                exchange_id = j.get('order_id') or j.get('id') or j.get('exchange_order_id')
+                # CreateOrder may return {"order": {...}} or the order object directly
+                order_obj = None
+                if isinstance(j, dict):
+                    order_obj = j.get('order') or j.get('orders') or j
+                else:
+                    order_obj = j
+                if isinstance(order_obj, list) and order_obj:
+                    order_obj = order_obj[0]
+                if isinstance(order_obj, dict):
+                    exchange_id = order_obj.get('order_id') or order_obj.get('id') or order_obj.get('orderId') or order_obj.get('exchange_order_id')
             except Exception:
                 exchange_id = None
             return {'status': status, 'latency_ms': latency, 'raw': r.text, 'code': r.status_code, 'exchange_order_id': exchange_id}
@@ -102,18 +115,22 @@ class KalshiExecutionProvider:
             return {'status': 'ERROR', 'latency_ms': latency, 'raw': str(e)}
 
     def cancel_order(self, client_order_id: str):
-        path = f'/v1/orders/{client_order_id}'
+        # OpenAPI: DELETE /portfolio/orders/{order_id}
+        # The API expects the order id. Allow callers to pass client_order_id or exchange id.
+        path = f'/portfolio/orders/{client_order_id}'
         url = self._endpoint(path)
         headers = self._signed_headers('DELETE', path, '')
         t0 = int(time.time() * 1000)
         try:
             r = requests.delete(url, headers=headers, timeout=self.timeout)
             latency = int(time.time() * 1000) - t0
-            status = 'ACK' if r.status_code < 400 else 'REJECT'
+            status = 'ACK' if r.status_code < 300 else 'REJECT'
             exchange_id = None
             try:
                 j = r.json()
-                exchange_id = j.get('order_id') or j.get('id') or j.get('exchange_order_id')
+                order_obj = j.get('order') if isinstance(j, dict) else j
+                if isinstance(order_obj, dict):
+                    exchange_id = order_obj.get('order_id') or order_obj.get('id') or order_obj.get('orderId') or order_obj.get('exchange_order_id')
             except Exception:
                 exchange_id = None
             return {'status': status, 'latency_ms': latency, 'raw': r.text, 'code': r.status_code, 'exchange_order_id': exchange_id}
@@ -123,38 +140,47 @@ class KalshiExecutionProvider:
             return {'status': 'ERROR', 'latency_ms': latency, 'raw': str(e)}
 
     def get_open_orders(self):
-        path = '/v1/orders'
+        path = '/portfolio/orders'
         url = self._endpoint(path)
         headers = self._signed_headers('GET', path, '')
         try:
             r = requests.get(url, headers=headers, timeout=self.timeout)
             r.raise_for_status()
-            return r.json()
+            j = r.json()
+            if isinstance(j, dict):
+                return j.get('orders') or j.get('order') or []
+            return j
         except Exception:
             logger.exception('get_open_orders failed')
             return []
 
     def get_positions(self):
-        path = '/v1/positions'
+        path = '/portfolio/positions'
         url = self._endpoint(path)
         headers = self._signed_headers('GET', path, '')
         try:
             r = requests.get(url, headers=headers, timeout=self.timeout)
             r.raise_for_status()
-            return r.json()
+            j = r.json()
+            if isinstance(j, dict):
+                return j.get('positions') or j.get('market_positions') or j
+            return j
         except Exception:
             logger.exception('get_positions failed')
             return []
 
     def get_fills(self, since_ts_ms: int = 0):
-        path = '/v1/fills'
+        path = '/portfolio/fills'
         url = self._endpoint(path)
-        params = {'since': since_ts_ms}
+        params = {'min_ts': since_ts_ms} if since_ts_ms else {}
         headers = self._signed_headers('GET', path, '')
         try:
             r = requests.get(url, params=params, headers=headers, timeout=self.timeout)
             r.raise_for_status()
-            return r.json()
+            j = r.json()
+            if isinstance(j, dict):
+                return j.get('fills') or j
+            return j
         except Exception:
             logger.exception('get_fills failed')
             return []
