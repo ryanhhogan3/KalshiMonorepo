@@ -126,7 +126,7 @@ class Engine:
         last_fills_ts = 0
         while self._running:
             try:
-                fills = self.recon.fetch_and_log_fills(last_fills_ts)
+                fills = self.recon.fetch_and_apply_fills()
                 if fills:
                     last_fills_ts = max([f.get('ts', last_fills_ts) for f in fills])
                 self.recon.fetch_and_log_positions()
