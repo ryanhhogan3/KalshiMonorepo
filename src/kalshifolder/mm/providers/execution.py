@@ -3,6 +3,7 @@ import time
 import logging
 import base64
 from typing import Optional
+import json
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 
@@ -71,48 +72,56 @@ class KalshiExecutionProvider:
         headers['Content-Type'] = 'application/json'
         return headers
 
-    def place_order(self, market_ticker: str, side: str, price: float, size: float, client_order_id: str):
-        # OpenAPI: POST /portfolio/orders (CreateOrder)
-        path = '/portfolio/orders'
+    def place_order(self, market_ticker: str, side: str, price_cents: int, size: float, client_order_id: str, action: str = "buy"):
+        path = "/portfolio/orders"
         url = self._endpoint(path)
-        # API expects fields like 'ticker' and 'count' in some variants; include both common names
+
+        price_cents = int(price_cents)
+        count = int(size)
+
+        if count <= 0:
+            return {"status": "ERROR", "latency_ms": 0, "raw": "count must be >= 1"}
+        if price_cents <= 0 or price_cents >= 100:
+            return {"status": "ERROR", "latency_ms": 0, "raw": "price_cents must be 1..99"}
+
+        side_norm = "yes" if side and side.lower() in ("yes", "y") else "no"
+        action_norm = action.lower()
+
         payload = {
-            'market_ticker': market_ticker,
-            'ticker': market_ticker,
-            'side': side,
-            'price': self.format_price_for_api(price),
-            'price_cents': int(self.format_price_for_api(price) if isinstance(self.format_price_for_api(price), int) else round(self.format_price_for_api(price)*100)),
-            'size': int(size),
-            'count': int(size),
-            'client_order_id': client_order_id,
+            "ticker": market_ticker,
+            "client_order_id": client_order_id,
+            "count": count,
+            "side": side_norm,
+            "action": action_norm,
         }
-        body = requests.utils.json.dumps(payload)
-        headers = self._signed_headers('POST', path, body)
+        if side_norm == "yes":
+            payload["yes_price"] = price_cents
+        else:
+            payload["no_price"] = price_cents
+
+        body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        headers = self._signed_headers("POST", path, body)
+        headers.setdefault("Content-Type", "application/json")
+
         t0 = int(time.time() * 1000)
         try:
             r = requests.post(url, data=body, headers=headers, timeout=self.timeout)
             latency = int(time.time() * 1000) - t0
-            status = 'ACK' if r.status_code in (200, 201) or r.status_code < 300 else 'REJECT'
+            status = "ACK" if r.status_code < 300 else "REJECT"
+
             exchange_id = None
             try:
                 j = r.json()
-                # CreateOrder may return {"order": {...}} or the order object directly
-                order_obj = None
-                if isinstance(j, dict):
-                    order_obj = j.get('order') or j.get('orders') or j
-                else:
-                    order_obj = j
-                if isinstance(order_obj, list) and order_obj:
-                    order_obj = order_obj[0]
+                order_obj = j.get("order") if isinstance(j, dict) else None
                 if isinstance(order_obj, dict):
-                    exchange_id = order_obj.get('order_id') or order_obj.get('id') or order_obj.get('orderId') or order_obj.get('exchange_order_id')
+                    exchange_id = order_obj.get("order_id") or order_obj.get("id")
             except Exception:
-                exchange_id = None
-            return {'status': status, 'latency_ms': latency, 'raw': r.text, 'code': r.status_code, 'exchange_order_id': exchange_id}
+                pass
+
+            return {"status": status, "latency_ms": latency, "raw": r.text, "code": r.status_code, "exchange_order_id": exchange_id}
         except Exception as e:
-            logger.exception('place_order failed')
             latency = int(time.time() * 1000) - t0
-            return {'status': 'ERROR', 'latency_ms': latency, 'raw': str(e)}
+            return {"status": "ERROR", "latency_ms": latency, "raw": str(e)}
 
     def cancel_order(self, client_order_id: str):
         # OpenAPI: DELETE /portfolio/orders/{order_id}
@@ -172,7 +181,8 @@ class KalshiExecutionProvider:
     def get_fills(self, since_ts_ms: int = 0):
         path = '/portfolio/fills'
         url = self._endpoint(path)
-        params = {'min_ts': since_ts_ms} if since_ts_ms else {}
+        # OpenAPI uses seconds for timestamps. Convert incoming ms -> seconds.
+        params = {'min_ts': int(since_ts_ms // 1000)} if since_ts_ms else {}
         headers = self._signed_headers('GET', path, '')
         try:
             r = requests.get(url, params=params, headers=headers, timeout=self.timeout)
