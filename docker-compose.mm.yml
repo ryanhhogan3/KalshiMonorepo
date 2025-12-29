@@ -1,7 +1,7 @@
 version: '3.8'
 services:
   kalshi_mm_engine:
-    image: python:3.10-slim
+    image: python:3.11-slim
     container_name: kalshi_mm_engine
     restart: always
     working_dir: /app
@@ -9,6 +9,7 @@ services:
       - ./:/app:rw
       - /run/secrets:/run/secrets:ro
     environment:
+      - PYTHONPATH=/app/src
       - MM_MARKETS
       - MM_POLL_MS
       - MM_MAX_LEVEL_AGE_MS
