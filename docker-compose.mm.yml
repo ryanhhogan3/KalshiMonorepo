@@ -1,0 +1,41 @@
+version: '3.8'
+services:
+  kalshi_mm_engine:
+    image: python:3.10-slim
+    container_name: kalshi_mm_engine
+    restart: always
+    working_dir: /app
+    volumes:
+      - ./:/app:rw
+      - /run/secrets:/run/secrets:ro
+    environment:
+      - MM_MARKETS
+      - MM_POLL_MS
+      - MM_MAX_LEVEL_AGE_MS
+      - MM_LOOP_JITTER_MS
+      - MM_QUOTE_REFRESH_MS
+      - MM_MIN_REPRICE_TICKS
+      - MM_SIZE
+      - MM_EDGE_TICKS
+      - MM_MAX_POS
+      - MM_MAX_GLOBAL_POS
+      - MM_MAX_REJECTS_PER_MIN
+      - MM_KILL_ON_STALE
+      - MM_KILL_ON_REJECT_SPIKE
+      - CH_URL
+      - CH_USER
+      - CH_PWD
+      - CH_DB
+      - KALSHI_KEY_ID
+      - KALSHI_PRIVATE_KEY_PATH
+      - KALSHI_API_BASE
+    depends_on:
+      - clickhouse
+    command: ["/bin/sh","-c","pip install -r requirements.txt && python -m kalshifolder.mm.main"]
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import sys; sys.exit(0)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
