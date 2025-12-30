@@ -7,8 +7,7 @@ logger = logging.getLogger(__name__)
 
 
 class ClickHouseMarketDataProvider:
-    class ClickHouseMarketDataProvider:
-        def __init__(self, ch_url: str, user: str = 'default', pwd: str = '', db: str = 'default',
+    def __init__(self, ch_url: str, user: str = 'default', pwd: str = '', db: str = 'default',
                     timeout: float = 5.0, latest_table: str = "kalshi.latest_levels_v2"):
             self.ch_url = ch_url.rstrip('/')
             self.user = user
