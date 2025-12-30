@@ -18,7 +18,16 @@ class ClickHouseWriter:
     def _exec(self, sql: str, params: dict = None, timeout: int = 10):
         q = sql
         try:
-            r = requests.post(self.url, params={'user': self.user, 'database': self.database}, data=q.encode('utf-8'), timeout=timeout)
+            # Build ClickHouse params robustly, including password when provided
+            req_params = {'database': self.database}
+            if self.user:
+                req_params['user'] = self.user
+            if self.pwd:
+                req_params['password'] = self.pwd
+            # merge any caller-provided params
+            if params:
+                req_params.update(params)
+            r = requests.post(self.url, params=req_params, data=q.encode('utf-8'), timeout=timeout)
             r.raise_for_status()
             return r.text
         except Exception as e:
