@@ -8,7 +8,11 @@ ssh -i C:\Users\ryanh\Desktop\AWS\kalshiMonoEC2key.pem ubuntu@18.219.222.79
 docker compose down
 docker compose up -d --build
 
+# UP
  docker compose -f docker-compose.yml -f docker-compose.mm.yml up -d
+
+# DOWN
+docker compose -f docker-compose.yml -f docker-compose.mm.yml down
 
 # Reset docker instance
 docker restart

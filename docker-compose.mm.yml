@@ -1,42 +1,92 @@
-version: '3.8'
 services:
   kalshi_mm_engine:
+    container_name: kalshi_mm_engine
+    image: python:3.11-slim
+    restart: always
+
     env_file:
       - .env
-    image: python:3.11-slim
-    container_name: kalshi_mm_engine
-    restart: always
+
     working_dir: /app
     volumes:
       - ./:/app:rw
-      - /home/ubuntu/.kalshi/prod_keys.pem:/run/secrets/prod_keys.pem:ros
+      # Mount key into the container at /run/secrets (read-only)
+      - /home/ubuntu/.kalshi/prod_keys.pem:/run/secrets/prod_keys.pem:ro
+
     environment:
-      - PYTHONPATH=/app/src
-      - MM_MARKETS
-      - MM_POLL_MS
-      - MM_MAX_LEVEL_AGE_MS
-      - MM_LOOP_JITTER_MS
-      - MM_QUOTE_REFRESH_MS
-      - MM_MIN_REPRICE_TICKS
-      - MM_SIZE
-      - MM_EDGE_TICKS
-      - MM_MAX_POS
-      - MM_MAX_GLOBAL_POS
-      - MM_MAX_REJECTS_PER_MIN
-      - MM_KILL_ON_STALE
-      - MM_KILL_ON_REJECT_SPIKE
-      - CH_URL
-      - CH_USER
-      - CH_PWD
-      - CH_DB
-      - KALSHI_KEY_ID
-      - KALSHI_PRIVATE_KEY_PATH
-      - KALSHI_API_BASE
+      PYTHONPATH: /app/src
+
+      # MM config
+      MM_MARKETS: ${MM_MARKETS}
+      MM_POLL_MS: ${MM_POLL_MS}
+      MM_MAX_LEVEL_AGE_MS: ${MM_MAX_LEVEL_AGE_MS}
+      MM_LOOP_JITTER_MS: ${MM_LOOP_JITTER_MS}
+      MM_QUOTE_REFRESH_MS: ${MM_QUOTE_REFRESH_MS}
+      MM_MIN_REPRICE_TICKS: ${MM_MIN_REPRICE_TICKS}
+      MM_SIZE: ${MM_SIZE}
+      MM_EDGE_TICKS: ${MM_EDGE_TICKS}
+      MM_MAX_POS: ${MM_MAX_POS}
+      MM_MAX_GLOBAL_POS: ${MM_MAX_GLOBAL_POS}
+      MM_MAX_REJECTS_PER_MIN: ${MM_MAX_REJECTS_PER_MIN}
+      MM_KILL_ON_STALE: ${MM_KILL_ON_STALE}
+      MM_KILL_ON_REJECT_SPIKE: ${MM_KILL_ON_REJECT_SPIKE}
+
+      # ClickHouse
+      CH_URL: ${CH_URL}
+      CH_USER: ${CH_USER}
+      CH_PWD: ${CH_PWD}
+      CH_DB: ${CH_DB}
+
+      # Kalshi
+      KALSHI_KEY_ID: ${KALSHI_KEY_ID}
+      KALSHI_PRIVATE_KEY_PATH: ${KALSHI_PRIVATE_KEY_PATH}
+      KALSHI_API_BASE: ${KALSHI_API_BASE}
+
     depends_on:
       - clickhouse
-    command: ["/bin/sh","-c","pip install -r requirements.txt && python -m kalshifolder.mm.main"]
+
+    # Wait for clickhouse DNS + HTTP before starting engine, then run engine.
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        set -e
+        pip install -r requirements.txt
+        python - <<'PY'
+        import os, time, socket, requests
+
+        url = os.getenv("CH_URL", "http://clickhouse:8123")
+        host = url.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+
+        # 1) Wait for docker DNS to resolve "clickhouse"
+        for i in range(60):
+          try:
+            socket.gethostbyname(host)
+            break
+          except Exception:
+            time.sleep(1)
+        else:
+          raise SystemExit(f"ClickHouse host did not resolve: {host}")
+
+        # 2) Wait for ClickHouse HTTP endpoint
+        for i in range(60):
+          try:
+            r = requests.get(url + "/?query=SELECT%201", timeout=2)
+            if r.status_code < 500:
+              break
+          except Exception:
+            pass
+          time.sleep(1)
+        else:
+          raise SystemExit(f"ClickHouse not reachable at: {url}")
+
+        print("ClickHouse ready:", url)
+        PY
+        python -m kalshifolder.mm.main
+
     networks:
       - default
+
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import sys; sys.exit(0)\""]
       interval: 30s
