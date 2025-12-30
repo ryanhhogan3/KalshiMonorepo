@@ -6,15 +6,21 @@ logger = logging.getLogger(__name__)
 
 
 class ClickHouseMarketDataProvider:
-    def __init__(self, ch_url: str, user: str = 'default', db: str = 'default', timeout: float = 5.0):
+    def __init__(self, ch_url: str, user: str = 'default', pwd: str = '', db: str = 'default', timeout: float = 5.0):
         self.ch_url = ch_url.rstrip('/')
         self.user = user
+        self.pwd = pwd
         self.db = db
         self.timeout = timeout
 
     def _query(self, sql: str):
         try:
-            r = requests.post(self.ch_url, params={'user': self.user, 'database': self.db}, data=sql.encode('utf-8'), timeout=self.timeout)
+            params = {'database': self.db}
+            if self.user:
+                params['user'] = self.user
+            if self.pwd:
+                params['password'] = self.pwd
+            r = requests.post(self.ch_url, params=params, data=sql.encode('utf-8'), timeout=self.timeout)
             r.raise_for_status()
             return r.text
         except Exception:

@@ -26,6 +26,7 @@ class MMConfig:
     trading_enabled: bool
     price_units: str
     cancel_strays_enabled: bool
+    ch_pwd: str = ''
 
 
 def load_config_from_env() -> MMConfig:
@@ -47,6 +48,7 @@ def load_config_from_env() -> MMConfig:
         kill_on_reject_spike=int(os.getenv('MM_KILL_ON_REJECT_SPIKE', '1')),
         ch_url=os.getenv('CH_URL', 'http://clickhouse:8123'),
         ch_user=os.getenv('CH_USER', 'default'),
+        ch_pwd=os.getenv('CH_PWD', ''),
         ch_db=os.getenv('CH_DB', 'kalshi'),
         kalshi_base=os.getenv('KALSHI_API_BASE', 'https://api.kalshi.com'),
         kalshi_key_id=os.getenv('KALSHI_KEY_ID', ''),

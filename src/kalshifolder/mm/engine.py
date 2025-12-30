@@ -25,8 +25,18 @@ class Engine:
     def __init__(self, config=None):
         self.config = config or load_config_from_env()
         setup_logging()
-        self.ch = ClickHouseWriter(self.config.ch_url, user=self.config.ch_user, database=self.config.ch_db)
-        self.md = ClickHouseMarketDataProvider(self.config.ch_url, user=self.config.ch_user, db=self.config.ch_db)
+        self.ch = ClickHouseWriter(
+            self.config.ch_url,
+            user=self.config.ch_user,
+            pwd=self.config.ch_pwd,
+            database=self.config.ch_db,
+        )
+        self.md = ClickHouseMarketDataProvider(
+            self.config.ch_url,
+            user=self.config.ch_user,
+            pwd=self.config.ch_pwd,
+            db=self.config.ch_db,
+        )
         self.exec = KalshiExecutionProvider(self.config.kalshi_base, key_id=self.config.kalshi_key_id, private_key_path=self.config.kalshi_private_key_path)
         # configure execution provider price units from config
         try:
