@@ -1,13 +1,15 @@
 version: '3.8'
 services:
   kalshi_mm_engine:
+    env_file:
+      - .env
     image: python:3.11-slim
     container_name: kalshi_mm_engine
     restart: always
     working_dir: /app
     volumes:
       - ./:/app:rw
-      - /run/secrets:/run/secrets:ro
+      - /home/ubuntu/.kalshi/prod_keys.pem:/run/secrets/prod_keys.pem:ros
     environment:
       - PYTHONPATH=/app/src
       - MM_MARKETS
