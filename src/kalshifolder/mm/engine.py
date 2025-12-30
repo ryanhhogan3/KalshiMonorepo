@@ -165,16 +165,23 @@ class Engine:
                 mr.kill_stale = True
                 logger.info(json_msg({'event': 'stale_market', 'market': m}))
                 continue
-            # update runtime state
-            mr.last_bb_px = md.get('bb_px')
-            mr.last_bb_sz = md.get('bb_sz')
-            mr.last_ba_px = md.get('ba_px')
-            mr.last_ba_sz = md.get('ba_sz')
-            mr.last_ts_ms = md.get('ts_ms')
-            # staleness
-            if mr.last_ts_ms is None or (now - mr.last_ts_ms) > self.config.max_level_age_ms:
+            # update runtime state using deduped ingest_ts-based fields (fall back to legacy keys)
+            mr.last_bb_px = md.get('yes_bb_px') or md.get('bb_px')
+            mr.last_bb_sz = md.get('yes_bb_sz') or md.get('bb_sz') or 0
+            mr.last_ba_px = md.get('yes_ba_px') or md.get('ba_px')
+            mr.last_ba_sz = md.get('yes_ba_sz') or md.get('ba_sz') or 0
+            # keep NO-side fields too if available
+            mr.no_bb_px = md.get('no_bb_px') or md.get('no_bb_px')
+            mr.no_bb_sz = md.get('no_bb_sz') or md.get('no_bb_sz') or 0
+            mr.no_ba_px = md.get('no_ba_px') or md.get('no_ba_px')
+            mr.no_ba_sz = md.get('no_ba_sz') or md.get('no_ba_sz') or 0
+            # ingest_ts: prefer new ingest_ts_ms, fall back to legacy ts_ms
+            mr.last_ingest_ts_ms = md.get('ingest_ts_ms') or md.get('ts_ms') or md.get('ingest_ts')
+            mr.last_exchange_ts_ms = md.get('exchange_ts_ms') or md.get('ts_ms') or md.get('exchange_ts')
+            # staleness: use ingest_ts (freshness of ingestion) rather than exchange ts
+            if mr.last_ingest_ts_ms is None or (now - mr.last_ingest_ts_ms) > self.config.max_level_age_ms:
                 mr.kill_stale = True
-                logger.info(json_msg({'event': 'stale_market_age', 'market': m, 'last_ts_ms': mr.last_ts_ms}))
+                logger.info(json_msg({'event': 'stale_market_age', 'market': m, 'last_ingest_ts_ms': mr.last_ingest_ts_ms}))
                 continue
 
             # ensure lock exists

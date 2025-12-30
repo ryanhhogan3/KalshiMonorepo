@@ -38,15 +38,32 @@ class ClickHouseMarketDataProvider:
         if not markets:
             return {}
         markets_list = ','.join([f"'{m}'" for m in markets])
+        # Use deduped levels based on ingest_ts so reads are stable regardless of background merges
         sql = (
-            "SELECT"
-            " market_ticker,"
-            " max(ts) AS ts,"
-            " maxIf(price, side = 'yes') AS yes_bid_px,"
-            " argMaxIf(size, price, side = 'yes') AS yes_bid_sz,"
-            " maxIf(price, side = 'no') AS no_bid_px,"
-            " argMaxIf(size, price, side = 'no') AS no_bid_sz"
+            "WITH lv AS ("
+            " SELECT"
+            "  market_ticker,"
+            "  side,"
+            "  price,"
+            "  argMax(size, ingest_ts) AS size,"
+            "  max(ingest_ts) AS ingest_ts,"
+            "  argMax(ts, ingest_ts) AS exchange_ts"
             f" FROM kalshi.latest_levels WHERE market_ticker IN ({markets_list})"
+            " GROUP BY market_ticker, side, price"
+            ")"
+            " SELECT"
+            "  market_ticker,"
+            "  max(ingest_ts) AS ingest_ts,"
+            "  argMaxIf(price, size, side='yes' AND size > 0) AS yes_bid_px,"
+            "  argMaxIf(size, price, side='yes' AND size > 0) AS yes_bid_sz,"
+            "  argMinIf(price, size, side='yes' AND size > 0) AS yes_ask_px,"
+            "  argMinIf(size, price, side='yes' AND size > 0) AS yes_ask_sz,"
+            "  argMaxIf(price, size, side='no' AND size > 0) AS no_bid_px,"
+            "  argMaxIf(size, price, side='no' AND size > 0) AS no_bid_sz,"
+            "  argMinIf(price, size, side='no' AND size > 0) AS no_ask_px,"
+            "  argMinIf(size, price, side='no' AND size > 0) AS no_ask_sz,"
+            "  argMax(exchange_ts, ingest_ts) AS exchange_ts"
+            " FROM lv"
             " GROUP BY market_ticker"
             " FORMAT JSONEachRow"
         )
@@ -70,33 +87,52 @@ class ClickHouseMarketDataProvider:
             mt = obj.get('market_ticker')
             if not mt:
                 continue
-            ts = obj.get('ts')
-            # convert ts to ms: ClickHouse returns ISO timestamp string or numeric; try parse
-            ts_ms = None
-            try:
-                # If ts is in ISO format, use datetime
-                from datetime import datetime
-                if isinstance(ts, str):
-                    # example: "2025-12-27 12:34:56.123456"
-                    dt = datetime.fromisoformat(ts)
-                    ts_ms = int(dt.timestamp() * 1000)
-                else:
-                    ts_ms = int(ts)
-            except Exception:
-                ts_ms = None
+            # normalize ingest_ts and exchange_ts to ms
+            ingest = obj.get('ingest_ts') or obj.get('ingest_ts_ms') or obj.get('ingest_ts')
+            exchange_ts = obj.get('exchange_ts') or obj.get('exchange_ts_ms') or obj.get('exchange_ts')
+            def _to_ms(val):
+                if val is None:
+                    return None
+                try:
+                    if isinstance(val, str):
+                        from datetime import datetime
+                        dt = datetime.fromisoformat(val)
+                        return int(dt.timestamp() * 1000)
+                    return int(val)
+                except Exception:
+                    return None
 
-            yes_px = obj.get('yes_bid_px')
-            yes_sz = obj.get('yes_bid_sz')
-            no_px = obj.get('no_bid_px')
-            no_sz = obj.get('no_bid_sz')
+            ingest_ms = _to_ms(ingest)
+            exchange_ms = _to_ms(exchange_ts)
 
-            # Build result; convert cents to dollars
+            yes_bid_px = obj.get('yes_bid_px')
+            yes_bid_sz = obj.get('yes_bid_sz')
+            yes_ask_px = obj.get('yes_ask_px')
+            yes_ask_sz = obj.get('yes_ask_sz')
+            no_bid_px = obj.get('no_bid_px')
+            no_bid_sz = obj.get('no_bid_sz')
+            no_ask_px = obj.get('no_ask_px')
+            no_ask_sz = obj.get('no_ask_sz')
+
+            def _px_to_dollars(px):
+                if px is None:
+                    return None
+                try:
+                    return px / 100.0
+                except Exception:
+                    return None
+
             results[mt] = {
-                'bb_px': (yes_px / 100.0) if yes_px else None,
-                'bb_sz': yes_sz or 0,
-                'ba_px': ((100 - no_px) / 100.0) if no_px else None,
-                'ba_sz': no_sz or 0,
-                'ts_ms': ts_ms,
+                'yes_bb_px': _px_to_dollars(yes_bid_px),
+                'yes_bb_sz': yes_bid_sz or 0,
+                'yes_ba_px': _px_to_dollars(yes_ask_px),
+                'yes_ba_sz': yes_ask_sz or 0,
+                'no_bb_px': _px_to_dollars(no_bid_px),
+                'no_bb_sz': no_bid_sz or 0,
+                'no_ba_px': _px_to_dollars(no_ask_px),
+                'no_ba_sz': no_ask_sz or 0,
+                'ingest_ts_ms': ingest_ms,
+                'exchange_ts_ms': exchange_ms,
             }
 
         return results
