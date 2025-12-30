@@ -46,6 +46,17 @@ class KalshiExecutionProvider:
             return 0
 
     def _signed_headers(self, method: str, path: str, body: Optional[str] = ''):
+        # Ensure the signed path matches the actual request path including any
+        # base path in the configured base_url (for example '/trade-api' or '/trade-api/v2').
+        from urllib.parse import urlparse
+        base_path = urlparse(self.base_url).path.rstrip('/')
+        # normalize incoming path to start with '/'
+        if path and not path.startswith('/'):
+            path = '/' + path
+        if base_path and not path.startswith(base_path):
+            # Prefix base_path (may include /v2 if provided in base_url)
+            path = f"{base_path}{path}"
+
         ts = str(int(time.time() * 1000))
         msg = (ts + method + path + (body or '')).encode('utf-8')
         sig = ''
@@ -183,7 +194,11 @@ class KalshiExecutionProvider:
         url = self._endpoint(path)
         # OpenAPI uses seconds for timestamps. Convert incoming ms -> seconds.
         params = {'min_ts': int(since_ts_ms // 1000)} if since_ts_ms else {}
-        headers = self._signed_headers('GET', path, '')
+        # If signature includes querystring, include it in the signed path
+        from urllib.parse import urlencode
+        qs = f"?{urlencode(params)}" if params else ""
+        signed_path = path + qs
+        headers = self._signed_headers('GET', signed_path, '')
         try:
             r = requests.get(url, params=params, headers=headers, timeout=self.timeout)
             r.raise_for_status()
