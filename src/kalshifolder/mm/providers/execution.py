@@ -167,9 +167,20 @@ class KalshiExecutionProvider:
             r = requests.get(url, headers=headers, timeout=self.timeout)
             r.raise_for_status()
             j = r.json()
+            # normalize to list[dict]
             if isinstance(j, dict):
-                return j.get('orders') or j.get('order') or []
-            return j
+                orders = j.get('orders') or j.get('order') or []
+                if isinstance(orders, list):
+                    return [o for o in orders if isinstance(o, dict)]
+                if isinstance(orders, dict):
+                    return [orders]
+                # unexpected type
+                logger.error('get_open_orders unexpected payload type for orders: %s keys=%s', type(orders), list(j.keys()))
+                return []
+            if isinstance(j, list):
+                return [o for o in j if isinstance(o, dict)]
+            logger.error('get_open_orders unexpected JSON root type: %s', type(j))
+            return []
         except Exception:
             logger.exception('get_open_orders failed')
             return []
@@ -182,9 +193,19 @@ class KalshiExecutionProvider:
             r = requests.get(url, headers=headers, timeout=self.timeout)
             r.raise_for_status()
             j = r.json()
+            # normalize to list[dict]
             if isinstance(j, dict):
-                return j.get('positions') or j.get('market_positions') or j
-            return j
+                positions = j.get('positions') or j.get('market_positions') or []
+                if isinstance(positions, list):
+                    return [p for p in positions if isinstance(p, dict)]
+                if isinstance(positions, dict):
+                    return [positions]
+                logger.error('get_positions unexpected payload type for positions: %s keys=%s', type(positions), list(j.keys()))
+                return []
+            if isinstance(j, list):
+                return [p for p in j if isinstance(p, dict)]
+            logger.error('get_positions unexpected JSON root type: %s', type(j))
+            return []
         except Exception:
             logger.exception('get_positions failed')
             return []
@@ -203,9 +224,19 @@ class KalshiExecutionProvider:
             r = requests.get(url, params=params, headers=headers, timeout=self.timeout)
             r.raise_for_status()
             j = r.json()
+            # normalize to list[dict]
             if isinstance(j, dict):
-                return j.get('fills') or j
-            return j
+                fills = j.get('fills') or j.get('fill') or j.get('data') or []
+                if isinstance(fills, list):
+                    return [f for f in fills if isinstance(f, dict)]
+                if isinstance(fills, dict):
+                    return [fills]
+                logger.error('get_fills unexpected payload type for fills: %s keys=%s', type(fills), list(j.keys()))
+                return []
+            if isinstance(j, list):
+                return [f for f in j if isinstance(f, dict)]
+            logger.error('get_fills unexpected JSON root type: %s', type(j))
+            return []
         except Exception:
             logger.exception('get_fills failed')
             return []
