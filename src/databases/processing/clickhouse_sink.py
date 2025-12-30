@@ -85,16 +85,25 @@ class ClickHouseSink:
         ensure_clickhouse_schema(self.client, db=db)
 
         # Fail-fast if ClickHouse is in a bad state (e.g., broken parts)
+                # Fail-fast if ClickHouse is in a bad state (e.g., broken parts)
         max_broken = int(os.getenv("CH_MAX_BROKEN_PARTS", "0"))
+
+        self.table_events = os.getenv("CH_TABLE_EVENTS", "orderbook_events")
+        self.table_latest = os.getenv("CH_TABLE_LATEST", "latest_levels_v2")
+
         assert_clickhouse_ready(
             self.client,
             db=db,
-            tables=("orderbook_events", "latest_levels_v2"),
+            tables=(self.table_events, self.table_latest),
             max_broken_parts=max_broken,
         )
+        log.info(
+            "CH tables configured",
+            extra={"events_table": self.table_events, "latest_table": self.table_latest, "db": db, "host": host, "port": port},
+        )
 
-        self.table_events = "orderbook_events"
-        self.table_latest = "latest_levels_v2"
+
+
         self.batch_rows = int(os.getenv("BATCH_ROWS", batch_rows))
         # Newer, clearer config names
         self.flush_rows = int(os.getenv("FLUSH_ROWS", 5_000))
