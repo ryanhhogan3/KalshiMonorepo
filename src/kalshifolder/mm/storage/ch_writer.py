@@ -18,34 +18,44 @@ class ClickHouseWriter:
 
     def _exec(self, sql: str, params: dict = None, timeout: int = 10):
         q = sql
-        try:
-            req_params = {"database": self.database}
-            if self.user:
-                req_params["user"] = self.user
-            if self.pwd:
-                req_params["password"] = self.pwd
-            if params:
-                req_params.update(params)
+        req_params = {"database": self.database}
+        if self.user:
+            req_params["user"] = self.user
+        if self.pwd:
+            req_params["password"] = self.pwd
+        if params:
+            req_params.update(params)
 
-            r = requests.post(
-                self.url,
-                params=req_params,
-                data=q.encode("utf-8"),
-                timeout=timeout,
-            )
-            r.raise_for_status()
-            return r.text
-        except Exception:
-            logger.exception("ClickHouse exec failed")
-            raise
+        r = requests.post(
+            self.url,
+            params=req_params,
+            data=q.encode("utf-8"),
+            timeout=timeout,
+        )
+        if r.status_code >= 300:
+            logger.error("ClickHouse HTTP %s response: %s", r.status_code, (r.text or "")[:2000])
+        r.raise_for_status()
+        return r.text
 
     def ensure_schema(self, sql_path: str):
         p = Path(sql_path)
         if not p.exists():
-            logger.warning('schemas.sql not found: %s', sql_path)
+            logger.warning("schemas.sql not found: %s", sql_path)
             return
-        sql = p.read_text()
-        self._exec(sql)
+
+        raw = p.read_text()
+
+        # Strip BOM if present and normalize newlines
+        raw = raw.lstrip("\ufeff").replace("\r\n", "\n")
+
+        # Naive but effective splitter: split on semicolons
+        stmts = [s.strip() for s in raw.split(";") if s.strip()]
+
+        for stmt in stmts:
+            # Skip pure comment blocks
+            if stmt.startswith("--"):
+                continue
+            self._exec(stmt)
 
     def insert(self, table: str, csv_rows: str):
         # Accept either a preformatted CSV string or a list/dict to convert to CSVWithNames
