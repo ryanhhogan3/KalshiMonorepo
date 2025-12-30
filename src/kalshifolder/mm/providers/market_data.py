@@ -7,12 +7,15 @@ logger = logging.getLogger(__name__)
 
 
 class ClickHouseMarketDataProvider:
-    def __init__(self, ch_url: str, user: str = 'default', pwd: str = '', db: str = 'default', timeout: float = 5.0):
-        self.ch_url = ch_url.rstrip('/')
-        self.user = user
-        self.pwd = pwd
-        self.db = db
-        self.timeout = timeout
+    class ClickHouseMarketDataProvider:
+        def __init__(self, ch_url: str, user: str = 'default', pwd: str = '', db: str = 'default',
+                    timeout: float = 5.0, latest_table: str = "kalshi.latest_levels_v2"):
+            self.ch_url = ch_url.rstrip('/')
+            self.user = user
+            self.pwd = pwd
+            self.db = db
+            self.timeout = timeout
+            self.latest_table = latest_table
 
     def _query(self, sql: str):
         try:
@@ -40,6 +43,8 @@ class ClickHouseMarketDataProvider:
         markets_list = ','.join([f"'{m}'" for m in markets])
         # Known-good merge-independent SQL: dedupe per (market_ticker, side, price) by ingest_ts,
         # then compute best bid/ask per side. This pattern avoids depending on background merges.
+        tbl = self.latest_table
+
         sql = f"""
 WITH
 dedup AS (
@@ -47,14 +52,18 @@ dedup AS (
     market_ticker,
     side,
     price,
-    argMax(size, ingest_ts) AS size
-  FROM kalshi.latest_levels
+    argMax(size, ingest_ts) AS size,
+    max(ingest_ts) AS ingest_ts,           -- ok: within this GROUP BY
+    argMax(ts, ingest_ts) AS exchange_ts   -- ts aligned to latest ingest_ts
+  FROM {tbl}
   WHERE market_ticker IN ({markets_list})
   GROUP BY market_ticker, side, price
 ),
 bbo AS (
   SELECT
     market_ticker,
+    max(ingest_ts) AS ingest_ts,
+    max(exchange_ts) AS exchange_ts,
 
     maxIf(price, side='yes' AND size > 0) AS yes_bid_px,
     argMaxIf(size, price, side='yes' AND size > 0) AS yes_bid_sz,
@@ -67,24 +76,14 @@ bbo AS (
     argMinIf(size, price, side='no' AND size > 0) AS no_ask_sz
   FROM dedup
   GROUP BY market_ticker
-),
-meta AS (
-  SELECT
-    market_ticker,
-    max(ingest_ts) AS ingest_ts,
-    max(ts) AS exchange_ts
-  FROM kalshi.latest_levels
-  WHERE market_ticker IN ({markets_list})
-  GROUP BY market_ticker
 )
 SELECT
-  bbo.market_ticker,
-  meta.ingest_ts,
-  meta.exchange_ts,
-  bbo.yes_bid_px, bbo.yes_bid_sz, bbo.yes_ask_px, bbo.yes_ask_sz,
-  bbo.no_bid_px,  bbo.no_bid_sz,  bbo.no_ask_px,  bbo.no_ask_sz
+  market_ticker,
+  ingest_ts,
+  exchange_ts,
+  yes_bid_px, yes_bid_sz, yes_ask_px, yes_ask_sz,
+  no_bid_px,  no_bid_sz,  no_ask_px,  no_ask_sz
 FROM bbo
-INNER JOIN meta USING (market_ticker)
 FORMAT JSONEachRow
 """
 
@@ -143,18 +142,30 @@ FORMAT JSONEachRow
                 except Exception:
                     return None
 
-            results[mt] = {
-                'yes_bb_px': _px_to_dollars(yes_bid_px),
-                'yes_bb_sz': yes_bid_sz or 0,
-                'yes_ba_px': _px_to_dollars(yes_ask_px),
-                'yes_ba_sz': yes_ask_sz or 0,
-                'no_bb_px': _px_to_dollars(no_bid_px),
-                'no_bb_sz': no_bid_sz or 0,
-                'no_ba_px': _px_to_dollars(no_ask_px),
-                'no_ba_sz': no_ask_sz or 0,
-                'ingest_ts_ms': ingest_ms,
-                'exchange_ts_ms': exchange_ms,
-            }
+            yes_bb_d = _px_to_dollars(yes_bid_px)
+            yes_ba_d = _px_to_dollars(yes_ask_px)
+            no_bb_d  = _px_to_dollars(no_bid_px)
+            no_ba_d  = _px_to_dollars(no_ask_px)
+
+        results[mt] = {
+            'yes_bb_px': yes_bb_d,
+            'yes_bb_sz': yes_bid_sz or 0,
+            'yes_ba_px': yes_ba_d,
+            'yes_ba_sz': yes_ask_sz or 0,
+            'no_bb_px': no_bb_d,
+            'no_bb_sz': no_bid_sz or 0,
+            'no_ba_px': no_ba_d,
+            'no_ba_sz': no_ask_sz or 0,
+            'ingest_ts_ms': ingest_ms,
+            'exchange_ts_ms': exchange_ms,
+
+            # legacy compatibility (engine might still expect these)
+            'bb_px': yes_bb_d,
+            'bb_sz': yes_bid_sz or 0,
+            'ba_px': yes_ba_d,
+            'ba_sz': yes_ask_sz or 0,
+            'ts_ms': ingest_ms or exchange_ms,
+        }
 
         return results
 
