@@ -1,6 +1,7 @@
 import requests
 import logging
 from typing import Dict, List
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +63,7 @@ class ClickHouseMarketDataProvider:
             if not line.strip():
                 continue
             try:
-                obj = requests.utils.json.loads(line)
+                obj = json.loads(line)
             except Exception:
                 logger.exception('Failed to parse CH JSON line')
                 continue
