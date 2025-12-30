@@ -129,7 +129,7 @@ class Engine:
                 fills = self.recon.fetch_and_apply_fills()
                 if fills:
                     last_fills_ts = max([f.get('ts', last_fills_ts) for f in fills])
-                self.recon.fetch_and_log_positions()
+                self.recon.reconcile_positions()
             except Exception:
                 logger.exception('recon loop failed')
             await asyncio.sleep(10)
