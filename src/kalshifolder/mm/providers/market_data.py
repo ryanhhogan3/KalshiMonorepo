@@ -21,12 +21,18 @@ class ClickHouseMarketDataProvider:
                 params['user'] = self.user
             if self.pwd:
                 params['password'] = self.pwd
+
             r = requests.post(self.ch_url, params=params, data=sql.encode('utf-8'), timeout=self.timeout)
+            if r.status_code >= 300:
+                print("---- CH HTTP ERROR ----")
+                print("status:", r.status_code)
+                print("body:", r.text[:4000])
+                print("sql:", sql[:4000])
             r.raise_for_status()
             return r.text
         except Exception:
             logger.exception('CH query failed')
-            raise
+            raise           
 
     def get_batch_best_bid_ask(self, markets: List[str]) -> Dict[str, dict]:
         """
