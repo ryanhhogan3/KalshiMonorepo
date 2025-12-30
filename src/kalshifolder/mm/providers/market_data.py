@@ -21,18 +21,12 @@ class ClickHouseMarketDataProvider:
                 params['user'] = self.user
             if self.pwd:
                 params['password'] = self.pwd
-
             r = requests.post(self.ch_url, params=params, data=sql.encode('utf-8'), timeout=self.timeout)
-            if r.status_code >= 300:
-                print("---- CH HTTP ERROR ----")
-                print("status:", r.status_code)
-                print("body:", r.text[:4000])
-                print("sql:", sql[:4000])
             r.raise_for_status()
             return r.text
         except Exception:
             logger.exception('CH query failed')
-            raise           
+            raise
 
     def get_batch_best_bid_ask(self, markets: List[str]) -> Dict[str, dict]:
         """
@@ -44,35 +38,39 @@ class ClickHouseMarketDataProvider:
         if not markets:
             return {}
         markets_list = ','.join([f"'{m}'" for m in markets])
-        # Use deduped levels based on ingest_ts so reads are stable regardless of background merges
-        sql = (
-            "WITH lv AS ("
-            " SELECT"
-            "  market_ticker,"
-            "  side,"
-            "  price,"
-            "  argMax(size, ingest_ts) AS size,"
-            "  max(ingest_ts) AS ingest_ts,"
-            "  argMax(ts, ingest_ts) AS exchange_ts"
-            f" FROM kalshi.latest_levels WHERE market_ticker IN ({markets_list})"
-            " GROUP BY market_ticker, side, price"
-            ")"
-            " SELECT"
-            "  market_ticker,"
-            "  max(ingest_ts) AS ingest_ts,"
-            "  argMaxIf(price, size, side='yes' AND size > 0) AS yes_bid_px,"
-            "  argMaxIf(size, price, side='yes' AND size > 0) AS yes_bid_sz,"
-            "  argMinIf(price, size, side='yes' AND size > 0) AS yes_ask_px,"
-            "  argMinIf(size, price, side='yes' AND size > 0) AS yes_ask_sz,"
-            "  argMaxIf(price, size, side='no' AND size > 0) AS no_bid_px,"
-            "  argMaxIf(size, price, side='no' AND size > 0) AS no_bid_sz,"
-            "  argMinIf(price, size, side='no' AND size > 0) AS no_ask_px,"
-            "  argMinIf(size, price, side='no' AND size > 0) AS no_ask_sz,"
-            "  argMax(exchange_ts, ingest_ts) AS exchange_ts"
-            " FROM lv"
-            " GROUP BY market_ticker"
-            " FORMAT JSONEachRow"
-        )
+        # Known-good merge-independent SQL: dedupe per (market_ticker, side, price) by ingest_ts,
+        # then compute best bid/ask per side. This pattern avoids depending on background merges.
+        sql = f"""
+WITH lv AS (
+    SELECT
+    market_ticker,
+    side,
+    price,
+    argMax(size, ingest_ts) AS size,
+    argMax(ingest_ts, ingest_ts) AS ingest_ts,
+    argMax(ts, ingest_ts) AS exchange_ts
+    FROM kalshi.latest_levels
+    WHERE market_ticker IN ({markets_list})
+    GROUP BY market_ticker, side, price
+)
+SELECT
+    market_ticker,
+    max(ingest_ts) AS ingest_ts,
+    max(exchange_ts) AS exchange_ts,
+
+    maxIf(price, side='yes' AND size > 0) AS yes_bid_px,
+    argMaxIf(size, price, side='yes' AND size > 0) AS yes_bid_sz,
+    minIf(price, side='yes' AND size > 0) AS yes_ask_px,
+    argMinIf(size, price, side='yes' AND size > 0) AS yes_ask_sz,
+
+    maxIf(price, side='no' AND size > 0) AS no_bid_px,
+    argMaxIf(size, price, side='no' AND size > 0) AS no_bid_sz,
+    minIf(price, side='no' AND size > 0) AS no_ask_px,
+    argMinIf(size, price, side='no' AND size > 0) AS no_ask_sz
+FROM lv
+GROUP BY market_ticker
+FORMAT JSONEachRow
+"""
 
         try:
             txt = self._query(sql)
@@ -111,14 +109,15 @@ class ClickHouseMarketDataProvider:
             ingest_ms = _to_ms(ingest)
             exchange_ms = _to_ms(exchange_ts)
 
-            yes_bid_px = obj.get('yes_bid_px')
-            yes_bid_sz = obj.get('yes_bid_sz')
-            yes_ask_px = obj.get('yes_ask_px')
-            yes_ask_sz = obj.get('yes_ask_sz')
-            no_bid_px = obj.get('no_bid_px')
-            no_bid_sz = obj.get('no_bid_sz')
-            no_ask_px = obj.get('no_ask_px')
-            no_ask_sz = obj.get('no_ask_sz')
+            # support both legacy and new field names
+            yes_bid_px = obj.get('yes_bb_px') or obj.get('yes_bid_px') or obj.get('bb_px')
+            yes_bid_sz = obj.get('yes_bb_sz') or obj.get('yes_bid_sz') or obj.get('bb_sz')
+            yes_ask_px = obj.get('yes_ba_px') or obj.get('yes_ask_px') or obj.get('ba_px')
+            yes_ask_sz = obj.get('yes_ba_sz') or obj.get('yes_ask_sz') or obj.get('ba_sz')
+            no_bid_px = obj.get('no_bb_px') or obj.get('no_bid_px')
+            no_bid_sz = obj.get('no_bb_sz') or obj.get('no_bid_sz')
+            no_ask_px = obj.get('no_ba_px') or obj.get('no_ask_px')
+            no_ask_sz = obj.get('no_ba_sz') or obj.get('no_ask_sz')
 
             def _px_to_dollars(px):
                 if px is None:
