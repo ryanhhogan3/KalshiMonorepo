@@ -7,42 +7,64 @@ logger = logging.getLogger(__name__)
 
 
 class ClickHouseMarketDataProvider:
-    def __init__(self, ch_url: str, user: str = 'default', pwd: str = '', db: str = 'default',
-                    timeout: float = 5.0, latest_table: str = "kalshi.latest_levels_v2"):
-            self.ch_url = ch_url.rstrip('/')
-            self.user = user
-            self.pwd = pwd
-            self.db = db
-            self.timeout = timeout
-            self.latest_table = latest_table
+    def __init__(
+        self,
+        ch_url: str,
+        user: str = "default",
+        pwd: str = "",
+        db: str = "default",
+        timeout: float = 5.0,
+        latest_table: str = "kalshi.latest_levels_v2",
+    ):
+        self.ch_url = ch_url.rstrip("/")
+        self.user = user
+        self.pwd = pwd
+        self.db = db
+        self.timeout = timeout
+        self.latest_table = latest_table
+
+    def _fq_table(self) -> str:
+        """
+        Fully qualify latest table safely.
+        Accepts 'latest_levels_v2' or 'kalshi.latest_levels_v2'.
+        """
+        t = (self.latest_table or "").strip()
+        if "." in t:
+            return t
+        return f"{self.db}.{t}"
 
     def _query(self, sql: str):
+        params = {"database": self.db}
+        if self.user:
+            params["user"] = self.user
+        if self.pwd:
+            params["password"] = self.pwd
+
+        r = None
         try:
-            params = {'database': self.db}
-            if self.user:
-                params['user'] = self.user
-            if self.pwd:
-                params['password'] = self.pwd
-            r = requests.post(self.ch_url, params=params, data=sql.encode('utf-8'), timeout=self.timeout)
+            r = requests.post(
+                self.ch_url,
+                params=params,
+                data=sql.encode("utf-8"),
+                timeout=self.timeout,
+            )
+            if r.status_code >= 400:
+                # Print ClickHouse error body + SQL (super important for debugging 500s)
+                body = (r.text or "")[:4000]
+                logger.error("---- CH HTTP ERROR ---- status=%s body=%s sql=%s", r.status_code, body, sql)
             r.raise_for_status()
             return r.text
         except Exception:
-            logger.exception('CH query failed')
+            # If requests blew up before we got a response, still log the SQL
+            logger.exception("CH query failed; sql=%s", sql)
             raise
 
     def get_batch_best_bid_ask(self, markets: List[str]) -> Dict[str, dict]:
-        """
-        Query kalshi.latest_levels in a single batch and return per-ticker top-of-book.
-
-        Returns dict keyed by market_ticker with fields: bb_px, bb_sz, ba_px, ba_sz, ts_ms
-        Prices are in dollars (float).
-        """
         if not markets:
             return {}
-        markets_list = ','.join([f"'{m}'" for m in markets])
-        # Known-good merge-independent SQL: dedupe per (market_ticker, side, price) by ingest_ts,
-        # then compute best bid/ask per side. This pattern avoids depending on background merges.
-        tbl = self.latest_table
+
+        markets_list = ",".join([f"'{m}'" for m in markets])
+        lt = self._fq_table()
 
         sql = f"""
 WITH
@@ -51,18 +73,14 @@ dedup AS (
     market_ticker,
     side,
     price,
-    argMax(size, ingest_ts) AS size,
-    max(ingest_ts) AS ingest_ts,           -- ok: within this GROUP BY
-    argMax(ts, ingest_ts) AS exchange_ts   -- ts aligned to latest ingest_ts
-  FROM {tbl}
+    argMax(size, ingest_ts) AS size
+  FROM {lt}
   WHERE market_ticker IN ({markets_list})
   GROUP BY market_ticker, side, price
 ),
 bbo AS (
   SELECT
     market_ticker,
-    max(ingest_ts) AS ingest_ts,
-    max(exchange_ts) AS exchange_ts,
 
     maxIf(price, side='yes' AND size > 0) AS yes_bid_px,
     argMaxIf(size, price, side='yes' AND size > 0) AS yes_bid_sz,
@@ -75,39 +93,43 @@ bbo AS (
     argMinIf(size, price, side='no' AND size > 0) AS no_ask_sz
   FROM dedup
   GROUP BY market_ticker
+),
+meta AS (
+  SELECT
+    market_ticker,
+    max(ingest_ts) AS ingest_ts,
+    max(ts) AS exchange_ts
+  FROM {lt}
+  WHERE market_ticker IN ({markets_list})
+  GROUP BY market_ticker
 )
 SELECT
-  market_ticker,
-  ingest_ts,
-  exchange_ts,
-  yes_bid_px, yes_bid_sz, yes_ask_px, yes_ask_sz,
-  no_bid_px,  no_bid_sz,  no_ask_px,  no_ask_sz
+  bbo.market_ticker,
+  meta.ingest_ts,
+  meta.exchange_ts,
+  bbo.yes_bid_px, bbo.yes_bid_sz, bbo.yes_ask_px, bbo.yes_ask_sz,
+  bbo.no_bid_px,  bbo.no_bid_sz,  bbo.no_ask_px,  bbo.no_ask_sz
 FROM bbo
+INNER JOIN meta USING (market_ticker)
 FORMAT JSONEachRow
 """
 
-        try:
-            txt = self._query(sql)
-        except Exception:
-            # bubble up so caller can mark markets stale / API-unhealthy
-            raise
+        txt = self._query(sql)
 
         results: Dict[str, dict] = {}
-        # parse JSONEachRow lines
         for line in txt.splitlines():
             if not line.strip():
                 continue
             try:
                 obj = json.loads(line)
             except Exception:
-                logger.exception('Failed to parse CH JSON line')
+                logger.exception("Failed to parse CH JSON line")
                 continue
-            mt = obj.get('market_ticker')
+
+            mt = obj.get("market_ticker")
             if not mt:
                 continue
-            # normalize ingest_ts and exchange_ts to ms
-            ingest = obj.get('ingest_ts') or obj.get('ingest_ts_ms') or obj.get('ingest_ts')
-            exchange_ts = obj.get('exchange_ts') or obj.get('exchange_ts_ms') or obj.get('exchange_ts')
+
             def _to_ms(val):
                 if val is None:
                     return None
@@ -120,19 +142,6 @@ FORMAT JSONEachRow
                 except Exception:
                     return None
 
-            ingest_ms = _to_ms(ingest)
-            exchange_ms = _to_ms(exchange_ts)
-
-            # support both legacy and new field names
-            yes_bid_px = obj.get('yes_bb_px') or obj.get('yes_bid_px') or obj.get('bb_px')
-            yes_bid_sz = obj.get('yes_bb_sz') or obj.get('yes_bid_sz') or obj.get('bb_sz')
-            yes_ask_px = obj.get('yes_ba_px') or obj.get('yes_ask_px') or obj.get('ba_px')
-            yes_ask_sz = obj.get('yes_ba_sz') or obj.get('yes_ask_sz') or obj.get('ba_sz')
-            no_bid_px = obj.get('no_bb_px') or obj.get('no_bid_px')
-            no_bid_sz = obj.get('no_bb_sz') or obj.get('no_bid_sz')
-            no_ask_px = obj.get('no_ba_px') or obj.get('no_ask_px')
-            no_ask_sz = obj.get('no_ba_sz') or obj.get('no_ask_sz')
-
             def _px_to_dollars(px):
                 if px is None:
                     return None
@@ -141,33 +150,17 @@ FORMAT JSONEachRow
                 except Exception:
                     return None
 
-            yes_bb_d = _px_to_dollars(yes_bid_px)
-            yes_ba_d = _px_to_dollars(yes_ask_px)
-            no_bb_d  = _px_to_dollars(no_bid_px)
-            no_ba_d  = _px_to_dollars(no_ask_px)
-
-        results[mt] = {
-            'yes_bb_px': yes_bb_d,
-            'yes_bb_sz': yes_bid_sz or 0,
-            'yes_ba_px': yes_ba_d,
-            'yes_ba_sz': yes_ask_sz or 0,
-            'no_bb_px': no_bb_d,
-            'no_bb_sz': no_bid_sz or 0,
-            'no_ba_px': no_ba_d,
-            'no_ba_sz': no_ask_sz or 0,
-            'ingest_ts_ms': ingest_ms,
-            'exchange_ts_ms': exchange_ms,
-
-            # legacy compatibility (engine might still expect these)
-            'bb_px': yes_bb_d,
-            'bb_sz': yes_bid_sz or 0,
-            'ba_px': yes_ba_d,
-            'ba_sz': yes_ask_sz or 0,
-            'ts_ms': ingest_ms or exchange_ms,
-        }
+            results[mt] = {
+                "yes_bb_px": _px_to_dollars(obj.get("yes_bid_px")),
+                "yes_bb_sz": obj.get("yes_bid_sz") or 0,
+                "yes_ba_px": _px_to_dollars(obj.get("yes_ask_px")),
+                "yes_ba_sz": obj.get("yes_ask_sz") or 0,
+                "no_bb_px": _px_to_dollars(obj.get("no_bid_px")),
+                "no_bb_sz": obj.get("no_bid_sz") or 0,
+                "no_ba_px": _px_to_dollars(obj.get("no_ask_px")),
+                "no_ba_sz": obj.get("no_ask_sz") or 0,
+                "ingest_ts_ms": _to_ms(obj.get("ingest_ts")),
+                "exchange_ts_ms": _to_ms(obj.get("exchange_ts")),
+            }
 
         return results
-
-    def get_best_bid_ask(self, market_ticker: str):
-        res = self.get_batch_best_bid_ask([market_ticker])
-        return res.get(market_ticker)
