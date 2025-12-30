@@ -14,6 +14,7 @@ class ClickHouseWriter:
         self.user = user
         self.pwd = pwd
         self.database = database
+        logger.info("CH init url=%s db=%s user=%s pwd_set=%s", self.url, self.database, self.user, bool(self.pwd))
 
     def _exec(self, sql: str, params: dict = None, timeout: int = 10):
         q = sql
