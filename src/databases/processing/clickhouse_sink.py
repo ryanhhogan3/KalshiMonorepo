@@ -89,12 +89,12 @@ class ClickHouseSink:
         assert_clickhouse_ready(
             self.client,
             db=db,
-            tables=("orderbook_events", "latest_levels"),
+            tables=("orderbook_events", "latest_levels_v2"),
             max_broken_parts=max_broken,
         )
 
         self.table_events = "orderbook_events"
-        self.table_latest = "latest_levels"
+        self.table_latest = "latest_levels_v2"
         self.batch_rows = int(os.getenv("BATCH_ROWS", batch_rows))
         # Newer, clearer config names
         self.flush_rows = int(os.getenv("FLUSH_ROWS", 5_000))
