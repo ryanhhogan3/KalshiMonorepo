@@ -158,6 +158,17 @@ class ReconciliationService:
             logger.exception('get_fills failed')
             return []
 
+        # Defensive normalization: ensure fills is a list of dicts
+        if isinstance(fills, dict):
+            fills = [fills]
+        elif isinstance(fills, str):
+            logger.error("get_fills returned str; dropping: %r", fills[:200])
+            fills = []
+        elif not isinstance(fills, list):
+            logger.error("get_fills returned %s; dropping", type(fills))
+            fills = []
+        fills = [f for f in fills if isinstance(f, dict)]
+
         if not fills:
             return []
 
