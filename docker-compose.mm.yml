@@ -1,64 +1,27 @@
 services:
   kalshi_mm_engine:
-    container_name: kalshi_mm_engine
     image: python:3.11-slim
-    restart: always
+    container_name: kalshi_mm_engine
+    restart: unless-stopped
+    working_dir: /app
 
     env_file:
       - .env
 
-    working_dir: /app
+    environment:
+      PYTHONPATH: /app/src
+
     volumes:
       - ./:/app:rw
       - /home/ubuntu/.kalshi/prod_keys.pem:/run/secrets/prod_keys.pem:ro
 
-    environment:
-      PYTHONPATH: /app/src
-
     depends_on:
       - clickhouse
 
-    command:
-      - /bin/sh
-      - -lc
-      - |
-        set -e
-        pip install -r requirements.txt
-        python - <<'PY'
-        import os, time, socket, requests
-
-        url = os.getenv("CH_URL", "http://clickhouse:8123").rstrip("/")
-        host = url.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
-
-        for _ in range(60):
-          try:
-            socket.gethostbyname(host)
-            break
-          except Exception:
-            time.sleep(1)
-        else:
-          raise SystemExit(f"ClickHouse host did not resolve: {host}")
-
-        for _ in range(60):
-          try:
-            r = requests.get(url + "/?query=SELECT%201", timeout=2)
-            if r.status_code < 500:
-              break
-          except Exception:
-            pass
-          time.sleep(1)
-        else:
-          raise SystemExit(f"ClickHouse not reachable at: {url}")
-
-        print("ClickHouse ready:", url)
-        PY
-        python -m kalshifolder.mm.main
-
-    networks:
-      - default
+    command: ["/bin/sh","-lc","pip install -r requirements.txt && python -m kalshifolder.mm.main"]
 
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import sys; sys.exit(0)\""]
+      test: ["CMD-SHELL", "python -c \"import os; import sys; sys.exit(0)\""]
       interval: 30s
       timeout: 10s
       retries: 3
