@@ -213,29 +213,42 @@ class KalshiExecutionProvider:
     def get_fills(self, since_ts_ms: int = 0):
         path = '/portfolio/fills'
         url = self._endpoint(path)
-        # OpenAPI uses seconds for timestamps. Convert incoming ms -> seconds.
+
+        # API uses seconds. Convert incoming ms -> seconds.
         params = {'min_ts': int(since_ts_ms // 1000)} if since_ts_ms else {}
+
         # If signature includes querystring, include it in the signed path
         from urllib.parse import urlencode
         qs = f"?{urlencode(params)}" if params else ""
         signed_path = path + qs
+
         headers = self._signed_headers('GET', signed_path, '')
         try:
             r = requests.get(url, params=params, headers=headers, timeout=self.timeout)
             r.raise_for_status()
             j = r.json()
-            # normalize to list[dict]
+
+            # Normalize to list[dict]
             if isinstance(j, dict):
-                fills = j.get('fills') or j.get('fill') or j.get('data') or []
+                fills = (
+                    j.get('fills')
+                    or j.get('fill')
+                    or j.get('data')
+                    or j.get('items')
+                    or j.get('result')
+                    or []
+                )
                 if isinstance(fills, list):
                     return [f for f in fills if isinstance(f, dict)]
                 if isinstance(fills, dict):
                     return [fills]
-                logger.error('get_fills unexpected payload type for fills: %s keys=%s', type(fills), list(j.keys()))
+                logger.error('get_fills unexpected fills type=%s keys=%s', type(fills), list(j.keys()))
                 return []
+
             if isinstance(j, list):
                 return [f for f in j if isinstance(f, dict)]
-            logger.error('get_fills unexpected JSON root type: %s', type(j))
+
+            logger.error('get_fills unexpected JSON root type=%s', type(j))
             return []
         except Exception:
             logger.exception('get_fills failed')
