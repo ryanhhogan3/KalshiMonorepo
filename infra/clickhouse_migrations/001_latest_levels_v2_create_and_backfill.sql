@@ -14,15 +14,36 @@ ORDER BY (market_ticker, side, price);
 -- 2) Backfill deduped latest rows into v2 using argMax by ingest_ts
 INSERT INTO kalshi.latest_levels_v2
 SELECT
-  any(market_id) AS market_id,
-  market_ticker,
-  side,
-  price,
-  argMax(size, ingest_ts) AS size,
-  argMax(ts, ingest_ts) AS ts,
-  argMax(ingest_ts, ingest_ts) AS ingest_ts
-FROM kalshi.latest_levels
-GROUP BY market_ticker, side, price;
+  a.market_id,
+  a.market_ticker,
+  a.side,
+  a.price,
+  a.size,
+  a.ts,
+  b.ingest_ts
+FROM
+(
+  SELECT
+    any(market_id) AS market_id,
+    market_ticker,
+    side,
+    price,
+    argMax(size, ingest_ts) AS size,
+    argMax(ts, ingest_ts) AS ts
+  FROM kalshi.latest_levels
+  GROUP BY market_ticker, side, price
+) AS a
+INNER JOIN
+(
+  SELECT
+    market_ticker,
+    side,
+    price,
+    max(ingest_ts) AS ingest_ts
+  FROM kalshi.latest_levels
+  GROUP BY market_ticker, side, price
+) AS b
+USING (market_ticker, side, price);
 
 -- 3) Swap tables with minimal downtime (manual step recommended):
 -- RENAME TABLE kalshi.latest_levels TO kalshi.latest_levels_old, kalshi.latest_levels_v2 TO kalshi.latest_levels;
