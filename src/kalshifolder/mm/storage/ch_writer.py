@@ -43,19 +43,19 @@ class ClickHouseWriter:
             logger.warning("schemas.sql not found: %s", sql_path)
             return
 
-        raw = p.read_text()
-
-        # Strip BOM if present and normalize newlines
+        raw = p.read_text(encoding="utf-8")
         raw = raw.lstrip("\ufeff").replace("\r\n", "\n")
 
-        # Naive but effective splitter: split on semicolons
-        stmts = [s.strip() for s in raw.split(";") if s.strip()]
+        # ClickHouse HTTP endpoint rejects multi-statements.
+        # Split on semicolons and execute each statement separately.
+        statements = [s.strip() for s in raw.split(";") if s.strip()]
 
-        for stmt in stmts:
-            # Skip pure comment blocks
+        for stmt in statements:
+            # Skip pure comment-only chunks
             if stmt.startswith("--"):
                 continue
             self._exec(stmt)
+
 
     def insert(self, table: str, csv_rows: str):
         # Accept either a preformatted CSV string or a list/dict to convert to CSVWithNames
