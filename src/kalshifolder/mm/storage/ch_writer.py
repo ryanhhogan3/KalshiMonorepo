@@ -43,18 +43,20 @@ class ClickHouseWriter:
             logger.warning("schemas.sql not found: %s", sql_path)
             return
 
-        raw = p.read_text(encoding="utf-8")
-        raw = raw.lstrip("\ufeff").replace("\r\n", "\n")
-
-        # ClickHouse HTTP endpoint rejects multi-statements.
-        # Split on semicolons and execute each statement separately.
+        raw = p.read_text(encoding="utf-8").lstrip("\ufeff").replace("\r\n", "\n")
         statements = [s.strip() for s in raw.split(";") if s.strip()]
 
         for stmt in statements:
-            # Skip pure comment-only chunks
-            if stmt.startswith("--"):
+            # Remove leading comment lines, but keep the statement
+            lines = []
+            for line in stmt.splitlines():
+                if not lines and line.strip().startswith("--"):
+                    continue
+                lines.append(line)
+            cleaned = "\n".join(lines).strip()
+            if not cleaned:
                 continue
-            self._exec(stmt)
+            self._exec(cleaned)
 
 
     def insert(self, table: str, csv_rows: str):
