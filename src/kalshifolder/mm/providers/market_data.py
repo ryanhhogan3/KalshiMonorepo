@@ -41,22 +41,20 @@ class ClickHouseMarketDataProvider:
         # Known-good merge-independent SQL: dedupe per (market_ticker, side, price) by ingest_ts,
         # then compute best bid/ask per side. This pattern avoids depending on background merges.
         sql = f"""
-WITH lv AS (
-    SELECT
+WITH
+dedup AS (
+  SELECT
     market_ticker,
     side,
     price,
-    argMax(size, ingest_ts) AS size,
-    argMax(ingest_ts, ingest_ts) AS ingest_ts,
-    argMax(ts, ingest_ts) AS exchange_ts
-    FROM kalshi.latest_levels
-    WHERE market_ticker IN ({markets_list})
-    GROUP BY market_ticker, side, price
-)
-SELECT
+    argMax(size, ingest_ts) AS size
+  FROM kalshi.latest_levels
+  WHERE market_ticker IN ({markets_list})
+  GROUP BY market_ticker, side, price
+),
+bbo AS (
+  SELECT
     market_ticker,
-    max(ingest_ts) AS ingest_ts,
-    max(exchange_ts) AS exchange_ts,
 
     maxIf(price, side='yes' AND size > 0) AS yes_bid_px,
     argMaxIf(size, price, side='yes' AND size > 0) AS yes_bid_sz,
@@ -67,8 +65,26 @@ SELECT
     argMaxIf(size, price, side='no' AND size > 0) AS no_bid_sz,
     minIf(price, side='no' AND size > 0) AS no_ask_px,
     argMinIf(size, price, side='no' AND size > 0) AS no_ask_sz
-FROM lv
-GROUP BY market_ticker
+  FROM dedup
+  GROUP BY market_ticker
+),
+meta AS (
+  SELECT
+    market_ticker,
+    max(ingest_ts) AS ingest_ts,
+    max(ts) AS exchange_ts
+  FROM kalshi.latest_levels
+  WHERE market_ticker IN ({markets_list})
+  GROUP BY market_ticker
+)
+SELECT
+  bbo.market_ticker,
+  meta.ingest_ts,
+  meta.exchange_ts,
+  bbo.yes_bid_px, bbo.yes_bid_sz, bbo.yes_ask_px, bbo.yes_ask_sz,
+  bbo.no_bid_px,  bbo.no_bid_sz,  bbo.no_ask_px,  bbo.no_ask_sz
+FROM bbo
+INNER JOIN meta USING (market_ticker)
 FORMAT JSONEachRow
 """
 
