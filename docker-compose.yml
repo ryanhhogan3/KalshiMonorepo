@@ -32,6 +32,7 @@ services:
         condition: service_healthy
     environment:
       # Credentials (load from .env file)
+      CLICKHOUSE_LATEST_TABLE: latest_levels_v2
       PROD_KEYID: ${PROD_KEYID}
       PROD_KEYFILE: /run/secrets/prod_keys.pem
 
