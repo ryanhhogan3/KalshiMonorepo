@@ -88,8 +88,9 @@ class ClickHouseSink:
                 # Fail-fast if ClickHouse is in a bad state (e.g., broken parts)
         max_broken = int(os.getenv("CH_MAX_BROKEN_PARTS", "0"))
 
-        self.table_events = os.getenv("CH_TABLE_EVENTS", "orderbook_events")
-        self.table_latest = os.getenv("CH_TABLE_LATEST", "latest_levels_v2")
+        # Table names: prefer new env var names but keep legacy fallbacks
+        self.table_events = os.getenv("CLICKHOUSE_EVENTS_TABLE") or os.getenv("CH_TABLE_EVENTS") or "orderbook_events"
+        self.table_latest = os.getenv("CLICKHOUSE_LATEST_TABLE") or os.getenv("CH_TABLE_LATEST") or "latest_levels_v2"
 
         assert_clickhouse_ready(
             self.client,

@@ -10,6 +10,7 @@ services:
 
     environment:
       PYTHONPATH: /app/src
+      CLICKHOUSE_LATEST_TABLE: latest_levels_v2
 
     volumes:
       - ./:/app:rw

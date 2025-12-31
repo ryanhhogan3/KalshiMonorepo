@@ -394,6 +394,11 @@ class Engine:
     async def run(self):
         self._running = True
         await self.ensure_schema()
+        # log latest_levels freshness to detect mismatched streamer writes
+        try:
+            await asyncio.to_thread(self._log_latest_table_freshness)
+        except Exception:
+            logger.exception('latest table freshness check failed')
         # perform startup reconciliation (cancel lingering engine-tagged orders)
         try:
             await asyncio.to_thread(self.recon.startup_reconcile, True)
@@ -420,3 +425,45 @@ class Engine:
 
     def stop(self):
         self._running = False
+
+    def _log_latest_table_freshness(self):
+        """Check the configured latest table's max ingest_ts and log a warning if it's stale.
+        This is a best-effort check and will not raise on failure.
+        """
+        try:
+            # prefer explicit sink/table if available, else fall back to configured DB + v2 name
+            try:
+                table = getattr(self.ch, 'table_latest', None)
+            except Exception:
+                table = None
+            if not table:
+                table = f"{self.config.ch_db}.latest_levels_v2"
+
+            sql = f"SELECT max(ingest_ts) FROM {table} FORMAT CSV"
+            try:
+                txt = self.ch._exec(sql)
+            except Exception:
+                logger.exception('failed to query latest table ingest_ts')
+                return
+            if not txt:
+                return
+            val = txt.strip().splitlines()[-1].strip()
+            if not val:
+                return
+            # parse as ISO or epoch seconds
+            try:
+                from datetime import datetime
+                if '-' in val or 'T' in val:
+                    dt = datetime.fromisoformat(val)
+                    ingest_ms = int(dt.timestamp() * 1000)
+                else:
+                    ingest_ms = int(float(val) * 1000)
+            except Exception:
+                return
+            age_ms = now_ms() - ingest_ms
+            if age_ms > self.config.max_level_age_ms:
+                logger.warning('latest table appears stale: %s age_ms=%s table=%s', val, age_ms, table)
+            else:
+                logger.info('latest table freshness OK: %s age_ms=%s table=%s', val, age_ms, table)
+        except Exception:
+            logger.exception('unexpected error checking latest table freshness')
