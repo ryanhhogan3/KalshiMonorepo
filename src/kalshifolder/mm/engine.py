@@ -21,6 +21,52 @@ from .utils.logging import setup_logging, json_msg
 logger = logging.getLogger(__name__)
 
 
+def to_ms(val):
+    """Normalize various timestamp formats to integer milliseconds.
+
+    Accepts:
+    - int (assume ms if > 1e12 else seconds -> *1000)
+    - float (same logic)
+    - ISO datetime string parseable by datetime.fromisoformat
+    - numeric string
+
+    Returns int ms or None on failure.
+    """
+    if val is None:
+        return None
+    try:
+        # ints/floats
+        if isinstance(val, (int, float)):
+            v = int(val)
+            if v > 10 ** 12:
+                return v
+            return int(v * 1000)
+        if isinstance(val, str):
+            s = val.strip()
+            # numeric string?
+            if s.isdigit():
+                v = int(s)
+                if v > 10 ** 12:
+                    return v
+                return int(v * 1000)
+            # try ISO parse
+            from datetime import datetime
+
+            try:
+                dt = datetime.fromisoformat(s)
+                return int(dt.timestamp() * 1000)
+            except Exception:
+                # last-ditch try to parse common space separated format
+                try:
+                    dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S.%f")
+                    return int(dt.timestamp() * 1000)
+                except Exception:
+                    return None
+    except Exception:
+        return None
+    return None
+
+
 class Engine:
     def __init__(self, config=None):
         self.config = config or load_config_from_env()
@@ -150,20 +196,71 @@ class Engine:
         try:
             batch = self.md.get_batch_best_bid_ask(markets)
         except Exception:
-            logger.exception('market data batch failed; marking markets stale')
-            # mark all markets stale
+            # on batch failure: don't latch stale permanently; mark md as unavailable for this cycle
+            logger.exception('market data batch failed; skipping quotes this cycle')
+            now = now_ms()
             for m in markets:
                 mr = self.store.get_market(m)
-                mr.kill_stale = True
+                mr.last_md_error_ts_ms = now
+                mr.md_ok = False
             return
 
         now = now_ms()
         for m in markets:
             mr = self.store.get_market(m)
             md = batch.get(m)
-            if not md:
+            # normalize ingest timestamp from the batch (try several keys)
+            new_ingest_ms = None
+            if md:
+                new_ingest_ms = to_ms(md.get('ingest_ts_ms') or md.get('ingest_ts') or md.get('ts_ms') or md.get('ts'))
+
+            if md is None:
+                # missing row in a successful batch: mark md as unavailable for this cycle
+                mr.md_ok = False
+                mr.last_md_error_ts_ms = None
+                mr.stale_reason = 'missing_row'
+                # do not overwrite last_ingest_ts_ms
+            else:
+                # if we could parse a new ingest timestamp, update last_ingest_ts_ms
+                if new_ingest_ms is not None:
+                    mr.last_ingest_ts_ms = new_ingest_ms
+                    mr.md_ok = True
+                    mr.last_md_ok_ts_ms = now
+                    mr.stale_reason = None
+                else:
+                    # md present but no usable timestamp
+                    mr.md_ok = False
+
+            # single age-based staleness check (compare to previous state and log only on change)
+            prev_kill = bool(mr.kill_stale)
+            age_ms = None
+            if mr.last_ingest_ts_ms is not None:
+                age_ms = now - mr.last_ingest_ts_ms
+            # Decide staleness
+            if mr.last_ingest_ts_ms is not None and age_ms <= self.config.max_level_age_ms:
+                mr.kill_stale = False
+                # only clear stale_reason when we actually received fresh md this cycle
+                if mr.md_ok:
+                    mr.stale_reason = None
+            else:
                 mr.kill_stale = True
-                logger.info(json_msg({'event': 'stale_market', 'market': m}))
+                if mr.stale_reason is None:
+                    mr.stale_reason = 'age'
+            if prev_kill != mr.kill_stale:
+                logger.info(json_msg({
+                    'event': 'stale_market_age',
+                    'market': m,
+                    'md_ok': mr.md_ok,
+                    'stale_reason': mr.stale_reason,
+                    'latest_table': getattr(self.config, 'latest_table', None),
+                    'now_ms': now,
+                    'last_ingest_ts_ms': mr.last_ingest_ts_ms,
+                    'age_ms': age_ms,
+                    'max_age_ms': self.config.max_level_age_ms,
+                }))
+
+            if not md:
+                # no data in this batch for the market — skip quoting for now
                 continue
             # update runtime state using deduped ingest_ts-based fields (fall back to legacy keys)
             mr.last_bb_px = md.get('yes_bb_px') or md.get('bb_px')
@@ -171,18 +268,10 @@ class Engine:
             mr.last_ba_px = md.get('yes_ba_px') or md.get('ba_px')
             mr.last_ba_sz = md.get('yes_ba_sz') or md.get('ba_sz') or 0
             # keep NO-side fields too if available
-            mr.no_bb_px = md.get('no_bb_px') or md.get('no_bb_px')
-            mr.no_bb_sz = md.get('no_bb_sz') or md.get('no_bb_sz') or 0
-            mr.no_ba_px = md.get('no_ba_px') or md.get('no_ba_px')
-            mr.no_ba_sz = md.get('no_ba_sz') or md.get('no_ba_sz') or 0
-            # ingest_ts: prefer new ingest_ts_ms, fall back to legacy ts_ms
-            mr.last_ingest_ts_ms = md.get('ingest_ts_ms') or md.get('ts_ms') or md.get('ingest_ts')
-            mr.last_exchange_ts_ms = md.get('exchange_ts_ms') or md.get('ts_ms') or md.get('exchange_ts')
-            # staleness: use ingest_ts (freshness of ingestion) rather than exchange ts
-            if mr.last_ingest_ts_ms is None or (now - mr.last_ingest_ts_ms) > self.config.max_level_age_ms:
-                mr.kill_stale = True
-                logger.info(json_msg({'event': 'stale_market_age', 'market': m, 'last_ingest_ts_ms': mr.last_ingest_ts_ms}))
-                continue
+            mr.no_bb_px = md.get('no_bb_px')
+            mr.no_bb_sz = md.get('no_bb_sz') or 0
+            mr.no_ba_px = md.get('no_ba_px')
+            mr.no_ba_sz = md.get('no_ba_sz') or 0
 
             # ensure lock exists
             if m not in self.market_locks:
@@ -437,7 +526,17 @@ class Engine:
             except Exception:
                 table = None
             if not table:
-                table = f"{self.config.ch_db}.latest_levels_v2"
+                # prefer explicit configured latest_table if provided
+                try:
+                    table = getattr(self.config, 'latest_table', None) or ''
+                except Exception:
+                    table = ''
+                if not table:
+                    table = f"{self.config.ch_db}.latest_levels_v2"
+                else:
+                    # normalize: prefix with DB if no dot present
+                    if '.' not in table:
+                        table = f"{self.config.ch_db}.{table}"
 
             sql = f"SELECT max(ingest_ts) FROM {table} FORMAT CSV"
             try:

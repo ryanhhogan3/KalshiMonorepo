@@ -36,7 +36,18 @@ class MarketRuntimeState:
     inventory: float = 0.0
     last_quote_ts_ms: Optional[int] = None
     rejects_rolling_counter: int = 0
+    # Whether quoting is disabled due to stale data (cleared when fresh data arrives)
     kill_stale: bool = False
+    # Whether market data appeared OK on last successful fetch
+    md_ok: bool = True
+    # Timestamps for last md cycle outcomes
+    last_md_error_ts_ms: Optional[int] = None
+    last_md_ok_ts_ms: Optional[int] = None
+    # Last ingest/exchange timestamps (ms) seen from latest_levels
+    last_ingest_ts_ms: Optional[int] = None
+    last_exchange_ts_ms: Optional[int] = None
+    # Optional human-readable stale reason (e.g. 'age' or other)
+    stale_reason: Optional[str] = None
 
 
 @dataclass

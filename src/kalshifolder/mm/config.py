@@ -27,6 +27,8 @@ class MMConfig:
     price_units: str
     cancel_strays_enabled: bool
     ch_pwd: str = ''
+    # optional explicit latest table name (may be 'latest_levels_v2' or 'kalshi.latest_levels_v2')
+    latest_table: str = ''
 
 
 def load_config_from_env() -> MMConfig:
@@ -50,6 +52,7 @@ def load_config_from_env() -> MMConfig:
         ch_user=os.getenv('CH_USER', 'default'),
         ch_pwd=os.getenv('CH_PWD', ''),
         ch_db=os.getenv('CH_DB', 'kalshi'),
+        latest_table=os.getenv('CLICKHOUSE_LATEST_TABLE', os.getenv('MM_LATEST_TABLE', '')),
         kalshi_base=os.getenv('KALSHI_API_BASE', 'https://api.kalshi.com'),
         kalshi_key_id=os.getenv('KALSHI_KEY_ID', ''),
         kalshi_private_key_path=os.getenv('KALSHI_PRIVATE_KEY_PATH', ''),
