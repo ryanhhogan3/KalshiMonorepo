@@ -550,9 +550,15 @@ class Engine:
                 except Exception:
                     logger.exception('failed_to_instantiate_ws_provider')
             if self.md:
-                await self.md.start()
+                try:
+                    await self.md.start(self.config.markets)
+                except TypeError:
+                    # older providers may not accept markets param
+                    await self.md.start()
             wait_ms = int(os.getenv('MM_MD_WAIT_MS', '5000'))
-            if hasattr(self.md, 'wait_for_initial_bbo'):
+            if hasattr(self.md, 'wait_ready'):
+                ok = await self.md.wait_ready(self.config.markets, timeout_s=(wait_ms / 1000.0))
+            elif hasattr(self.md, 'wait_for_initial_bbo'):
                 ok = await self.md.wait_for_initial_bbo(self.config.markets, timeout_ms=wait_ms)
                 if not ok:
                     logger.warning('md provider did not provide initial BBOs within timeout')

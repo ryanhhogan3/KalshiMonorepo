@@ -25,12 +25,42 @@ class WSMarketDataProvider(BaseMarketDataProvider):
         # bbo map: ticker -> dict with yes_bb_px, yes_bb_sz, yes_ba_px, yes_ba_sz, ingest_ts_ms, exchange_ts_ms
         self._bbo: Dict[str, dict] = {}
         self._lock = asyncio.Lock()
+        # track which markets we've logged first-BBO for
+        self._first_bbo_logged: set = set()
+        # debug mode: log first N raw messages
+        import os
+        self._ws_debug = bool(int(os.getenv('MM_WS_DEBUG', '0')))
+        self._ws_debug_limit = int(os.getenv('MM_WS_DEBUG_LIMIT', '20'))
+        self._ws_debug_count = 0
 
-    async def start(self) -> None:
+    async def start(self, markets: Optional[List[str]] = None) -> None:
         if self.rt and self._task and not self._task.done():
             return
         self.rt = KalshiWSRuntime()
         await self.rt.start()
+        # wait briefly for connect
+        for _ in range(50):
+            if getattr(self.rt, 'is_connected', False):
+                break
+            await asyncio.sleep(0.1)
+
+        try:
+            log.info("ws_connected", extra={"url": getattr(self.rt, 'ws_url', None), "markets_count": len(markets) if markets else 0})
+        except Exception:
+            log.info("ws_connected")
+
+        # subscribe if markets provided
+        if markets:
+            try:
+                await self.rt.subscribe_markets(markets)
+                try:
+                    sample = markets[:3]
+                    log.info("ws_subscribed", extra={"markets_sample": sample, "n": len(markets)})
+                except Exception:
+                    log.info("ws_subscribed")
+            except Exception:
+                log.exception("ws_subscribe_failed")
+
         self._task = asyncio.create_task(self._consume_loop(), name="ws_provider_consumer")
         log.info("ws_provider_started")
 
@@ -59,6 +89,21 @@ class WSMarketDataProvider(BaseMarketDataProvider):
                 import json
 
                 frame = json.loads(raw)
+                # debug mode: log first N raw frames keys and a small snippet
+                try:
+                    if self._ws_debug and self._ws_debug_count < self._ws_debug_limit:
+                        self._ws_debug_count += 1
+                        keys = list(frame.keys()) if isinstance(frame, dict) else []
+                        snippet = None
+                        try:
+                            snippet = frame.get('msg') if isinstance(frame, dict) else None
+                        except Exception:
+                            snippet = None
+                        log.info("ws_raw_msg", extra={"keys": keys, "type": frame.get('type') if isinstance(frame, dict) else None, "snippet": str(snippet)[:200]})
+                        if self._ws_debug_count >= self._ws_debug_limit:
+                            log.info("ws_debug_logging_complete", extra={"count": self._ws_debug_count})
+                except Exception:
+                    pass
             except Exception:
                 log.exception("ws_provider_failed_to_parse_frame")
                 continue
@@ -80,6 +125,14 @@ class WSMarketDataProvider(BaseMarketDataProvider):
                         self._books[ticker] = ob
                         # populate bbo from top of book
                         self._bbo[ticker] = self._extract_bbo_from_book(ob, ingest_ms=now_ms)
+                        if ticker not in self._first_bbo_logged:
+                            self._first_bbo_logged.add(ticker)
+                            try:
+                                bb = self._bbo[ticker].get('yes_bb_px')
+                                ba = self._bbo[ticker].get('yes_ba_px')
+                                log.info('ws_first_bbo', extra={'market': ticker, 'bb': bb, 'ba': ba})
+                            except Exception:
+                                log.info('ws_first_bbo', extra={'market': ticker})
 
                 elif typ == "orderbook_delta":
                     sid = int(frame.get("sid", -1))
@@ -102,9 +155,17 @@ class WSMarketDataProvider(BaseMarketDataProvider):
                         if abs_size is not None:
                             # update bbo for this ticker
                             self._bbo[ticker] = self._extract_bbo_from_book(ob, ingest_ms=now_ms)
+                            if ticker not in self._first_bbo_logged:
+                                self._first_bbo_logged.add(ticker)
+                                try:
+                                    bb = self._bbo[ticker].get('yes_bb_px')
+                                    ba = self._bbo[ticker].get('yes_ba_px')
+                                    log.info('ws_first_bbo', extra={'market': ticker, 'bb': bb, 'ba': ba})
+                                except Exception:
+                                    log.info('ws_first_bbo', extra={'market': ticker})
 
             except Exception:
-                log.exception("ws_provider_handler_error")
+                log.exception("ws_loop_crash")
 
     def _extract_bbo_from_book(self, ob: OrderBook, ingest_ms: int) -> dict:
         # yes side best bid = max price in yes.levels, best ask = min price in yes.levels
@@ -170,6 +231,18 @@ class WSMarketDataProvider(BaseMarketDataProvider):
                 return True
             await asyncio.sleep(0.05)
         return False
+
+    def is_ready(self, market: str) -> bool:
+        try:
+            return bool(self._bbo.get(market))
+        except Exception:
+            return False
+
+    async def wait_ready(self, markets: List[str], timeout_s: float = 10.0) -> bool:
+        try:
+            return await self.wait_for_initial_bbo(markets, timeout_ms=int(timeout_s * 1000))
+        except Exception:
+            return False
 
     @property
     def last_ws_message_age(self) -> float:
