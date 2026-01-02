@@ -11,7 +11,7 @@ services:
       - /home/ubuntu/.kalshi/prod_keys.pem:/run/secrets/prod_keys.pem:ro
     environment:
       PYTHONPATH: /app/src
-
+      MM_WS_DISCONNECT_KILL_SECS: "220"   # or 300
       # --- MD SOURCE: WS ---
       PROD_KEYID: ${PROD_KEYID}
       PROD_KEYFILE: /run/secrets/prod_keys.pem
