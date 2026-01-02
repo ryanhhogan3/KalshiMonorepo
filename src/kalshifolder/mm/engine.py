@@ -568,7 +568,7 @@ class Engine:
         recon_task = asyncio.create_task(self.reconcile_loop())
         try:
             # WS disconnect kill threshold (seconds)
-            ws_kill_s = int(os.getenv('MM_WS_DISCONNECT_KILL_S', '10'))
+            ws_kill_s = int(os.getenv('MM_WS_DISCONNECT_KILL_S', '120'))
             while self._running:
                 # Hard-kill if WS provider reports long disconnects
                 try:
