@@ -16,6 +16,10 @@ docker compose up -d --build
 # DOWN
 docker compose -f docker-compose.yml -f docker-compose.mm.yml down
 
+# Bring down engine only (for MM)
+docker compose -f docker-compose.yml -f docker-compose.mm.yml stop kalshi_mm_engine
+docker compose -f docker-compose.yml -f docker-compose.mm.yml rm -f kalshi_mm_engine
+
 # Reset docker instance
 docker restart
 
