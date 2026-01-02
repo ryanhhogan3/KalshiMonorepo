@@ -17,8 +17,9 @@ DEFAULT_WS_URL = os.getenv("WS_URL", "wss://api.elections.kalshi.com/trade-api/w
 DEFAULT_HOST   = os.getenv("WS_HOSTNAME", "api.elections.kalshi.com")
 METHOD, PATH   = "GET", "/trade-api/ws/v2"
 
-KEYID   = os.getenv("PROD_KEYID")   or os.getenv("KALSHI_KEY_ID") or os.getenv("PROD_KEY_ID")
-KEYFILE = os.getenv("PROD_KEYFILE") or os.getenv("KALSHI_PRIVATE_KEY_PATH") or os.getenv("PROD_KEYFILE_PATH") or "/run/secrets/prod_keys.pem"
+KEY_ID  = (os.getenv("PROD_KEYID") or "").strip()
+KEYFILE = (os.getenv("PROD_KEYFILE") or "").strip()
+
 
 class KalshiWSRuntime:
     """
