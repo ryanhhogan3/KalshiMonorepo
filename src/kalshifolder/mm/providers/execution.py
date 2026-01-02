@@ -57,22 +57,21 @@ class KalshiExecutionProvider:
         except Exception:
             return 0
 
-    def _signed_headers(self, method: str, path: str, body: Optional[str] = ""):
-        if not self._private_key or not self.key_id:
-            raise RuntimeError("Missing private key or key id for signing")
+    def _signed_headers(self, method: str, path: str, body: Optional[str] = ''):
+    # Normalize path
+        if path and not path.startswith('/'):
+            path = '/' + path
 
-        # Kalshi signing rule: sign timestamp + METHOD + path (NO querystring) + body
+        # Strip query from signed path (Kalshi requirement)
+        path_to_sign = path.split('?', 1)[0]
+
         ts = str(int(time.time() * 1000))
 
-        p = self._norm_path(path)
-        p_no_qs = p.split("?", 1)[0]
+        # IMPORTANT: Kalshi signs timestamp + METHOD + PATH only (no body)
+        msg = (ts + method + path_to_sign).encode('utf-8')
 
-        m = (method or "").upper()
-        body_str = body or ""
-
-        msg = (ts + m + p_no_qs + body_str).encode("utf-8")
-
-        try:
+        sig = ''
+        if self._private_key:
             sig = base64.b64encode(
                 self._private_key.sign(
                     msg,
@@ -82,18 +81,14 @@ class KalshiExecutionProvider:
                     ),
                     hashes.SHA256(),
                 )
-            ).decode("utf-8")
-        except Exception:
-            logger.exception("signing failed")
-            sig = ""
+            ).decode('utf-8')
 
         headers = {
-            "KALSHI-ACCESS-KEY": self.key_id,
-            "KALSHI-ACCESS-TIMESTAMP": ts,
-            "Content-Type": "application/json",
+            'KALSHI-ACCESS-KEY': self.key_id,
+            'KALSHI-ACCESS-TIMESTAMP': ts,
+            'KALSHI-ACCESS-SIGNATURE': sig,
+            'Content-Type': 'application/json',
         }
-        if sig:
-            headers["KALSHI-ACCESS-SIGNATURE"] = sig
         return headers
 
     def place_order(self, market_ticker: str, side: str, price_cents: int, size: float, client_order_id: str, action: str = "buy"):
