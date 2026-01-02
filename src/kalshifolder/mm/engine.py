@@ -1,4 +1,5 @@
 import asyncio
+import os
 import logging
 import time
 import csv
@@ -19,6 +20,35 @@ from .utils.time import now_ms
 from .utils.logging import setup_logging, json_msg
 
 logger = logging.getLogger(__name__)
+
+# Ensure a default event loop is available for code/tests that call
+# `asyncio.get_event_loop().run_until_complete(...)` in older styles.
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    except Exception:
+        pass
+else:
+    # Make get_event_loop resilient in test environments that clear the loop.
+    # Replace only if not already patched.
+    if not hasattr(asyncio, '_orig_get_event_loop'):
+        asyncio._orig_get_event_loop = asyncio.get_event_loop
+
+        def _get_event_loop_resilient():
+            try:
+                return asyncio._orig_get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                return loop
+
+        try:
+            asyncio.get_event_loop = _get_event_loop_resilient
+        except Exception:
+            pass
 
 
 def to_ms(val):
@@ -77,12 +107,19 @@ class Engine:
             pwd=self.config.ch_pwd,
             database=self.config.ch_db,
         )
-        self.md = ClickHouseMarketDataProvider(
-            self.config.ch_url,
-            user=self.config.ch_user,
-            pwd=self.config.ch_pwd,
-            db=self.config.ch_db,
-        )
+        # Market data source: prefer WS for live quoting unless overridden
+        md_source = os.getenv('MM_MD_SOURCE', 'ws').lower()
+        if md_source == 'clickhouse':
+            self.md = ClickHouseMarketDataProvider(
+                self.config.ch_url,
+                user=self.config.ch_user,
+                pwd=self.config.ch_pwd,
+                db=self.config.ch_db,
+            )
+        else:
+            # default: websocket provider (instantiate lazily at run-time)
+            self.md = None
+            self._md_source = 'ws'
         self.exec = KalshiExecutionProvider(self.config.kalshi_base, key_id=self.config.kalshi_key_id, private_key_path=self.config.kalshi_private_key_path)
         # configure execution provider price units from config
         try:
@@ -501,9 +538,43 @@ class Engine:
             logger.exception('initial reconcile_cycle failed')
 
         # start reconcile loop
+        # Start market data provider and wait for initial BBOs where applicable
+        try:
+            # instantiate lazy WS provider if requested
+            if getattr(self, '_md_source', None) == 'ws' and not self.md:
+                try:
+                    # local import to avoid heavy websocket imports at module import time
+                    from .providers.market_data_ws import WSMarketDataProvider
+
+                    self.md = WSMarketDataProvider()
+                except Exception:
+                    logger.exception('failed_to_instantiate_ws_provider')
+            if self.md:
+                await self.md.start()
+            wait_ms = int(os.getenv('MM_MD_WAIT_MS', '5000'))
+            if hasattr(self.md, 'wait_for_initial_bbo'):
+                ok = await self.md.wait_for_initial_bbo(self.config.markets, timeout_ms=wait_ms)
+                if not ok:
+                    logger.warning('md provider did not provide initial BBOs within timeout')
+        except Exception:
+            logger.exception('failed to start market data provider')
+
         recon_task = asyncio.create_task(self.reconcile_loop())
         try:
+            # WS disconnect kill threshold (seconds)
+            ws_kill_s = int(os.getenv('MM_WS_DISCONNECT_KILL_S', '10'))
             while self._running:
+                # Hard-kill if WS provider reports long disconnects
+                try:
+                    if hasattr(self.md, 'last_ws_message_age'):
+                        age = float(getattr(self.md, 'last_ws_message_age'))
+                        if age is not None and age > ws_kill_s:
+                            logger.error('ws_provider_disconnected_too_long age_s=%s killing_engine', age)
+                            self._running = False
+                            break
+                except Exception:
+                    pass
+
                 await self.run_once()
                 await asyncio.sleep(self.config.poll_ms / 1000.0)
         except asyncio.CancelledError:
@@ -511,6 +582,12 @@ class Engine:
         finally:
             self._running = False
             recon_task.cancel()
+            # ensure provider is stopped
+            try:
+                if hasattr(self.md, 'stop'):
+                    await self.md.stop()
+            except Exception:
+                logger.exception('failed to stop market data provider')
 
     def stop(self):
         self._running = False
