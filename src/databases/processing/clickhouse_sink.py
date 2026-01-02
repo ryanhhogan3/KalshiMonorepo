@@ -117,6 +117,10 @@ class ClickHouseSink:
         # Keep columnar buffer for "latest_levels" as before
         self._buf_lt = self._new_lt()
         self._t = asyncio.get_event_loop().time()
+        # separate timer for latest_levels flushes (decouple from event flush timer)
+        self._t_lt = asyncio.get_event_loop().time()
+        # timestamp when latest buffer last received a new row
+        self._last_lt_buffer_ts: float | None = None
         self._lock = asyncio.Lock()
         # Metrics for monitoring
         # Insert stats object (used by streamer heartbeat)
@@ -158,6 +162,23 @@ class ClickHouseSink:
         async with self._lock:
             for k in self._buf_lt:
                 self._buf_lt[k].append(row[k])
+            # record last buffer time for latest-levels
+            try:
+                self._last_lt_buffer_ts = asyncio.get_event_loop().time()
+            except Exception:
+                self._last_lt_buffer_ts = None
+            # Log buffering of latest rows for observability
+            try:
+                log.info(
+                    "LT_BUFFER",
+                    extra={
+                        "rows_added": 1,
+                        "lt_buf_rows": len(self._buf_lt.get("market_id", [])),
+                        "latest_table": self.table_latest,
+                    },
+                )
+            except Exception:
+                pass
             await self._maybe_flush()
 
     async def _maybe_flush(self):
@@ -165,6 +186,21 @@ class ClickHouseSink:
         # flush if we have reached configured row count, or enough time passed
         if len(self._buffer_events) >= self.flush_rows or (now - self._t) >= self.flush_secs:
             await self.flush()
+            return
+
+        # Also consider the latest-levels buffer independently: flush when it has data
+        # and either enough time passed since last latest flush or buffer reached a modest size.
+        if self._buf_lt.get("market_id"):
+            # if we have a timestamp for last latest flush, use that; otherwise use global
+            last_lt = getattr(self, "_t_lt", self._t)
+            # trigger when time since last latest flush exceeds flush_secs
+            if (now - last_lt) >= self.flush_secs:
+                await self.flush()
+                return
+            # also trigger when latest buffer grows very large (safety)
+            if len(self._buf_lt.get("market_id", [])) >= max(1, self.batch_rows):
+                await self.flush()
+                return
 
     def _insert_compat(self, table: str, buf: dict, cols: list[str]):
         """
@@ -230,9 +266,22 @@ class ClickHouseSink:
             for i in range(n):
                 row = {c: b[c][i] for c in self._cols_lt}
                 rows.append(row)
+            # log that we're about to flush latest_levels
+            try:
+                log.info(
+                    "LT_FLUSH",
+                    extra={"rows": len(rows), "table": self.table_latest},
+                )
+            except Exception:
+                pass
             # record pending rows
             self.insert_stats.pending_rows = len(rows)
             await self._insert_with_retry(self.table_latest, rows, self._cols_lt)
+            # record time of latest-levels flush attempt
+            try:
+                self._t_lt = asyncio.get_event_loop().time()
+            except Exception:
+                pass
             self.insert_stats.pending_rows = 0
 
     async def _insert_with_retry(self, table, rows, cols):
@@ -274,6 +323,19 @@ class ClickHouseSink:
                     "clickhouse_insert_ok",
                     extra={"rows": len(rows), "attempt": attempt, "table": table},
                 )
+                # If this was a latest_levels insert, emit explicit LT flush success
+                try:
+                    if table == self.table_latest:
+                        try:
+                            self._t_lt = asyncio.get_event_loop().time()
+                        except Exception:
+                            pass
+                        log.info(
+                            "LT_FLUSH_OK",
+                            extra={"rows": len(rows), "table": table},
+                        )
+                except Exception:
+                    pass
                 return
             except (DatabaseError, OperationalError, Exception) as e:
                 now = datetime.now(timezone.utc)
@@ -323,6 +385,15 @@ class ClickHouseSink:
                                 "spooled_file": spooled_file,
                             },
                         )
+                        # If this was a latest_levels insert, emit explicit LT flush failure
+                        try:
+                            if table == self.table_latest:
+                                log.error(
+                                    "LT_FLUSH_FAIL",
+                                    extra={"rows": len(rows), "table": table, "error": msg[:500]},
+                                )
+                        except Exception:
+                            pass
                         # also ensure insert_stats totals reflect gave-up
                         self.insert_stats.record_failure(msg, now_ts, window_s=fail_window)
                         self.insert_failures = self.insert_stats.insert_failures_total
