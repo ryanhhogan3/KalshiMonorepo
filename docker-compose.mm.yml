@@ -1,28 +1,60 @@
 services:
   kalshi_mm_engine:
+    env_file:
+      - .env
     image: python:3.11-slim
     container_name: kalshi_mm_engine
     restart: unless-stopped
     working_dir: /app
-
-    env_file:
-      - .env
-
-    environment:
-      PYTHONPATH: /app/src
-      CLICKHOUSE_LATEST_TABLE: latest_levels_v2
-
     volumes:
       - ./:/app:rw
       - /home/ubuntu/.kalshi/prod_keys.pem:/run/secrets/prod_keys.pem:ro
+    environment:
+      PYTHONPATH: /app/src
+
+      # --- MD SOURCE: WS ---
+      MM_MD_SOURCE: ws
+      # Use same WS as streamer
+      WS_URL: ${WS_URL:-wss://api.elections.kalshi.com/trade-api/ws/v2}
+      WS_HOSTNAME: ${WS_HOSTNAME:-api.elections.kalshi.com}
+
+      # TEMP DEBUG (turn off once stable)
+      MM_WS_DEBUG: ${MM_WS_DEBUG:-1}
+      MM_WS_DEBUG_LIMIT: ${MM_WS_DEBUG_LIMIT:-20}
+
+      # --- Markets to quote ---
+      MM_MARKETS: ${MM_MARKETS}
+
+      # --- Staleness / loop ---
+      MM_POLL_MS: ${MM_POLL_MS:-250}
+      MM_MAX_LEVEL_AGE_MS: ${MM_MAX_LEVEL_AGE_MS:-5000}   # tighter for WS
+      MM_LOOP_JITTER_MS: ${MM_LOOP_JITTER_MS:-0}
+      MM_KILL_ON_STALE: ${MM_KILL_ON_STALE:-1}
+
+      # --- Trading safety defaults (paper-first) ---
+      MM_TRADING_ENABLED: ${MM_TRADING_ENABLED:-0}
+      MM_SIZE: ${MM_SIZE:-1}
+      MM_EDGE_TICKS: ${MM_EDGE_TICKS:-1}
+      MM_MAX_POS: ${MM_MAX_POS:-1}
+      MM_MAX_GLOBAL_POS: ${MM_MAX_GLOBAL_POS:-2}
+      MM_MAX_REJECTS_PER_MIN: ${MM_MAX_REJECTS_PER_MIN:-10}
+      MM_KILL_ON_REJECT_SPIKE: ${MM_KILL_ON_REJECT_SPIKE:-1}
+      MM_MIN_REPRICE_TICKS: ${MM_MIN_REPRICE_TICKS:-1}
+      MM_QUOTE_REFRESH_MS: ${MM_QUOTE_REFRESH_MS:-1000}
+
+      # --- API creds ---
+      KALSHI_KEY_ID: ${KALSHI_KEY_ID}
+      KALSHI_PRIVATE_KEY_PATH: /run/secrets/prod_keys.pem
+      KALSHI_API_BASE: ${KALSHI_API_BASE:-https://api.elections.kalshi.com/trade-api/v2}
+
+      # --- ClickHouse still used for logs/recon (optional) ---
+      CH_URL: ${CH_URL:-http://clickhouse:8123}
+      CH_USER: ${CH_USER:-default}
+      CH_PWD: ${CH_PWD:-default_password}
+      CH_DB: ${CH_DB:-kalshi}
+      CLICKHOUSE_LATEST_TABLE: ${CLICKHOUSE_LATEST_TABLE:-latest_levels_v2}
 
     depends_on:
       - clickhouse
 
     command: ["/bin/sh","-lc","pip install -r requirements.txt && python -m kalshifolder.mm.main"]
-
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import os; import sys; sys.exit(0)\""]
-      interval: 30s
-      timeout: 10s
-      retries: 3
