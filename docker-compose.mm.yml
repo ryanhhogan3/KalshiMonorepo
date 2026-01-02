@@ -13,7 +13,7 @@ services:
       PYTHONPATH: /app/src
 
       # --- MD SOURCE: WS ---
-      PROD_KEYID: ${KALSHI_KEY_ID}
+      PROD_KEYID: ${PROD_KEYID}
       PROD_KEYFILE: /run/secrets/prod_keys.pem
       MM_MD_SOURCE: ws
       # Use same WS as streamer
