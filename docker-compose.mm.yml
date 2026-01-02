@@ -21,7 +21,7 @@ services:
       WS_HOSTNAME: ${WS_HOSTNAME:-api.elections.kalshi.com}
 
       # TEMP DEBUG (turn off once stable)
-      MM_WS_DEBUG: ${MM_WS_DEBUG:-1}
+      MM_WS_DEBUG: ${MM_WS_DEBUG:-0}
       MM_WS_DEBUG_LIMIT: ${MM_WS_DEBUG_LIMIT:-20}
 
       # --- Markets to quote ---
@@ -29,9 +29,9 @@ services:
 
       # --- Staleness / loop ---
       MM_POLL_MS: ${MM_POLL_MS:-250}
-      MM_MAX_LEVEL_AGE_MS: ${MM_MAX_LEVEL_AGE_MS:-30000}   # tighter for WS
+      MM_MAX_LEVEL_AGE_MS: ${MM_MAX_LEVEL_AGE_MS:-120000}   # tighter for WS
       MM_LOOP_JITTER_MS: ${MM_LOOP_JITTER_MS:-0}
-      MM_KILL_ON_STALE: ${MM_KILL_ON_STALE:-1}
+      MM_KILL_ON_STALE: ${MM_KILL_ON_STALE:-0}
 
       # --- Trading safety defaults (paper-first) ---
       MM_TRADING_ENABLED: ${MM_TRADING_ENABLED:-0}
