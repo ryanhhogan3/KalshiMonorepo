@@ -167,29 +167,39 @@ class KalshiExecutionProvider:
             latency = int(time.time() * 1000) - t0
             return {"status": "ERROR", "latency_ms": latency, "raw": str(e)}
 
-    def get_open_orders(self):
+    def get_open_orders(self, ticker: str | None = None, limit: int = 200):
         path = f"{API_PREFIX}/portfolio/orders"
         url = self._endpoint(path)
+
+        params = {"status": "resting", "limit": int(limit)}
+        if ticker:
+            params["ticker"] = ticker
+
         headers = self._signed_headers("GET", path, "")
+
         try:
-            r = requests.get(url, headers=headers, timeout=self.timeout)
+            r = requests.get(url, params=params, headers=headers, timeout=self.timeout)
             r.raise_for_status()
             j = r.json()
+
+            orders = []
             if isinstance(j, dict):
-                orders = j.get("orders") or j.get("order") or []
-                if isinstance(orders, list):
-                    return [o for o in orders if isinstance(o, dict)]
-                if isinstance(orders, dict):
-                    return [orders]
-                logger.error("get_open_orders unexpected payload type for orders: %s keys=%s", type(orders), list(j.keys()))
-                return []
-            if isinstance(j, list):
-                return [o for o in j if isinstance(o, dict)]
-            logger.error("get_open_orders unexpected JSON root type: %s", type(j))
-            return []
+                orders = j.get("orders") or []
+            elif isinstance(j, list):
+                orders = j
+
+            # extra safety filter (in case API behavior changes)
+            out = []
+            for o in orders:
+                if not isinstance(o, dict):
+                    continue
+                if o.get("status") == "resting" and int(o.get("remaining_count") or 0) > 0:
+                    out.append(o)
+            return out
         except Exception:
             logger.exception("get_open_orders failed")
             return []
+
 
     def get_positions(self):
         path = f"{API_PREFIX}/portfolio/positions"
