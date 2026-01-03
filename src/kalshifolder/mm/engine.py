@@ -18,6 +18,9 @@ from .risk.limits import RiskManager
 from .utils.id import uuid4_hex
 from .utils.time import now_ms
 from .utils.logging import setup_logging, json_msg
+from collections import deque
+from datetime import datetime, timezone
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +142,9 @@ class Engine:
         self._running = False
         self.market_locks: Dict[str, asyncio.Lock] = {}
         self.last_sent: Dict[str, dict] = {}
+        self.reject_window_s = int(os.getenv("MM_REJECT_WINDOW_S", "60"))
+        self.reject_times = deque()  # store epoch seconds of rejects (global)
+
 
     async def ensure_schema(self):
         # ensure schemas exist
@@ -198,7 +204,7 @@ class Engine:
 
     def _log_response(self, action_id: str, market: str, client_order_id: str, status: str, exchange_order_id: str, reject_reason: str, latency_ms: int, response_json: str):
         row = {
-            'ts': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'ts': self.ch_utc_now_str(),
             'action_id': action_id,
             'engine_instance_id': self.state.instance_id,
             'engine_version': self.state.version,
@@ -517,10 +523,95 @@ class Engine:
                         else:
                             mr.rejects_rolling_counter += 1
 
+    def ch_utc_now_str():
+    # ClickHouse DateTime64(3,'UTC') accepts "YYYY-MM-DD HH:MM:SS.mmm"
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    
+    def _record_reject_and_maybe_kill(self):
+        if not self.config.kill_on_reject_spike:
+            return
+        now_s = time.time()
+        self.reject_times.append(now_s)
+        # prune old
+        cutoff = now_s - self.reject_window_s
+        while self.reject_times and self.reject_times[0] < cutoff:
+            self.reject_times.popleft()
+
+        if len(self.reject_times) > int(self.config.max_rejects_per_min):
+            logger.error(json_msg({
+                "event": "KILL_SWITCH_REJECT_SPIKE",
+                "rejects_in_window": len(self.reject_times),
+                "window_s": self.reject_window_s,
+                "max_per_min": self.config.max_rejects_per_min,
+            }))
+            self._running = False
+
+
+    def extract_reject_reason(raw: str) -> str:
+        if not raw:
+            return ""
+        try:
+            j = json.loads(raw)
+            err = j.get("error") if isinstance(j, dict) else None
+            if isinstance(err, dict):
+                code = err.get("code", "")
+                details = err.get("details", "") or err.get("message", "")
+                # keep it compact for CH
+                return f"{code}:{details}"[:500]
+            return raw[:500]
+        except Exception:
+            return raw[:500]
+
+    
+
     async def run(self):
         self._running = True
         await self.ensure_schema()
         # log latest_levels freshness to detect mismatched streamer writes
+        # ---- trading preflight ----
+        API_PREFIX = "/trade-api/v2"
+        if self.config.trading_enabled:
+            try:
+                # 1) exchange status
+                status_path = f"{API_PREFIX}/exchange/status"
+                r = requests.get(
+                    self.exec.base_url + status_path,
+                    headers=self.exec._signed_headers("GET", status_path, ""),
+                    timeout=10,
+                )
+                ok = (r.status_code == 200)
+                logger.info(json_msg({"event": "exchange_status", "ok": ok, "code": r.status_code, "body": r.text[:300]}))
+                if not ok:
+                    logger.error("Trading preflight failed: exchange status not OK. Disabling trading.")
+                    self.config.trading_enabled = False
+            except Exception:
+                logger.exception("Trading preflight failed: exchange status error. Disabling trading.")
+                self.config.trading_enabled = False
+
+        if self.config.trading_enabled:
+            try:
+                # 2) balance threshold
+                min_bal = int(os.getenv("MM_MIN_BALANCE_CENTS", "100"))  # default $1.00
+                bal_path = f"{API_PREFIX}/portfolio/balance"
+                r = requests.get(
+                    self.exec.base_url + bal_path,
+                    headers=self.exec._signed_headers("GET", bal_path, ""),
+                    timeout=10,
+                )
+                if r.status_code == 200:
+                    j = r.json()
+                    bal = int(j.get("balance", 0))
+                    logger.info(json_msg({"event": "balance_check", "balance_cents": bal, "min_required_cents": min_bal}))
+                    if bal < min_bal:
+                        logger.error("Insufficient balance for trading. Disabling trading.")
+                        self.config.trading_enabled = False
+                else:
+                    logger.error("Balance check failed code=%s body=%s", r.status_code, r.text[:300])
+                    self.config.trading_enabled = False
+            except Exception:
+                logger.exception("Balance check failed. Disabling trading.")
+                self.config.trading_enabled = False
+
         try:
             await asyncio.to_thread(self._log_latest_table_freshness)
         except Exception:
