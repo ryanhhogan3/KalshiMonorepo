@@ -145,6 +145,9 @@ class Engine:
         self.reject_window_s = int(os.getenv("MM_REJECT_WINDOW_S", "60"))
         self.reject_times = deque()  # store epoch seconds of rejects (global)
 
+    def ch_utc_now_str():
+    # ClickHouse DateTime64(3,'UTC') accepts "YYYY-MM-DD HH:MM:SS.mmm"
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
     async def ensure_schema(self):
         # ensure schemas exist
@@ -204,7 +207,7 @@ class Engine:
 
     def _log_response(self, action_id: str, market: str, client_order_id: str, status: str, exchange_order_id: str, reject_reason: str, latency_ms: int, response_json: str):
         row = {
-            'ts': self.ch_utc_now_str(),
+            'ts': time.strftime('%Y-%m-%d %H:%M:%S'),
             'action_id': action_id,
             'engine_instance_id': self.state.instance_id,
             'engine_version': self.state.version,
@@ -523,9 +526,6 @@ class Engine:
                         else:
                             mr.rejects_rolling_counter += 1
 
-    def ch_utc_now_str():
-    # ClickHouse DateTime64(3,'UTC') accepts "YYYY-MM-DD HH:MM:SS.mmm"
-        return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     
     def _record_reject_and_maybe_kill(self):
         if not self.config.kill_on_reject_spike:
