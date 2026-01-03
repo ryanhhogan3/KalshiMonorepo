@@ -113,7 +113,6 @@ class KalshiExecutionProvider:
             "side": side_norm,
             "action": action_norm,
             "type": "limit",            
-            "post_only": True,  
         }
         if side_norm == "yes":
             payload["yes_price"] = price_cents
