@@ -372,7 +372,8 @@ class Engine:
                             if not self.config.trading_enabled:
                                 resp = {'status': 'SIMULATED', 'latency_ms': 0, 'raw': '{"simulated": true}', 'exchange_order_id': ''}
                             else:
-                                resp = await asyncio.to_thread(self.exec.cancel_order, cancel_client)
+                                cancel_id = wo.exchange_order_id or wo.client_order_id
+                                resp = await asyncio.to_thread(self.exec.cancel_order, cancel_id)
                             status = resp.get('status', 'ERROR')
                             exch_id = resp.get('exchange_order_id')
                             if not self.config.trading_enabled:
@@ -467,7 +468,8 @@ class Engine:
                             if not self.config.trading_enabled:
                                 resp = {'status': 'SIMULATED', 'latency_ms': 0, 'raw': '{"simulated": true}', 'exchange_order_id': ''}
                             else:
-                                resp = await asyncio.to_thread(self.exec.cancel_order, cancel_client)
+                                cancel_id = wo.exchange_order_id or wo.client_order_id
+                                resp = await asyncio.to_thread(self.exec.cancel_order, cancel_id)
                             status = resp.get('status', 'ERROR')
                             exch_id = resp.get('exchange_order_id')
                             if not self.config.trading_enabled:
