@@ -58,7 +58,7 @@ class KalshiExecutionProvider:
             return 0
 
     def _signed_headers(self, method: str, path: str, body: Optional[str] = ''):
-    # Normalize path
+        # Normalize path - caller should pass full /trade-api/v2/... path
         if path and not path.startswith('/'):
             path = '/' + path
 
@@ -68,7 +68,7 @@ class KalshiExecutionProvider:
         ts = str(int(time.time() * 1000))
 
         # IMPORTANT: Kalshi signs timestamp + METHOD + PATH only (no body)
-        msg = (ts + method + path_to_sign).encode('utf-8')
+        msg = (ts + method.upper() + path_to_sign).encode('utf-8')
 
         sig = ''
         if self._private_key:
@@ -92,7 +92,7 @@ class KalshiExecutionProvider:
         return headers
 
     def place_order(self, market_ticker: str, side: str, price_cents: int, size: float, client_order_id: str, action: str = "buy"):
-        path = "/portfolio/orders"
+        path = f"{API_PREFIX}/portfolio/orders"
         url = self._endpoint(path)
 
         price_cents = int(price_cents)
@@ -143,7 +143,7 @@ class KalshiExecutionProvider:
             return {"status": "ERROR", "latency_ms": latency, "raw": str(e)}
 
     def cancel_order(self, client_order_id: str):
-        path = f"/portfolio/orders/{client_order_id}"
+        path = f"{API_PREFIX}/portfolio/orders/{client_order_id}"
         url = self._endpoint(path)
         headers = self._signed_headers("DELETE", path, "")
 
@@ -167,7 +167,7 @@ class KalshiExecutionProvider:
             return {"status": "ERROR", "latency_ms": latency, "raw": str(e)}
 
     def get_open_orders(self):
-        path = "/portfolio/orders"
+        path = f"{API_PREFIX}/portfolio/orders"
         url = self._endpoint(path)
         headers = self._signed_headers("GET", path, "")
         try:
@@ -191,7 +191,7 @@ class KalshiExecutionProvider:
             return []
 
     def get_positions(self):
-        path = "/portfolio/positions"
+        path = f"{API_PREFIX}/portfolio/positions"
         url = self._endpoint(path)
         headers = self._signed_headers("GET", path, "")
         try:
@@ -215,7 +215,7 @@ class KalshiExecutionProvider:
             return []
 
     def get_fills(self, since_ts_ms: int = 0):
-        path = "/portfolio/fills"
+        path = f"{API_PREFIX}/portfolio/fills"
         url = self._endpoint(path)
 
         # API uses seconds. Convert incoming ms -> seconds.
