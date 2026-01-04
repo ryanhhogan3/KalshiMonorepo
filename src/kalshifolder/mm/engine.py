@@ -255,6 +255,8 @@ class Engine:
         for m in markets:
             mr = self.store.get_market(m)
             md = batch.get(m)
+            if int(now/1000) % 1 == 0:
+                logger.info(json_msg({"event":"md_row","market":m,"md":md}))
             # normalize ingest timestamp from the batch (try several keys)
             new_ingest_ms = None
             if md:
@@ -332,6 +334,18 @@ class Engine:
                 mr.kill_stale = True
                 logger.info(json_msg({'event': 'no_book', 'market': m}))
                 # cancel working orders if any (not implemented here)
+                continue
+            if bb >= ba:
+                logger.error(json_msg({
+                    "event": "inverted_book",
+                    "market": m,
+                    "bb": bb,
+                    "ba": ba,
+                    "yes_bb_px": mr.last_bb_px,
+                    "yes_ba_px": mr.last_ba_px,
+                    "no_bb_px": mr.no_bb_px,
+                    "no_ba_px": mr.no_ba_px,
+                }))
                 continue
 
             target = compute_quotes(bb, ba, mr.inventory, self.config.max_pos, self.config.edge_ticks, tick_size, self.config.size)
@@ -448,6 +462,7 @@ class Engine:
                                 last_update_ts_ms=now,
                             )
                             mr.working_bid = wo_new
+                            logger.info(json_msg({"event":"wo_set","market":m,"side":"BID","client_order_id":client_order_id,"px_cents":new_price_cents}))
                             last['bid_px'] = target.bid_px
                             last['ts_ms'] = now
                             # register in engine order registries
@@ -531,6 +546,7 @@ class Engine:
                                 last_update_ts_ms=now,
                             )
                             mr.working_ask = wo_new
+                            logger.info(json_msg({"event":"wo_set","market":m,"side":"ASK","client_order_id":client_order_id,"px_cents":new_price_cents}))
                             last['ask_px'] = target.ask_px
                             last['ts_ms'] = now
                             try:
