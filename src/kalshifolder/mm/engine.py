@@ -255,7 +255,8 @@ class Engine:
         for m in markets:
             mr = self.store.get_market(m)
             md = batch.get(m)
-            if int(now/1000) % 1 == 0:
+            if int(now/1000) != int((getattr(mr, "_last_wo_log_ms", 0))/1000):
+                mr._last_wo_log_ms = now
                 logger.info(json_msg({"event":"md_row","market":m,"md":md}))
             # normalize ingest timestamp from the batch (try several keys)
             new_ingest_ms = None
@@ -309,32 +310,81 @@ class Engine:
                 }))
 
             if not md:
-                # no data in this batch for the market — skip quoting for now
-                logger.info(json_msg({"event":"skip_no_md_row","market":m,"stale_reason":mr.stale_reason}))
+                logger.info(json_msg({"event": "skip_no_md_row", "market": m, "stale_reason": mr.stale_reason}))
                 continue
-            # update runtime state using deduped ingest_ts-based fields (fall back to legacy keys)
-            mr.last_bb_px = md.get('yes_bb_px') or md.get('bb_px')
-            mr.last_bb_sz = md.get('yes_bb_sz') or md.get('bb_sz') or 0
-            mr.last_ba_px = md.get('yes_ba_px') or md.get('ba_px')
-            mr.last_ba_sz = md.get('yes_ba_sz') or md.get('ba_sz') or 0
-            # keep NO-side fields too if available
-            mr.no_bb_px = md.get('no_bb_px')
-            mr.no_bb_sz = md.get('no_bb_sz') or 0
-            mr.no_ba_px = md.get('no_ba_px')
-            mr.no_ba_sz = md.get('no_ba_sz') or 0
+
+            # ---------- normalize/ingest raw book ----------
+            yes_bb_px = md.get("yes_bb_px")
+            yes_bb_sz = md.get("yes_bb_sz") or 0
+            yes_ba_px = md.get("yes_ba_px")
+            yes_ba_sz = md.get("yes_ba_sz") or 0
+
+            no_bb_px = md.get("no_bb_px")
+            no_bb_sz = md.get("no_bb_sz") or 0
+            no_ba_px = md.get("no_ba_px")
+            no_ba_sz = md.get("no_ba_sz") or 0
+
+            # Fallback to legacy keys if present
+            if yes_bb_px is None:
+                yes_bb_px = md.get("bb_px")
+            if yes_bb_sz == 0:
+                yes_bb_sz = md.get("bb_sz") or 0
+            if yes_ba_px is None:
+                yes_ba_px = md.get("ba_px")
+            if yes_ba_sz == 0:
+                yes_ba_sz = md.get("ba_sz") or 0
+
+            # ---------- derive asks from opposite-side bids if asks are missing/bogus ----------
+            # WS often provides only bids or uses placeholder asks (e.g. 0.01). Treat "ask <= 0.01" as unusable.
+            def _round_px(x):
+                try:
+                    return round(float(x), 2)
+                except Exception:
+                    return None
+
+            def _is_bad_ask(x):
+                if x is None:
+                    return True
+                try:
+                    return float(x) <= 0.01
+                except Exception:
+                    return True
+
+            # If we have both bids, we can always derive a consistent ask on each side.
+            if _is_bad_ask(yes_ba_px) and no_bb_px is not None:
+                yes_ba_px = _round_px(1.0 - float(no_bb_px))
+                yes_ba_sz = int(no_bb_sz or 0)
+
+            if _is_bad_ask(no_ba_px) and yes_bb_px is not None:
+                no_ba_px = _round_px(1.0 - float(yes_bb_px))
+                no_ba_sz = int(yes_bb_sz or 0)
+
+            # ---------- write normalized state to mr ----------
+            mr.last_bb_px = _round_px(yes_bb_px)
+            mr.last_bb_sz = int(yes_bb_sz or 0)
+            mr.last_ba_px = _round_px(yes_ba_px)
+            mr.last_ba_sz = int(yes_ba_sz or 0)
+
+            mr.no_bb_px = _round_px(no_bb_px)
+            mr.no_bb_sz = int(no_bb_sz or 0)
+            mr.no_ba_px = _round_px(no_ba_px)
+            mr.no_ba_sz = int(no_ba_sz or 0)
 
             # ensure lock exists
             if m not in self.market_locks:
                 self.market_locks[m] = asyncio.Lock()
-            last = self.last_sent.setdefault(m, {'bid_px': None, 'ask_px': None, 'ts_ms': 0})
+            last = self.last_sent.setdefault(m, {"bid_px": None, "ask_px": None, "ts_ms": 0})
 
             bb = mr.last_bb_px
             ba = mr.last_ba_px
+
             if bb is None or ba is None:
                 mr.kill_stale = True
-                logger.info(json_msg({'event': 'no_book', 'market': m}))
-                # cancel working orders if any (not implemented here)
+                logger.info(json_msg({"event": "no_book", "market": m, "yes_bb_px": mr.last_bb_px, "yes_ba_px": mr.last_ba_px,
+                                    "no_bb_px": mr.no_bb_px, "no_ba_px": mr.no_ba_px}))
                 continue
+
+            # If still inverted after derivation, skip quoting (bad data)
             if bb >= ba:
                 logger.error(json_msg({
                     "event": "inverted_book",
@@ -345,11 +395,28 @@ class Engine:
                     "yes_ba_px": mr.last_ba_px,
                     "no_bb_px": mr.no_bb_px,
                     "no_ba_px": mr.no_ba_px,
+                    "note": "skipping quotes; asks should be derived from opposite bid",
                 }))
                 continue
 
+            # wo_state: rate-limit to 1/sec per market
+            now = now_ms()
+            if int(now / 1000) != int(getattr(mr, "_last_wo_log_ms", 0) / 1000):
+                mr._last_wo_log_ms = now
+                logger.info(json_msg({
+                    "event": "wo_state",
+                    "market": m,
+                    "has_bid": bool(mr.working_bid),
+                    "has_ask": bool(mr.working_ask),
+                    "bid_client": (mr.working_bid.client_order_id if mr.working_bid else None),
+                    "ask_client": (mr.working_ask.client_order_id if mr.working_ask else None),
+                    "bid_px_cents": (mr.working_bid.price_cents if mr.working_bid else None),
+                    "ask_px_cents": (mr.working_ask.price_cents if mr.working_ask else None),
+                }))
+
             target = compute_quotes(bb, ba, mr.inventory, self.config.max_pos, self.config.edge_ticks, tick_size, self.config.size)
             allowed, reason = self.risk.check_market(mr)
+
             logger.info(json_msg({
                 "event": "quote_eval",
                 "market": m,
@@ -362,12 +429,14 @@ class Engine:
                 "target_bid_px": target.bid_px, "target_ask_px": target.ask_px,
                 "target_bid_sz": target.bid_sz, "target_ask_sz": target.ask_sz,
             }))
+
             decision_id = uuid4_hex()
             mid = (bb + ba) / 2.0
             spread = ba - bb
             self._log_decision(decision_id, m, bb, ba, mid, spread, target, mr.inventory, mr.inventory)
+
             if not allowed:
-                logger.info(json_msg({'event': 'risk_block', 'market': m, 'reason': reason}))
+                logger.info(json_msg({"event": "risk_block", "market": m, "reason": reason}))
                 continue
 
             async with self.market_locks[m]:
