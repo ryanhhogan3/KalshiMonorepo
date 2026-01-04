@@ -262,6 +262,7 @@ class Engine:
 
             if md is None:
                 # missing row in a successful batch: mark md as unavailable for this cycle
+                logger.info(json_msg({"event":"skip_no_book","market":m}))
                 mr.md_ok = False
                 mr.last_md_error_ts_ms = None
                 mr.stale_reason = 'missing_row'
@@ -307,6 +308,7 @@ class Engine:
 
             if not md:
                 # no data in this batch for the market — skip quoting for now
+                logger.info(json_msg({"event":"skip_no_md_row","market":m,"stale_reason":mr.stale_reason}))
                 continue
             # update runtime state using deduped ingest_ts-based fields (fall back to legacy keys)
             mr.last_bb_px = md.get('yes_bb_px') or md.get('bb_px')
@@ -334,6 +336,18 @@ class Engine:
 
             target = compute_quotes(bb, ba, mr.inventory, self.config.max_pos, self.config.edge_ticks, tick_size, self.config.size)
             allowed, reason = self.risk.check_market(mr)
+            logger.info(json_msg({
+                "event": "quote_eval",
+                "market": m,
+                "trading_enabled": bool(self.config.trading_enabled),
+                "md_ok": bool(mr.md_ok),
+                "kill_stale": bool(mr.kill_stale),
+                "risk_allowed": bool(allowed),
+                "risk_reason": reason,
+                "bb": bb, "ba": ba,
+                "target_bid_px": target.bid_px, "target_ask_px": target.ask_px,
+                "target_bid_sz": target.bid_sz, "target_ask_sz": target.ask_sz,
+            }))
             decision_id = uuid4_hex()
             mid = (bb + ba) / 2.0
             spread = ba - bb

@@ -124,6 +124,7 @@ class KalshiExecutionProvider:
         headers = self._signed_headers("POST", path, body)
 
         t0 = int(time.time() * 1000)
+        logger.info("place_order payload=%s", body)
         try:
             r = requests.post(url, data=body, headers=headers, timeout=self.timeout)
             latency = int(time.time() * 1000) - t0
