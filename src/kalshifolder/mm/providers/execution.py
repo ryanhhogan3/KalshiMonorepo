@@ -178,25 +178,29 @@ class KalshiExecutionProvider:
 
         headers = self._signed_headers("GET", path, "")
 
+        def _is_resting(o: dict) -> bool:
+            st = (o.get("status") or "").lower()
+            try:
+                rem = int(o.get("remaining_count") or 0)
+            except Exception:
+                rem = 0
+            return st == "resting" and rem > 0
+
         try:
             r = requests.get(url, params=params, headers=headers, timeout=self.timeout)
             r.raise_for_status()
             j = r.json()
 
-            orders = []
             if isinstance(j, dict):
                 orders = j.get("orders") or []
             elif isinstance(j, list):
                 orders = j
+            else:
+                orders = []
 
-            # extra safety filter (in case API behavior changes)
-            out = []
-            for o in orders:
-                if not isinstance(o, dict):
-                    continue
-                if o.get("status") == "resting" and int(o.get("remaining_count") or 0) > 0:
-                    out.append(o)
+            out = [o for o in orders if isinstance(o, dict) and _is_resting(o)]
             return out
+
         except Exception:
             logger.exception("get_open_orders failed")
             return []
