@@ -144,8 +144,14 @@ class KalshiExecutionProvider:
             latency = int(time.time() * 1000) - t0
             return {"status": "ERROR", "latency_ms": latency, "raw": str(e)}
 
-    def cancel_order(self, client_order_id: str):
-        path = f"{API_PREFIX}/portfolio/orders/{client_order_id}"
+    def cancel_order(self, order_id: str):
+        """Cancel an order by its ID.
+        
+        Args:
+            order_id: The order ID to cancel. Prefer exchange_order_id if available,
+                     otherwise fall back to client_order_id.
+        """
+        path = f"{API_PREFIX}/portfolio/orders/{order_id}"
         url = self._endpoint(path)
         headers = self._signed_headers("DELETE", path, "")
 
