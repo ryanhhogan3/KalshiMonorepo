@@ -358,25 +358,31 @@ class Engine:
             last = self.last_sent.setdefault(m, {"bid_px": None, "ask_px": None, "ts_ms": 0})
 
             bb = mr.last_bb_px
-            ba = mr.last_ba_px
+            ba = mr.last_ba_px  # may be garbage from WS
 
-            if bb is None or ba is None:
-                logger.info(json_msg({"event": "skip_no_yes_bbo", "market": m}))
+            if bb is None:
+                logger.info(json_msg({"event": "skip_no_yes_bb", "market": m}))
                 continue
 
-            # Validate YES book is in valid range [0.0, 1.0] and not inverted
-            if not (0.0 <= bb <= 1.0 and 0.0 <= ba <= 1.0):
-                logger.error(json_msg({"event": "skip_bad_yes_range", "market": m, "bb": bb, "ba": ba}))
+            # basic sanity on bid only
+            try:
+                bb_val = float(bb)
+                if not (0.0 <= bb_val <= 1.0):
+                    logger.error(json_msg({"event": "skip_bad_yes_bb_range", "market": m, "bb": bb}))
+                    continue
+            except (ValueError, TypeError):
+                logger.error(json_msg({"event": "skip_bad_yes_bb_type", "market": m, "bb": bb}))
                 continue
 
-            if bb >= ba:
-                logger.error(json_msg({
-                    "event": "skip_inverted_yes_book",
-                    "market": m,
-                    "bb": bb,
-                    "ba": ba,
-                }))
-                continue
+            # Detect suspect WS ask mapping (ask at 0.01 but bid is large)
+            if ba is not None:
+                try:
+                    ba_val = float(ba)
+                    bb_val = float(bb)
+                    if ba_val <= 0.011 and bb_val >= 0.20:
+                        logger.error(json_msg({"event": "suspect_ws_ask_mapping", "market": m, "yes_bb": bb, "yes_ba": ba, "raw_md": md}))
+                except (ValueError, TypeError):
+                    pass
 
             # wo_state: rate-limit to 1/sec per market
             now = now_ms()
@@ -391,28 +397,57 @@ class Engine:
                     "ask_client": (mr.working_ask.client_order_id if mr.working_ask else None),
                     "bid_px_cents": (mr.working_bid.price_cents if mr.working_bid else None),
                     "ask_px_cents": (mr.working_ask.price_cents if mr.working_ask else None),
+                    "md_yes_bb": bb,
+                    "md_yes_ba": ba,
+                    "md_no_bb": mr.no_bb_px,
+                    "md_no_ba": mr.no_ba_px,
                 }))
 
-            target = compute_quotes(bb, ba, mr.inventory, self.config.max_pos, self.config.edge_ticks, tick_size, self.config.size)
+            # BID-ONLY quoting mode (safe until WS ask mapping is fixed)
+            # Uses yes_bb_px as reference, quotes on both sides but derives ask from bid
+            edge_ticks = int(self.config.edge_ticks)
+            tick_size = 0.01
+
+            bid_px = max(0.01, min(0.99, float(bb) - edge_ticks * tick_size))
+            ask_px = max(0.01, min(0.99, float(bb) + edge_ticks * tick_size))
+
+            # enforce non-crossing by construction
+            if bid_px >= ask_px:
+                ask_px = min(0.99, bid_px + tick_size)
+
+            # build a target object compatible with existing downstream code
+            class _Target:
+                def __init__(self, bid_px, ask_px, bid_sz, ask_sz):
+                    self.bid_px = bid_px
+                    self.ask_px = ask_px
+                    self.bid_sz = bid_sz
+                    self.ask_sz = ask_sz
+
+            target = _Target(bid_px=bid_px, ask_px=ask_px, bid_sz=float(self.config.size), ask_sz=float(self.config.size))
             allowed, reason = self.risk.check_market(mr)
 
             logger.info(json_msg({
                 "event": "quote_eval",
                 "market": m,
+                "mode": "bid_only",
                 "trading_enabled": bool(self.config.trading_enabled),
                 "md_ok": bool(mr.md_ok),
                 "kill_stale": bool(mr.kill_stale),
                 "risk_allowed": bool(allowed),
                 "risk_reason": reason,
-                "bb": bb, "ba": ba,
-                "target_bid_px": target.bid_px, "target_ask_px": target.ask_px,
-                "target_bid_sz": target.bid_sz, "target_ask_sz": target.ask_sz,
+                "bb": bb,
+                "ba": ba,
+                "target_bid_px": target.bid_px,
+                "target_ask_px": target.ask_px,
+                "target_bid_sz": target.bid_sz,
+                "target_ask_sz": target.ask_sz,
             }))
 
             decision_id = uuid4_hex()
-            mid = (bb + ba) / 2.0
-            spread = ba - bb
-            self._log_decision(decision_id, m, bb, ba, mid, spread, target, mr.inventory, mr.inventory)
+            # For bid-only mode, compute mid from bid only to avoid bad ask
+            mid = float(bb)
+            spread = float(target.ask_px) - float(target.bid_px)
+            self._log_decision(decision_id, m, float(bb), float(target.ask_px), mid, spread, target, mr.inventory, mr.inventory)
 
             if not allowed:
                 logger.info(json_msg({"event": "risk_block", "market": m, "reason": reason}))
