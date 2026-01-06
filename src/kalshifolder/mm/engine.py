@@ -334,30 +334,12 @@ class Engine:
             if yes_ba_sz == 0:
                 yes_ba_sz = md.get("ba_sz") or 0
 
-            # ---------- derive asks from opposite-side bids if asks are missing/bogus ----------
-            # WS often provides only bids or uses placeholder asks (e.g. 0.01). Treat "ask <= 0.01" as unusable.
+            # ---------- normalize prices ----------
             def _round_px(x):
                 try:
                     return round(float(x), 2)
                 except Exception:
                     return None
-
-            def _is_bad_ask(x):
-                if x is None:
-                    return True
-                try:
-                    return float(x) <= 0.01
-                except Exception:
-                    return True
-
-            # If we have both bids, we can always derive a consistent ask on each side.
-            if _is_bad_ask(yes_ba_px) and no_bb_px is not None:
-                yes_ba_px = _round_px(1.0 - float(no_bb_px))
-                yes_ba_sz = int(no_bb_sz or 0)
-
-            if _is_bad_ask(no_ba_px) and yes_bb_px is not None:
-                no_ba_px = _round_px(1.0 - float(yes_bb_px))
-                no_ba_sz = int(yes_bb_sz or 0)
 
             # ---------- write normalized state to mr ----------
             mr.last_bb_px = _round_px(yes_bb_px)
@@ -379,23 +361,20 @@ class Engine:
             ba = mr.last_ba_px
 
             if bb is None or ba is None:
-                mr.kill_stale = True
-                logger.info(json_msg({"event": "no_book", "market": m, "yes_bb_px": mr.last_bb_px, "yes_ba_px": mr.last_ba_px,
-                                    "no_bb_px": mr.no_bb_px, "no_ba_px": mr.no_ba_px}))
+                logger.info(json_msg({"event": "skip_no_yes_bbo", "market": m}))
                 continue
 
-            # If still inverted after derivation, skip quoting (bad data)
+            # Validate YES book is in valid range [0.0, 1.0] and not inverted
+            if not (0.0 <= bb <= 1.0 and 0.0 <= ba <= 1.0):
+                logger.error(json_msg({"event": "skip_bad_yes_range", "market": m, "bb": bb, "ba": ba}))
+                continue
+
             if bb >= ba:
                 logger.error(json_msg({
-                    "event": "inverted_book",
+                    "event": "skip_inverted_yes_book",
                     "market": m,
                     "bb": bb,
                     "ba": ba,
-                    "yes_bb_px": mr.last_bb_px,
-                    "yes_ba_px": mr.last_ba_px,
-                    "no_bb_px": mr.no_bb_px,
-                    "no_ba_px": mr.no_ba_px,
-                    "note": "skipping quotes; asks should be derived from opposite bid",
                 }))
                 continue
 
@@ -457,6 +436,10 @@ class Engine:
                     logger.info(json_msg({"event": "cooldown_skip", "market": m, "until_ms": mr.cooldown_until_ms, "now_ms": now_cycle_ms}))
                     continue
 
+                # Minimum replace interval per market (throttle on 250ms poll)
+                min_replace_ms = int(os.getenv("MM_MIN_REPLACE_MS", "2000"))
+                now = now_ms()
+
                 # Helper to create deterministic client_order_id
                 # Keep it short (32 chars max) to avoid Kalshi API client_order_id constraints.
                 # Metadata (instance, market, side, timestamp) stored in state/logs instead.
@@ -466,15 +449,24 @@ class Engine:
 
                 # BID side replace semantics
                 if target.bid_px is not None:
-                    wo = mr.working_bid
-                    new_price_cents = int(round(target.bid_px * 100))
-                    need_replace = False
-                    if wo is None:
-                        need_replace = True
+                    # Check minimum replace interval
+                    last_bid = getattr(mr, "last_place_bid_ms", 0) or 0
+                    if now - last_bid < min_replace_ms:
+                        logger.info(json_msg({"event": "throttle_bid", "market": m, "dt_ms": now - last_bid, "min_ms": min_replace_ms}))
                     else:
-                        # replace if price or size changed beyond thresholds
-                        if wo.price_cents != new_price_cents or int(wo.size) != int(target.bid_sz):
+                        wo = mr.working_bid
+                        new_price_cents = int(round(target.bid_px * 100))
+                        need_replace = False
+                        if wo is None:
                             need_replace = True
+                        else:
+                            # Check if price/size changed
+                            if wo.price_cents != new_price_cents or int(wo.size) != int(target.bid_sz):
+                                need_replace = True
+                            else:
+                                # Same price and size: no-op, don't cancel/replace
+                                logger.info(json_msg({"event": "skip_same_quote", "market": m, "side": "BID"}))
+                                need_replace = False
 
                     if need_replace:
                         # if existing working order, cancel it first
@@ -531,52 +523,47 @@ class Engine:
                         client_order_id = make_client_id('B')
                         api_side = 'yes'
                         self._log_action(action_id, decision_id, m, client_order_id, 'PLACE', 'BID', api_side, target.bid_px, new_price_cents, target.bid_sz, replace_of=(wo.client_order_id if wo else ''))
-                        # per-side minimum place interval throttle
-                        min_place_interval_ms = int(os.getenv("MM_MIN_PLACE_INTERVAL_MS", "2000"))
-                        if now_ms() - mr.last_place_bid_ms < min_place_interval_ms:
-                            logger.info(json_msg({"event":"bid_throttle_skip","market":m}))
+                        if not self.config.trading_enabled:
+                            # simulate place
+                            resp = {'status': 'SIMULATED', 'latency_ms': 0, 'raw': '{"simulated": true}', 'exchange_order_id': ''}
                         else:
-                            mr.last_place_bid_ms = now_ms()
-                            if not self.config.trading_enabled:
-                                # simulate place
-                                resp = {'status': 'SIMULATED', 'latency_ms': 0, 'raw': '{"simulated": true}', 'exchange_order_id': ''}
-                            else:
-                                resp = await asyncio.to_thread(self.exec.place_order, m, api_side, new_price_cents, int(target.bid_sz), client_order_id)
-                            status = resp.get('status', 'ERROR')
-                            exch_id = resp.get('exchange_order_id')
-                            # parse reject reason for place
+                            resp = await asyncio.to_thread(self.exec.place_order, m, api_side, new_price_cents, int(target.bid_sz), client_order_id)
+                        status = resp.get('status', 'ERROR')
+                        exch_id = resp.get('exchange_order_id')
+                        # parse reject reason for place
+                        reject_reason = ""
+                        try:
+                            raw = resp.get('raw') or ''
+                            j = json.loads(raw) if raw and raw.lstrip().startswith('{') else None
+                            if isinstance(j, dict):
+                                err = j.get('error') or {}
+                                reject_reason = err.get('code') or err.get('message') or err.get('details') or ''
+                                if err.get('details'):
+                                    reject_reason = f"{reject_reason} | {err.get('details')}"
+                        except Exception:
                             reject_reason = ""
-                            try:
-                                raw = resp.get('raw') or ''
-                                j = json.loads(raw) if raw and raw.lstrip().startswith('{') else None
-                                if isinstance(j, dict):
-                                    err = j.get('error') or {}
-                                    reject_reason = err.get('code') or err.get('message') or err.get('details') or ''
-                                    if err.get('details'):
-                                        reject_reason = f"{reject_reason} | {err.get('details')}"
-                            except Exception:
-                                reject_reason = ""
 
-                            # log response but mark simulated separately
-                            if not self.config.trading_enabled:
-                                self._log_response(action_id, m, client_order_id, 'SIMULATED', '', '', 0, json.dumps({'simulated': True}))
-                            else:
-                                self._log_response(action_id, m, client_order_id, status, exch_id, reject_reason, resp.get('latency_ms', 0), resp.get('raw', ''))
+                        # log response but mark simulated separately
+                        if not self.config.trading_enabled:
+                            self._log_response(action_id, m, client_order_id, 'SIMULATED', '', '', 0, json.dumps({'simulated': True}))
+                        else:
+                            self._log_response(action_id, m, client_order_id, status, exch_id, reject_reason, resp.get('latency_ms', 0), resp.get('raw', ''))
 
-                            if status != 'ACK':
-                                # 2s cooldown per reject per market (tune)
-                                mr.cooldown_until_ms = now_ms() + 2000
-                                mr.rejects_rolling_counter += 1
-                                logger.error(json_msg({"event":"place_reject", "market": m, "side": "BID", "reason": reject_reason, "cooldown_ms": 2000}))
+                        if status != 'ACK':
+                            # 2s cooldown per reject per market (tune)
+                            mr.cooldown_until_ms = now_ms() + 2000
+                            mr.rejects_rolling_counter += 1
+                            logger.error(json_msg({"event":"place_reject", "market": m, "side": "BID", "reason": reject_reason, "cooldown_ms": 2000}))
 
-                                # hard kill if reject spike enabled
-                                if self.config.kill_on_reject_spike and mr.rejects_rolling_counter >= self.config.max_rejects_per_min:
-                                    logger.error(json_msg({"event":"reject_spike_kill", "market": m, "rejects": mr.rejects_rolling_counter}))
-                                    self._running = False
-                                # do NOT attempt the other side in same cycle after a reject
-                                continue
+                            # hard kill if reject spike enabled
+                            if self.config.kill_on_reject_spike and mr.rejects_rolling_counter >= self.config.max_rejects_per_min:
+                                logger.error(json_msg({"event":"reject_spike_kill", "market": m, "rejects": mr.rejects_rolling_counter}))
+                                self._running = False
+                            # do NOT attempt the other side in same cycle after a reject
+                            continue
 
-                        # update working order
+                        # update working order (only if ACK)
+                        mr.last_place_bid_ms = now
                         wo_new = None
                         if status == 'ACK' or (not self.config.trading_enabled and status == 'SIMULATED'):
                             # for simulated, set exchange id to a simulated token
@@ -609,18 +596,28 @@ class Engine:
 
                 # ASK side replace semantics
                 if target.ask_px is not None:
-                    wo = mr.working_ask
-                    new_price_cents = int(round(target.ask_px * 100))
-                    need_replace = False
-                    if wo is None:
-                        need_replace = True
+                    # Check minimum replace interval
+                    last_ask = getattr(mr, "last_place_ask_ms", 0) or 0
+                    if now - last_ask < min_replace_ms:
+                        logger.info(json_msg({"event": "throttle_ask", "market": m, "dt_ms": now - last_ask, "min_ms": min_replace_ms}))
                     else:
-                        if wo.price_cents != new_price_cents or int(wo.size) != int(target.ask_sz):
+                        wo = mr.working_ask
+                        new_price_cents = int(round(target.ask_px * 100))
+                        need_replace = False
+                        if wo is None:
                             need_replace = True
+                        else:
+                            # Check if price/size changed
+                            if wo.price_cents != new_price_cents or int(wo.size) != int(target.ask_sz):
+                                need_replace = True
+                            else:
+                                # Same price and size: no-op, don't cancel/replace
+                                logger.info(json_msg({"event": "skip_same_quote", "market": m, "side": "ASK"}))
+                                need_replace = False
 
-                    if need_replace:
-                        if wo is not None:
-                            action_id = uuid4_hex()
+                        if need_replace:
+                            if wo is not None:
+                                action_id = uuid4_hex()
                             cancel_client = wo.client_order_id
                             api_side = 'no'
                             self._log_action(action_id, decision_id, m, cancel_client, 'CANCEL', 'ASK', api_side, wo.price_cents / 100.0, wo.price_cents, wo.size, replace_of='')
@@ -667,78 +664,73 @@ class Engine:
                         client_order_id = make_client_id('A')
                         api_side = 'no'
                         self._log_action(action_id, decision_id, m, client_order_id, 'PLACE', 'ASK', api_side, target.ask_px, new_price_cents, target.ask_sz, replace_of=(wo.client_order_id if wo else ''))
-                        # per-side minimum place interval throttle for ask
-                        min_place_interval_ms = int(os.getenv("MM_MIN_PLACE_INTERVAL_MS", "2000"))
-                        if now_ms() - mr.last_place_ask_ms < min_place_interval_ms:
-                            logger.info(json_msg({"event":"ask_throttle_skip","market":m}))
+                        if not self.config.trading_enabled:
+                            resp = {'status': 'SIMULATED', 'latency_ms': 0, 'raw': '{"simulated": true}', 'exchange_order_id': ''}
                         else:
-                            mr.last_place_ask_ms = now_ms()
-                            if not self.config.trading_enabled:
-                                resp = {'status': 'SIMULATED', 'latency_ms': 0, 'raw': '{"simulated": true}', 'exchange_order_id': ''}
-                            else:
-                                resp = await asyncio.to_thread(self.exec.place_order, m, api_side, new_price_cents, int(target.ask_sz), client_order_id)
-                            status = resp.get('status', 'ERROR')
-                            exch_id = resp.get('exchange_order_id')
-                            # parse reject reason for place
+                            resp = await asyncio.to_thread(self.exec.place_order, m, api_side, new_price_cents, int(target.ask_sz), client_order_id)
+                        status = resp.get('status', 'ERROR')
+                        exch_id = resp.get('exchange_order_id')
+                        # parse reject reason for place
+                        reject_reason = ""
+                        try:
+                            raw = resp.get('raw') or ''
+                            j = json.loads(raw) if raw and raw.lstrip().startswith('{') else None
+                            if isinstance(j, dict):
+                                err = j.get('error') or {}
+                                reject_reason = err.get('code') or err.get('message') or err.get('details') or ''
+                                if err.get('details'):
+                                    reject_reason = f"{reject_reason} | {err.get('details')}"
+                        except Exception:
                             reject_reason = ""
+
+                        if not self.config.trading_enabled:
+                            self._log_response(action_id, m, client_order_id, 'SIMULATED', '', '', 0, json.dumps({'simulated': True}))
+                        else:
+                            self._log_response(action_id, m, client_order_id, status, exch_id, reject_reason, resp.get('latency_ms', 0), resp.get('raw', ''))
+                        
+                        if status != 'ACK':
+                            # 2s cooldown per reject per market (tune)
+                            mr.cooldown_until_ms = now_ms() + 2000
+                            mr.rejects_rolling_counter += 1
+                            logger.error(json_msg({"event":"place_reject", "market": m, "side": "ASK", "reason": reject_reason, "cooldown_ms": 2000}))
+
+                            # hard kill if reject spike enabled
+                            if self.config.kill_on_reject_spike and mr.rejects_rolling_counter >= self.config.max_rejects_per_min:
+                                logger.error(json_msg({"event":"reject_spike_kill", "market": m, "rejects": mr.rejects_rolling_counter}))
+                                self._running = False
+                            # do NOT attempt next cycle until cooldown expires
+                            continue
+
+                        # update working order (only if ACK)
+                        mr.last_place_ask_ms = now
+                        wo_new = None
+                        if status == 'ACK' or (not self.config.trading_enabled and status == 'SIMULATED'):
+                            # for simulated, set exchange id to a simulated token
+                            sim_exch = exch_id or (f"SIMULATED:{client_order_id}" if not self.config.trading_enabled else None)
+                            wo_new = WorkingOrder(
+                                client_order_id=client_order_id,
+                                exchange_order_id=sim_exch,
+                                side='ASK',
+                                price_cents=new_price_cents,
+                                size=target.ask_sz,
+                                status='ACKED',
+                                placed_ts_ms=now,
+                                remaining_size=target.ask_sz,
+                                last_update_ts_ms=now,
+                            )
+                            mr.working_ask = wo_new
+                            logger.info(json_msg({"event":"wo_set","market":m,"side":"ASK","client_order_id":client_order_id,"exchange_order_id":sim_exch,"price_cents":new_price_cents,"size":target.ask_sz}))
+                            last['ask_px'] = target.ask_px
+                            last['ts_ms'] = now
+                            # register in engine order registries
                             try:
-                                raw = resp.get('raw') or ''
-                                j = json.loads(raw) if raw and raw.lstrip().startswith('{') else None
-                                if isinstance(j, dict):
-                                    err = j.get('error') or {}
-                                    reject_reason = err.get('code') or err.get('message') or err.get('details') or ''
-                                    if err.get('details'):
-                                        reject_reason = f"{reject_reason} | {err.get('details')}"
+                                if exch_id:
+                                    self.state.order_by_exchange_id[str(exch_id)] = OrderRef(market_ticker=m, internal_side='ASK', decision_id=decision_id, client_order_id=client_order_id)
+                                self.state.order_by_client_id[client_order_id] = OrderRef(market_ticker=m, internal_side='ASK', decision_id=decision_id, client_order_id=client_order_id)
                             except Exception:
-                                reject_reason = ""
-
-                            if not self.config.trading_enabled:
-                                self._log_response(action_id, m, client_order_id, 'SIMULATED', '', '', 0, json.dumps({'simulated': True}))
-                            else:
-                                self._log_response(action_id, m, client_order_id, status, exch_id, reject_reason, resp.get('latency_ms', 0), resp.get('raw', ''))
-                            
-                            if status != 'ACK':
-                                # 2s cooldown per reject per market (tune)
-                                mr.cooldown_until_ms = now_ms() + 2000
-                                mr.rejects_rolling_counter += 1
-                                logger.error(json_msg({"event":"place_reject", "market": m, "side": "ASK", "reason": reject_reason, "cooldown_ms": 2000}))
-
-                                # hard kill if reject spike enabled
-                                if self.config.kill_on_reject_spike and mr.rejects_rolling_counter >= self.config.max_rejects_per_min:
-                                    logger.error(json_msg({"event":"reject_spike_kill", "market": m, "rejects": mr.rejects_rolling_counter}))
-                                    self._running = False
-                                # do NOT attempt next cycle until cooldown expires
-                                continue
-
-                            # update working order
-                            wo_new = None
-                            if status == 'ACK' or (not self.config.trading_enabled and status == 'SIMULATED'):
-                                # for simulated, set exchange id to a simulated token
-                                sim_exch = exch_id or (f"SIMULATED:{client_order_id}" if not self.config.trading_enabled else None)
-                                wo_new = WorkingOrder(
-                                    client_order_id=client_order_id,
-                                    exchange_order_id=sim_exch,
-                                    side='ASK',
-                                    price_cents=new_price_cents,
-                                    size=target.ask_sz,
-                                    status='ACKED',
-                                    placed_ts_ms=now,
-                                    remaining_size=target.ask_sz,
-                                    last_update_ts_ms=now,
-                                )
-                                mr.working_ask = wo_new
-                                logger.info(json_msg({"event":"wo_set","market":m,"side":"ASK","client_order_id":client_order_id,"exchange_order_id":sim_exch,"price_cents":new_price_cents,"size":target.ask_sz}))
-                                last['ask_px'] = target.ask_px
-                                last['ts_ms'] = now
-                                # register in engine order registries
-                                try:
-                                    if exch_id:
-                                        self.state.order_by_exchange_id[str(exch_id)] = OrderRef(market_ticker=m, internal_side='ASK', decision_id=decision_id, client_order_id=client_order_id)
-                                    self.state.order_by_client_id[client_order_id] = OrderRef(market_ticker=m, internal_side='ASK', decision_id=decision_id, client_order_id=client_order_id)
-                                except Exception:
-                                    logger.exception('failed to update order registry')
-                            else:
-                                mr.rejects_rolling_counter += 1
+                                logger.exception('failed to update order registry')
+                        else:
+                            mr.rejects_rolling_counter += 1
 
     
     def _record_reject_and_maybe_kill(self):
