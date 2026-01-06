@@ -653,47 +653,47 @@ class Engine:
                         if need_replace:
                             if wo is not None:
                                 action_id = uuid4_hex()
-                            cancel_client = wo.client_order_id
-                            api_side = 'no'
-                            self._log_action(action_id, decision_id, m, cancel_client, 'CANCEL', 'ASK', api_side, wo.price_cents / 100.0, wo.price_cents, wo.size, replace_of='')
-                            # simulate cancel in paper mode
-                            if not self.config.trading_enabled:
-                                resp = {'status': 'SIMULATED', 'latency_ms': 0, 'raw': '{"simulated": true}', 'exchange_order_id': ''}
-                            else:
-                                cancel_id = wo.exchange_order_id or wo.client_order_id
-                                resp = await asyncio.to_thread(self.exec.cancel_order, cancel_id)
-                            status = resp.get('status', 'ERROR')
-                            exch_id = resp.get('exchange_order_id')
-                            # parse reject reason for cancel
-                            cancel_reject_reason = ""
-                            try:
-                                raw = resp.get('raw') or ''
-                                j = json.loads(raw) if raw and raw.lstrip().startswith('{') else None
-                                if isinstance(j, dict):
-                                    err = j.get('error') or {}
-                                    cancel_reject_reason = err.get('code') or err.get('message') or err.get('details') or ''
-                                    if err.get('details'):
-                                        cancel_reject_reason = f"{cancel_reject_reason} | {err.get('details')}"
-                            except Exception:
+                                cancel_client = wo.client_order_id
+                                api_side = 'no'
+                                self._log_action(action_id, decision_id, m, cancel_client, 'CANCEL', 'ASK', api_side, wo.price_cents / 100.0, wo.price_cents, wo.size, replace_of='')
+                                # simulate cancel in paper mode
+                                if not self.config.trading_enabled:
+                                    resp = {'status': 'SIMULATED', 'latency_ms': 0, 'raw': '{"simulated": true}', 'exchange_order_id': ''}
+                                else:
+                                    cancel_id = wo.exchange_order_id or wo.client_order_id
+                                    resp = await asyncio.to_thread(self.exec.cancel_order, cancel_id)
+                                status = resp.get('status', 'ERROR')
+                                exch_id = resp.get('exchange_order_id')
+                                # parse reject reason for cancel
                                 cancel_reject_reason = ""
-
-                            if not self.config.trading_enabled:
-                                self._log_response(action_id, m, cancel_client, 'SIMULATED', '', '', 0, json.dumps({'simulated': True}))
-                            else:
-                                self._log_response(action_id, m, cancel_client, status, exch_id, cancel_reject_reason, resp.get('latency_ms', 0), resp.get('raw', ''))
-                            if status == 'ACK' or (not self.config.trading_enabled and status == 'SIMULATED'):
-                                wo.status = 'CANCELLED'
                                 try:
-                                    if getattr(wo, 'exchange_order_id', None):
-                                        self.state.order_by_exchange_id.pop(str(wo.exchange_order_id), None)
-                                    self.state.order_by_client_id.pop(getattr(wo, 'client_order_id', ''), None)
+                                    raw = resp.get('raw') or ''
+                                    j = json.loads(raw) if raw and raw.lstrip().startswith('{') else None
+                                    if isinstance(j, dict):
+                                        err = j.get('error') or {}
+                                        cancel_reject_reason = err.get('code') or err.get('message') or err.get('details') or ''
+                                        if err.get('details'):
+                                            cancel_reject_reason = f"{cancel_reject_reason} | {err.get('details')}"
                                 except Exception:
-                                    logger.exception('failed to cleanup registry on cancel')
-                                mr.working_ask = None
-                            else:
-                                wo.status = 'PENDING_CANCEL'
-                                await asyncio.sleep(cancel_timeout_ms / 1000.0)
-                                mr.working_ask = None
+                                    cancel_reject_reason = ""
+
+                                if not self.config.trading_enabled:
+                                    self._log_response(action_id, m, cancel_client, 'SIMULATED', '', '', 0, json.dumps({'simulated': True}))
+                                else:
+                                    self._log_response(action_id, m, cancel_client, status, exch_id, cancel_reject_reason, resp.get('latency_ms', 0), resp.get('raw', ''))
+                                if status == 'ACK' or (not self.config.trading_enabled and status == 'SIMULATED'):
+                                    wo.status = 'CANCELLED'
+                                    try:
+                                        if getattr(wo, 'exchange_order_id', None):
+                                            self.state.order_by_exchange_id.pop(str(wo.exchange_order_id), None)
+                                        self.state.order_by_client_id.pop(getattr(wo, 'client_order_id', ''), None)
+                                    except Exception:
+                                        logger.exception('failed to cleanup registry on cancel')
+                                    mr.working_ask = None
+                                else:
+                                    wo.status = 'PENDING_CANCEL'
+                                    await asyncio.sleep(cancel_timeout_ms / 1000.0)
+                                    mr.working_ask = None
 
                         action_id = uuid4_hex()
                         client_order_id = make_client_id('A')
