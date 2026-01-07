@@ -4,6 +4,8 @@ import time
 from typing import Dict, List, Optional
 import json
 
+from ..utils.logging import json_msg
+
 from kalshifolder.websocket.ws_runtime import KalshiWSRuntime
 from kalshifolder.websocket.order_book import OrderBook
 
@@ -33,6 +35,7 @@ class WSMarketDataProvider(BaseMarketDataProvider):
         self._ws_debug = bool(int(os.getenv('MM_WS_DEBUG', '0')))
         self._ws_debug_limit = int(os.getenv('MM_WS_DEBUG_LIMIT', '20'))
         self._ws_debug_count = 0
+        self._peeked: set[str] = set()
 
         # Periodic per-ticker truth probe
         self._truth_probe_every_s = float(os.getenv('MM_WS_TRUTH_PROBE_S', '10'))
@@ -126,13 +129,24 @@ class WSMarketDataProvider(BaseMarketDataProvider):
             return
         self._last_truth_probe_mono[ticker] = now
         try:
-            log.info("ws_truth_probe", extra={"event": "ws_truth_probe", "market": ticker, **context})
+            log.info(json_msg({"event": "ws_truth_probe", "ticker": ticker, **context}))
         except Exception:
             pass
 
-    def _log_ws_drop_update(self, *, ticker: str, reason: str, context: dict) -> None:
+    def _log_ws_drop_update(self, *, ticker: str, reason: str, context: dict | None = None) -> None:
+        ctx = context or {}
         try:
-            log.error("ws_drop_update", extra={"event": "ws_drop_update", "market": ticker, "reason": reason, **context})
+            log.error(
+                json_msg(
+                    {
+                        "event": "ws_drop_update",
+                        "ticker": ticker,
+                        "reason": reason,
+                        # keep it bounded so logs don’t explode
+                        "context": ctx,
+                    }
+                )
+            )
         except Exception:
             pass
 
@@ -170,6 +184,27 @@ class WSMarketDataProvider(BaseMarketDataProvider):
         """
         if not isinstance(msg, dict):
             return None
+
+        # One-time raw message peek per ticker (debug only). This is bounded.
+        try:
+            if self._ws_debug and ticker and ticker not in self._peeked:
+                self._peeked.add(ticker)
+                log.info(
+                    json_msg(
+                        {
+                            "event": "ws_raw_peek",
+                            "ticker": ticker,
+                            "keys": list(msg.keys())[:60],
+                            "type": msg.get("type"),
+                            "market_ticker": msg.get("market_ticker")
+                            or msg.get("ticker")
+                            or msg.get("market"),
+                            "snippet": str(msg)[:600],
+                        }
+                    )
+                )
+        except Exception:
+            pass
 
         def _norm_px(px):
             if px is None:
@@ -313,13 +348,8 @@ class WSMarketDataProvider(BaseMarketDataProvider):
         }
         self._maybe_truth_probe(ticker=ticker, context=probe_ctx)
 
-        drop_ctx = probe_ctx | {
-            "min_spread": self._min_spread,
-            "raw_levels_snippet": json.dumps(
-                {"yes": msg.get("yes"), "no": msg.get("no"), "keys": list(msg.keys())},
-                default=str,
-            )[:800],
-        }
+        # Bounded drop context only (no full raw msg payload)
+        drop_ctx = probe_ctx | {"min_spread": self._min_spread, "msg_keys": list(msg.keys())[:60]}
 
         def _in_range(v):
             return v is not None and 0.0 < float(v) < 1.0
@@ -487,11 +517,23 @@ class WSMarketDataProvider(BaseMarketDataProvider):
                         if ticker not in self._first_bbo_logged:
                             self._first_bbo_logged.add(ticker)
                             try:
-                                bb = self._bbo[ticker].get('yes_bb_px')
-                                ba = self._bbo[ticker].get('yes_ba_px')
-                                log.info('ws_first_bbo', extra={'market': ticker, 'bb': bb, 'ba': ba})
+                                out = self._bbo.get(ticker) or {}
+                                log.info(
+                                    json_msg(
+                                        {
+                                            "event": "ws_first_bbo",
+                                            "ticker": ticker,
+                                            "yes_bb_px": out.get("yes_bb_px"),
+                                            "yes_ba_px": out.get("yes_ba_px"),
+                                            "no_bb_px": out.get("no_bb_px"),
+                                            "no_ba_px": out.get("no_ba_px"),
+                                            "yes_ba_is_implied": out.get("yes_ba_is_implied"),
+                                            "no_ba_is_implied": out.get("no_ba_is_implied"),
+                                        }
+                                    )
+                                )
                             except Exception:
-                                log.info('ws_first_bbo', extra={'market': ticker})
+                                log.info(json_msg({"event": "ws_first_bbo", "ticker": ticker}))
 
                 elif typ == "orderbook_delta":
                     sid = int(frame.get("sid", -1))
@@ -522,11 +564,23 @@ class WSMarketDataProvider(BaseMarketDataProvider):
                             if ticker not in self._first_bbo_logged:
                                 self._first_bbo_logged.add(ticker)
                                 try:
-                                    bb = self._bbo[ticker].get('yes_bb_px')
-                                    ba = self._bbo[ticker].get('yes_ba_px')
-                                    log.info('ws_first_bbo', extra={'market': ticker, 'bb': bb, 'ba': ba})
+                                    out = self._bbo.get(ticker) or {}
+                                    log.info(
+                                        json_msg(
+                                            {
+                                                "event": "ws_first_bbo",
+                                                "ticker": ticker,
+                                                "yes_bb_px": out.get("yes_bb_px"),
+                                                "yes_ba_px": out.get("yes_ba_px"),
+                                                "no_bb_px": out.get("no_bb_px"),
+                                                "no_ba_px": out.get("no_ba_px"),
+                                                "yes_ba_is_implied": out.get("yes_ba_is_implied"),
+                                                "no_ba_is_implied": out.get("no_ba_is_implied"),
+                                            }
+                                        )
+                                    )
                                 except Exception:
-                                    log.info('ws_first_bbo', extra={'market': ticker})
+                                    log.info(json_msg({"event": "ws_first_bbo", "ticker": ticker}))
 
             except Exception:
                 log.exception("ws_loop_crash")
