@@ -37,7 +37,7 @@ services:
       PROD_KEYFILE: /run/secrets/prod_keys.pem
 
       # Markets
-      MARKET_TICKERS: ${MARKET_TICKERS:-KXBTCMAXY-25-DEC31-129999.99,FEDFUNDS-DEC25}
+      MARKET_TICKERS: ${MARKET_TICKERS}
 
       # WebSocket
       WS_URL: ${WS_URL:-wss://api.elections.kalshi.com/trade-api/ws/v2}
