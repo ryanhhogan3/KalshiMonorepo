@@ -145,6 +145,22 @@ class Engine:
         self.reject_window_s = int(os.getenv("MM_REJECT_WINDOW_S", "60"))
         self.reject_times = deque()  # store epoch seconds of rejects (global)
 
+    def _get_exchange_pos_by_ticker(self) -> dict:
+        """Fetch current positions from exchange and return as dict keyed by ticker."""
+        try:
+            positions = self.exec.get_positions()
+        except Exception:
+            logger.exception("get_positions failed")
+            return {}
+        out = {}
+        for p in positions or []:
+            try:
+                t = p.get("ticker")
+                out[t] = int(p.get("position") or 0)
+            except Exception:
+                continue
+        return out
+
     def ch_utc_now_str():
     # ClickHouse DateTime64(3,'UTC') accepts "YYYY-MM-DD HH:MM:SS.mmm"
         return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -239,6 +255,14 @@ class Engine:
     async def run_once(self):
         markets = self.config.markets
         tick_size = 0.01
+        
+        # Fetch exchange positions once per cycle
+        pos_by_ticker = {}
+        try:
+            pos_by_ticker = self._get_exchange_pos_by_ticker()
+        except Exception:
+            pos_by_ticker = {}
+        
         try:
             batch = self.md.get_batch_best_bid_ask(markets)
         except Exception:
@@ -374,15 +398,36 @@ class Engine:
                 logger.error(json_msg({"event": "skip_bad_yes_bb_type", "market": m, "bb": bb}))
                 continue
 
-            # Detect suspect WS ask mapping (ask at 0.01 but bid is large)
-            if ba is not None:
-                try:
-                    ba_val = float(ba)
-                    bb_val = float(bb)
-                    if ba_val <= 0.011 and bb_val >= 0.20:
-                        logger.error(json_msg({"event": "suspect_ws_ask_mapping", "market": m, "yes_bb": bb, "yes_ba": ba, "raw_md": md}))
-                except (ValueError, TypeError):
-                    pass
+            # Proper YES book validation: require both bid and ask, both in (0, 1), bid < ask
+            if bb is None or ba is None:
+                logger.info(json_msg({"event":"skip_no_book", "market": m}))
+                continue
+
+            try:
+                bb_val = float(bb)
+                ba_val = float(ba)
+                if not (0.0 < bb_val < 1.0) or not (0.0 < ba_val < 1.0):
+                    logger.error(json_msg({"event":"skip_bad_yes_range", "market": m, "bb": bb, "ba": ba}))
+                    continue
+                if bb_val >= ba_val:
+                    logger.error(json_msg({"event":"skip_inverted_yes_book", "market": m, "bb": bb, "ba": ba}))
+                    continue
+            except (ValueError, TypeError):
+                logger.error(json_msg({"event":"skip_bad_yes_type", "market": m, "bb": bb, "ba": ba}))
+                continue
+
+            # Exchange position check: hard block if at or beyond limit
+            ex_pos = int(pos_by_ticker.get(m, 0))
+            mr.exchange_position = ex_pos  # store for visibility
+            
+            if abs(ex_pos) >= int(self.config.max_pos):
+                logger.error(json_msg({
+                    "event": "risk_hard_block_exchange_pos",
+                    "market": m,
+                    "exchange_position": ex_pos,
+                    "max_pos": int(self.config.max_pos),
+                }))
+                continue
 
             # wo_state: rate-limit to 1/sec per market
             now = now_ms()
@@ -397,19 +442,19 @@ class Engine:
                     "ask_client": (mr.working_ask.client_order_id if mr.working_ask else None),
                     "bid_px_cents": (mr.working_bid.price_cents if mr.working_bid else None),
                     "ask_px_cents": (mr.working_ask.price_cents if mr.working_ask else None),
+                    "exchange_position": ex_pos,
                     "md_yes_bb": bb,
                     "md_yes_ba": ba,
                     "md_no_bb": mr.no_bb_px,
                     "md_no_ba": mr.no_ba_px,
                 }))
 
-            # BID-ONLY quoting mode (safe until WS ask mapping is fixed)
-            # Uses yes_bb_px as reference, quotes on both sides but derives ask from bid
+            # Quote computation: use both bid and ask from market
             edge_ticks = int(self.config.edge_ticks)
             tick_size = 0.01
 
             bid_px = max(0.01, min(0.99, float(bb) - edge_ticks * tick_size))
-            ask_px = max(0.01, min(0.99, float(bb) + edge_ticks * tick_size))
+            ask_px = max(0.01, min(0.99, float(ba) + edge_ticks * tick_size))
 
             # enforce non-crossing by construction
             if bid_px >= ask_px:
@@ -429,7 +474,6 @@ class Engine:
             logger.info(json_msg({
                 "event": "quote_eval",
                 "market": m,
-                "mode": "bid_only",
                 "trading_enabled": bool(self.config.trading_enabled),
                 "md_ok": bool(mr.md_ok),
                 "kill_stale": bool(mr.kill_stale),
@@ -444,10 +488,10 @@ class Engine:
             }))
 
             decision_id = uuid4_hex()
-            # For bid-only mode, compute mid from bid only to avoid bad ask
-            mid = float(bb)
+            # Compute mid and spread from actual market mid
+            mid = (float(bb) + float(ba)) / 2.0
             spread = float(target.ask_px) - float(target.bid_px)
-            self._log_decision(decision_id, m, float(bb), float(target.ask_px), mid, spread, target, mr.inventory, mr.inventory)
+            self._log_decision(decision_id, m, float(bb), float(ba), mid, spread, target, mr.inventory, mr.inventory)
 
             if not allowed:
                 logger.info(json_msg({"event": "risk_block", "market": m, "reason": reason}))
@@ -513,56 +557,69 @@ class Engine:
                                 if not self.config.trading_enabled:
                                     resp = {'status': 'SIMULATED', 'latency_ms': 0, 'raw': '{"simulated": true}', 'exchange_order_id': ''}
                                 else:
-                                    cancel_id = wo.exchange_order_id or wo.client_order_id
-                                    resp = await asyncio.to_thread(self.exec.cancel_order, cancel_id)
-                                status = resp.get('status', 'ERROR')
-                                exch_id = resp.get('exchange_order_id')
-                                # parse reject reason for cancel
-                                cancel_reject_reason = ""
-                                try:
-                                    raw = resp.get('raw') or ''
-                                    j = json.loads(raw) if raw and raw.lstrip().startswith('{') else None
-                                    if isinstance(j, dict):
-                                        err = j.get('error') or {}
-                                        cancel_reject_reason = err.get('code') or err.get('message') or err.get('details') or ''
-                                        if err.get('details'):
-                                            cancel_reject_reason = f"{cancel_reject_reason} | {err.get('details')}"
-                                except Exception:
-                                    cancel_reject_reason = ""
+                                    # Use exchange_order_id only; fail loudly if missing
+                                    cancel_id = wo.exchange_order_id
+                                    if not cancel_id:
+                                        logger.error(json_msg({"event":"cancel_missing_exchange_order_id", "market": m, "client_order_id": wo.client_order_id}))
+                                        wo.status = 'PENDING_CANCEL'
+                                        mr.working_bid = None
+                                    else:
+                                        resp = await asyncio.to_thread(self.exec.cancel_order, cancel_id)
+                                        status = resp.get('status', 'ERROR')
+                                        exch_id = resp.get('exchange_order_id')
+                                        # parse reject reason for cancel
+                                        cancel_reject_reason = ""
+                                        try:
+                                            raw = resp.get('raw') or ''
+                                            j = json.loads(raw) if raw and raw.lstrip().startswith('{') else None
+                                            if isinstance(j, dict):
+                                                err = j.get('error') or {}
+                                                cancel_reject_reason = err.get('code') or err.get('message') or err.get('details') or ''
+                                                if err.get('details'):
+                                                    cancel_reject_reason = f"{cancel_reject_reason} | {err.get('details')}"
+                                        except Exception:
+                                            cancel_reject_reason = ""
 
-                                if not self.config.trading_enabled:
-                                    self._log_response(action_id, m, cancel_client, 'SIMULATED', '', '', 0, json.dumps({'simulated': True}))
-                                else:
-                                    self._log_response(action_id, m, cancel_client, status, exch_id, cancel_reject_reason, resp.get('latency_ms', 0), resp.get('raw', ''))
+                                        self._log_response(action_id, m, cancel_client, status, exch_id, cancel_reject_reason, resp.get('latency_ms', 0), resp.get('raw', ''))
 
-                                if status == 'ACK' or (not self.config.trading_enabled and status == 'SIMULATED'):
-                                    wo.status = 'CANCELLED'
-                                    # remove from registries
-                                    try:
-                                        if getattr(wo, 'exchange_order_id', None):
-                                            self.state.order_by_exchange_id.pop(str(wo.exchange_order_id), None)
-                                        self.state.order_by_client_id.pop(getattr(wo, 'client_order_id', ''), None)
-                                    except Exception:
-                                        logger.exception('failed to cleanup registry on cancel')
-                                    mr.working_bid = None
-                                else:
-                                    # mark pending cancel and continue after timeout
-                                    wo.status = 'PENDING_CANCEL'
-                                    # best-effort wait
-                                    await asyncio.sleep(cancel_timeout_ms / 1000.0)
-                                    # after wait, clear local state to avoid blocking
-                                    mr.working_bid = None
+                                        if status == 'ACK' or (not self.config.trading_enabled and status == 'SIMULATED'):
+                                            wo.status = 'CANCELLED'
+                                            # remove from registries
+                                            try:
+                                                if getattr(wo, 'exchange_order_id', None):
+                                                    self.state.order_by_exchange_id.pop(str(wo.exchange_order_id), None)
+                                                self.state.order_by_client_id.pop(getattr(wo, 'client_order_id', ''), None)
+                                            except Exception:
+                                                logger.exception('failed to cleanup registry on cancel')
+                                            mr.working_bid = None
+                                        else:
+                                            # mark pending cancel and continue after timeout
+                                            wo.status = 'PENDING_CANCEL'
+                                            # best-effort wait
+                                            await asyncio.sleep(cancel_timeout_ms / 1000.0)
+                                            # after wait, clear local state to avoid blocking
+                                            mr.working_bid = None
+                            
+                            if not self.config.trading_enabled:
+                                self._log_response(action_id, m, cancel_client, 'SIMULATED', '', '', 0, json.dumps({'simulated': True}))
 
                             # place new order
                             action_id = uuid4_hex()
                             client_order_id = make_client_id('B')
-                            api_side = 'yes'
-                            self._log_action(action_id, decision_id, m, client_order_id, 'PLACE', 'BID', api_side, target.bid_px, new_price_cents, target.bid_sz, replace_of=(wo.client_order_id if wo else ''))
+                            self._log_action(action_id, decision_id, m, client_order_id, 'PLACE', 'BID', 'yes', target.bid_px, new_price_cents, target.bid_sz, replace_of=(wo.client_order_id if wo else ''))
                             if not self.config.trading_enabled:
                                 # simulate place
                                 resp = {'status': 'SIMULATED', 'latency_ms': 0, 'raw': '{"simulated": true}', 'exchange_order_id': ''}
                             else:
-                                resp = await asyncio.to_thread(self.exec.place_order, m, api_side, new_price_cents, int(target.bid_sz), client_order_id)
+                                resp = await asyncio.to_thread(
+                                    self.exec.place_order,
+                                    market_ticker=m,
+                                    side="yes",
+                                    price_cents=new_price_cents,
+                                    size=int(target.bid_sz),
+                                    client_order_id=client_order_id,
+                                    action="buy",
+                                )
                             status = resp.get('status', 'ERROR')
                             exch_id = resp.get('exchange_order_id')
                             # parse reject reason for place
@@ -654,55 +711,67 @@ class Engine:
                             if wo is not None:
                                 action_id = uuid4_hex()
                                 cancel_client = wo.client_order_id
-                                api_side = 'no'
-                                self._log_action(action_id, decision_id, m, cancel_client, 'CANCEL', 'ASK', api_side, wo.price_cents / 100.0, wo.price_cents, wo.size, replace_of='')
+                                self._log_action(action_id, decision_id, m, cancel_client, 'CANCEL', 'ASK', 'yes', wo.price_cents / 100.0, wo.price_cents, wo.size, replace_of='')
                                 # simulate cancel in paper mode
                                 if not self.config.trading_enabled:
                                     resp = {'status': 'SIMULATED', 'latency_ms': 0, 'raw': '{"simulated": true}', 'exchange_order_id': ''}
                                 else:
-                                    cancel_id = wo.exchange_order_id or wo.client_order_id
-                                    resp = await asyncio.to_thread(self.exec.cancel_order, cancel_id)
-                                status = resp.get('status', 'ERROR')
-                                exch_id = resp.get('exchange_order_id')
-                                # parse reject reason for cancel
-                                cancel_reject_reason = ""
-                                try:
-                                    raw = resp.get('raw') or ''
-                                    j = json.loads(raw) if raw and raw.lstrip().startswith('{') else None
-                                    if isinstance(j, dict):
-                                        err = j.get('error') or {}
-                                        cancel_reject_reason = err.get('code') or err.get('message') or err.get('details') or ''
-                                        if err.get('details'):
-                                            cancel_reject_reason = f"{cancel_reject_reason} | {err.get('details')}"
-                                except Exception:
-                                    cancel_reject_reason = ""
+                                    # Use exchange_order_id only; fail loudly if missing
+                                    cancel_id = wo.exchange_order_id
+                                    if not cancel_id:
+                                        logger.error(json_msg({"event":"cancel_missing_exchange_order_id", "market": m, "client_order_id": wo.client_order_id}))
+                                        wo.status = 'PENDING_CANCEL'
+                                        mr.working_ask = None
+                                    else:
+                                        resp = await asyncio.to_thread(self.exec.cancel_order, cancel_id)
+                                        status = resp.get('status', 'ERROR')
+                                        exch_id = resp.get('exchange_order_id')
+                                        # parse reject reason for cancel
+                                        cancel_reject_reason = ""
+                                        try:
+                                            raw = resp.get('raw') or ''
+                                            j = json.loads(raw) if raw and raw.lstrip().startswith('{') else None
+                                            if isinstance(j, dict):
+                                                err = j.get('error') or {}
+                                                cancel_reject_reason = err.get('code') or err.get('message') or err.get('details') or ''
+                                                if err.get('details'):
+                                                    cancel_reject_reason = f"{cancel_reject_reason} | {err.get('details')}"
+                                        except Exception:
+                                            cancel_reject_reason = ""
 
-                                if not self.config.trading_enabled:
-                                    self._log_response(action_id, m, cancel_client, 'SIMULATED', '', '', 0, json.dumps({'simulated': True}))
-                                else:
-                                    self._log_response(action_id, m, cancel_client, status, exch_id, cancel_reject_reason, resp.get('latency_ms', 0), resp.get('raw', ''))
-                                if status == 'ACK' or (not self.config.trading_enabled and status == 'SIMULATED'):
-                                    wo.status = 'CANCELLED'
-                                    try:
-                                        if getattr(wo, 'exchange_order_id', None):
-                                            self.state.order_by_exchange_id.pop(str(wo.exchange_order_id), None)
-                                        self.state.order_by_client_id.pop(getattr(wo, 'client_order_id', ''), None)
-                                    except Exception:
-                                        logger.exception('failed to cleanup registry on cancel')
-                                    mr.working_ask = None
-                                else:
-                                    wo.status = 'PENDING_CANCEL'
-                                    await asyncio.sleep(cancel_timeout_ms / 1000.0)
-                                    mr.working_ask = None
+                                        self._log_response(action_id, m, cancel_client, status, exch_id, cancel_reject_reason, resp.get('latency_ms', 0), resp.get('raw', ''))
+                                        if status == 'ACK' or (not self.config.trading_enabled and status == 'SIMULATED'):
+                                            wo.status = 'CANCELLED'
+                                            try:
+                                                if getattr(wo, 'exchange_order_id', None):
+                                                    self.state.order_by_exchange_id.pop(str(wo.exchange_order_id), None)
+                                                self.state.order_by_client_id.pop(getattr(wo, 'client_order_id', ''), None)
+                                            except Exception:
+                                                logger.exception('failed to cleanup registry on cancel')
+                                            mr.working_ask = None
+                                        else:
+                                            wo.status = 'PENDING_CANCEL'
+                                            await asyncio.sleep(cancel_timeout_ms / 1000.0)
+                                            mr.working_ask = None
+                            
+                            if not self.config.trading_enabled:
+                                self._log_response(action_id, m, cancel_client, 'SIMULATED', '', '', 0, json.dumps({'simulated': True}))
 
                             action_id = uuid4_hex()
                             client_order_id = make_client_id('A')
-                            api_side = 'no'
-                            self._log_action(action_id, decision_id, m, client_order_id, 'PLACE', 'ASK', api_side, target.ask_px, new_price_cents, target.ask_sz, replace_of=(wo.client_order_id if wo else ''))
+                            self._log_action(action_id, decision_id, m, client_order_id, 'PLACE', 'ASK', 'yes', target.ask_px, new_price_cents, target.ask_sz, replace_of=(wo.client_order_id if wo else ''))
                             if not self.config.trading_enabled:
                                 resp = {'status': 'SIMULATED', 'latency_ms': 0, 'raw': '{"simulated": true}', 'exchange_order_id': ''}
                             else:
-                                resp = await asyncio.to_thread(self.exec.place_order, m, api_side, new_price_cents, int(target.ask_sz), client_order_id)
+                                resp = await asyncio.to_thread(
+                                    self.exec.place_order,
+                                    market_ticker=m,
+                                    side="yes",
+                                    price_cents=new_price_cents,
+                                    size=int(target.ask_sz),
+                                    client_order_id=client_order_id,
+                                    action="sell",
+                                )
                             status = resp.get('status', 'ERROR')
                             exch_id = resp.get('exchange_order_id')
                             # parse reject reason for place
@@ -869,7 +938,21 @@ class Engine:
         except Exception:
             logger.exception('initial reconcile_cycle failed')
 
-        # start reconcile loop
+        # Startup safety: cancel all resting orders on configured tickers if trading enabled
+        if self.config.trading_enabled and os.getenv("MM_CANCEL_ALL_ON_START", "1") == "1":
+            for m in self.config.markets:
+                try:
+                    orders = self.exec.get_open_orders(ticker=m, limit=500)
+                    cancel_count = 0
+                    for o in orders:
+                        oid = o.get("order_id")
+                        if oid and o.get("status") == "resting" and int(o.get("remaining_count") or 0) > 0:
+                            self.exec.cancel_order(oid)
+                            cancel_count += 1
+                    if cancel_count > 0:
+                        logger.info(json_msg({"event":"startup_cancel_all_done","market":m,"n":cancel_count}))
+                except Exception:
+                    logger.exception("startup cancel all failed for market %s", m)
         # Start market data provider and wait for initial BBOs where applicable
         try:
             # instantiate lazy WS provider if requested

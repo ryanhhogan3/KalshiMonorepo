@@ -92,7 +92,7 @@ class KalshiExecutionProvider:
         return headers
 
     def place_order(self, market_ticker: str, side: str, price_cents: int, size: float, client_order_id: str, action: str = "buy"):
-        path = f"{API_PREFIX}/portfolio/orders"
+        path = self._norm_path("/portfolio/orders")
         url = self._endpoint(path)
 
         price_cents = int(price_cents)
@@ -105,6 +105,9 @@ class KalshiExecutionProvider:
 
         side_norm = "yes" if side and side.lower() in ("yes", "y") else "no"
         action_norm = (action or "buy").lower()
+        
+        if action_norm not in ("buy", "sell"):
+            return {"status": "ERROR", "latency_ms": 0, "raw": "action must be buy|sell"}
 
         payload = {
             "ticker": market_ticker,
@@ -145,13 +148,12 @@ class KalshiExecutionProvider:
             return {"status": "ERROR", "latency_ms": latency, "raw": str(e)}
 
     def cancel_order(self, order_id: str):
-        """Cancel an order by its ID.
+        """Cancel an order by its exchange order ID.
         
         Args:
-            order_id: The order ID to cancel. Prefer exchange_order_id if available,
-                     otherwise fall back to client_order_id.
+            order_id: The exchange order ID to cancel (order_id from exchange, not client_order_id).
         """
-        path = f"{API_PREFIX}/portfolio/orders/{order_id}"
+        path = self._norm_path(f"/portfolio/orders/{order_id}")
         url = self._endpoint(path)
         headers = self._signed_headers("DELETE", path, "")
 
@@ -175,7 +177,7 @@ class KalshiExecutionProvider:
             return {"status": "ERROR", "latency_ms": latency, "raw": str(e)}
 
     def get_open_orders(self, ticker: str | None = None, limit: int = 200):
-        path = f"{API_PREFIX}/portfolio/orders"
+        path = self._norm_path("/portfolio/orders")
         url = self._endpoint(path)
 
         params = {"status": "resting", "limit": int(limit)}
@@ -213,7 +215,7 @@ class KalshiExecutionProvider:
 
 
     def get_positions(self):
-        path = f"{API_PREFIX}/portfolio/positions"
+        path = self._norm_path("/portfolio/positions")
         url = self._endpoint(path)
         headers = self._signed_headers("GET", path, "")
         try:
@@ -237,7 +239,7 @@ class KalshiExecutionProvider:
             return []
 
     def get_fills(self, since_ts_ms: int = 0):
-        path = f"{API_PREFIX}/portfolio/fills"
+        path = self._norm_path("/portfolio/fills")
         url = self._endpoint(path)
 
         # API uses seconds. Convert incoming ms -> seconds.
