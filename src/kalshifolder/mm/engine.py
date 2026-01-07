@@ -384,18 +384,19 @@ class Engine:
             bb = mr.last_bb_px
             ba = mr.last_ba_px  # may be garbage from WS
 
-            if bb is None:
-                logger.info(json_msg({"event": "skip_no_yes_bb", "market": m}))
-                continue
+            # Exchange position check: hard block if at or beyond limit.
+            # This must run even if market data is junk, so we can prove gating in logs.
+            ex_pos = int(pos_by_ticker.get(m, 0))
+            mr.exchange_position = ex_pos  # store for visibility
+            mr.inventory = ex_pos  # TEMP: until reconciliation is proven correct
 
-            # basic sanity on bid only
-            try:
-                bb_val = float(bb)
-                if not (0.0 <= bb_val <= 1.0):
-                    logger.error(json_msg({"event": "skip_bad_yes_bb_range", "market": m, "bb": bb}))
-                    continue
-            except (ValueError, TypeError):
-                logger.error(json_msg({"event": "skip_bad_yes_bb_type", "market": m, "bb": bb}))
+            if abs(ex_pos) >= int(self.config.max_pos):
+                logger.error(json_msg({
+                    "event": "risk_hard_block_exchange_pos",
+                    "market": m,
+                    "exchange_position": ex_pos,
+                    "max_pos": int(self.config.max_pos),
+                }))
                 continue
 
             # Proper YES book validation: require both bid and ask, both in (0, 1), bid < ask
@@ -406,6 +407,10 @@ class Engine:
             try:
                 bb_val = float(bb)
                 ba_val = float(ba)
+                # WS placeholder ask protection: treat 0.01 ask as missing when bid is meaningful
+                if ba_val <= 0.011 and bb_val >= 0.20:
+                    logger.error(json_msg({"event": "skip_bogus_yes_ask", "market": m, "bb": bb, "ba": ba}))
+                    continue
                 if not (0.0 < bb_val < 1.0) or not (0.0 < ba_val < 1.0):
                     logger.error(json_msg({"event":"skip_bad_yes_range", "market": m, "bb": bb, "ba": ba}))
                     continue
@@ -414,19 +419,6 @@ class Engine:
                     continue
             except (ValueError, TypeError):
                 logger.error(json_msg({"event":"skip_bad_yes_type", "market": m, "bb": bb, "ba": ba}))
-                continue
-
-            # Exchange position check: hard block if at or beyond limit
-            ex_pos = int(pos_by_ticker.get(m, 0))
-            mr.exchange_position = ex_pos  # store for visibility
-            
-            if abs(ex_pos) >= int(self.config.max_pos):
-                logger.error(json_msg({
-                    "event": "risk_hard_block_exchange_pos",
-                    "market": m,
-                    "exchange_position": ex_pos,
-                    "max_pos": int(self.config.max_pos),
-                }))
                 continue
 
             # wo_state: rate-limit to 1/sec per market

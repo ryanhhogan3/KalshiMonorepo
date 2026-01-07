@@ -18,13 +18,14 @@ docker compose -f docker-compose.yml -f docker-compose.mm.yml down
 
 # Bring down engine only (for MM)
 docker compose -f docker-compose.yml -f docker-compose.mm.yml stop kalshi_mm_engine
+
 docker compose -f docker-compose.yml -f docker-compose.mm.yml rm -f kalshi_mm_engine
 
 # Reset docker instance
 docker restart
 
 # Docker clickhouse query
-ubuntu@ip-10-0-0-11:~/apps/KalshiMonorepo$ docker exec -it clickhouse clickhouse-client   --user default --password default_password --database kalshi --query 
+docker exec -it clickhouse clickhouse-client   --user default --password default_password --database kalshi --query 
 
 ## Logging files and info
 # view streamer logs
