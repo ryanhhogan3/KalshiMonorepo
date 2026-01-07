@@ -171,6 +171,24 @@ class WSMarketDataProvider(BaseMarketDataProvider):
         if not isinstance(msg, dict):
             return None
 
+        def _norm_px(px):
+            if px is None:
+                return None
+            try:
+                v = float(px)
+            except Exception:
+                return None
+            # If we ever see > 1, assume cents and convert to dollars
+            if v > 1.5:
+                v = v / 100.0
+            # clip into Kalshi range
+            if v <= 0:
+                return None
+            if v >= 1:
+                v = 0.99
+            # quantize to 1-cent tick
+            return round(v + 1e-9, 2)
+
         # Try to locate YES/NO levels in common formats.
         # Preferred: msg['yes'] and msg['no'] are dicts with {'bids':..., 'asks':...}
         yes_levels = msg.get("yes")
@@ -218,6 +236,11 @@ class WSMarketDataProvider(BaseMarketDataProvider):
         yes_bb_direct, yes_ba_direct, yes_bb_sz_direct, yes_ba_sz_direct = self._best_bid_ask(yes_levels)
         no_bb_direct, no_ba_direct, no_bb_sz_direct, no_ba_sz_direct = self._best_bid_ask(no_levels)
 
+        yes_bb_direct = _norm_px(yes_bb_direct)
+        yes_ba_direct = _norm_px(yes_ba_direct)
+        no_bb_direct = _norm_px(no_bb_direct)
+        no_ba_direct = _norm_px(no_ba_direct)
+
         # Compute implied asks only if asks are missing/empty
         yes_ba_implied = None
         yes_ba_sz_implied = 0
@@ -232,6 +255,9 @@ class WSMarketDataProvider(BaseMarketDataProvider):
             if yes_bb_direct is not None:
                 no_ba_implied = round(1.0 - float(yes_bb_direct), 2)
                 no_ba_sz_implied = int(yes_bb_sz_direct or 0)
+
+        yes_ba_implied = _norm_px(yes_ba_implied)
+        no_ba_implied = _norm_px(no_ba_implied)
 
         # Choose output (direct preferred)
         yes_bb_px = yes_bb_direct
@@ -295,6 +321,22 @@ class WSMarketDataProvider(BaseMarketDataProvider):
             )[:800],
         }
 
+        def _in_range(v):
+            return v is not None and 0.0 < float(v) < 1.0
+
+        if yes_bb_px is not None and not _in_range(yes_bb_px):
+            self._log_ws_drop_update(ticker=ticker, reason="yes_bb_out_of_range", context=drop_ctx)
+            return None
+        if yes_ba_px is not None and not _in_range(yes_ba_px):
+            self._log_ws_drop_update(ticker=ticker, reason="yes_ba_out_of_range", context=drop_ctx)
+            return None
+        if no_bb_px is not None and not _in_range(no_bb_px):
+            self._log_ws_drop_update(ticker=ticker, reason="no_bb_out_of_range", context=drop_ctx)
+            return None
+        if no_ba_px is not None and not _in_range(no_ba_px):
+            self._log_ws_drop_update(ticker=ticker, reason="no_ba_out_of_range", context=drop_ctx)
+            return None
+
         # Hard block bad output BEFORE publishing
         if yes_bb_px is not None and yes_ba_px is not None and yes_bb_px >= yes_ba_px:
             self._log_ws_drop_update(ticker=ticker, reason="inverted_yes_bbo", context=drop_ctx)
@@ -302,7 +344,7 @@ class WSMarketDataProvider(BaseMarketDataProvider):
 
         if yes_ba_px is not None and yes_bb_px is not None:
             try:
-                if float(yes_ba_px) == 0.01 and float(yes_bb_px) >= 0.20:
+                if float(yes_ba_px) <= 0.011 and float(yes_bb_px) >= 0.20:
                     self._log_ws_drop_update(ticker=ticker, reason="bogus_yes_ask_symptom", context=drop_ctx)
                     return None
             except Exception:
@@ -314,7 +356,7 @@ class WSMarketDataProvider(BaseMarketDataProvider):
 
         if yes_ba_is_implied and yes_ba_px is not None and yes_bb_px is not None:
             try:
-                if (float(yes_ba_px) - float(yes_bb_px)) < float(self._min_spread):
+                if (float(yes_ba_px) - float(yes_bb_px)) <= float(self._min_spread):
                     self._log_ws_drop_update(ticker=ticker, reason="implied_yes_spread_too_small", context=drop_ctx)
                     return None
             except Exception:
@@ -329,7 +371,7 @@ class WSMarketDataProvider(BaseMarketDataProvider):
             return None
         if no_ba_is_implied and no_ba_px is not None and no_bb_px is not None:
             try:
-                if (float(no_ba_px) - float(no_bb_px)) < float(self._min_spread):
+                if (float(no_ba_px) - float(no_bb_px)) <= float(self._min_spread):
                     self._log_ws_drop_update(ticker=ticker, reason="implied_no_spread_too_small", context=drop_ctx)
                     return None
             except Exception:
@@ -524,6 +566,26 @@ class WSMarketDataProvider(BaseMarketDataProvider):
             no_ba_sz = int(yes_bid_sz or 0)
             no_ba_is_implied = True
 
+        def _norm_px(px):
+            if px is None:
+                return None
+            try:
+                v = float(px)
+            except Exception:
+                return None
+            if v > 1.5:
+                v = v / 100.0
+            if v <= 0:
+                return None
+            if v >= 1:
+                v = 0.99
+            return round(v + 1e-9, 2)
+
+        yes_bb = _norm_px(yes_bb)
+        yes_ba = _norm_px(yes_ba)
+        no_bb = _norm_px(no_bb)
+        no_ba = _norm_px(no_ba)
+
         ticker = getattr(ob, 'ticker', None) or ""
         drop_ctx = {
             "has_yes_bids": bool(ob.yes.levels),
@@ -553,20 +615,36 @@ class WSMarketDataProvider(BaseMarketDataProvider):
             "min_spread": self._min_spread,
         }
 
+        def _in_range(v):
+            return v is not None and 0.0 < float(v) < 1.0
+
+        if yes_bb is not None and not _in_range(yes_bb):
+            self._log_ws_drop_update(ticker=ticker, reason="yes_bb_out_of_range_book_fallback", context=drop_ctx)
+            return None
+        if yes_ba is not None and not _in_range(yes_ba):
+            self._log_ws_drop_update(ticker=ticker, reason="yes_ba_out_of_range_book_fallback", context=drop_ctx)
+            return None
+        if no_bb is not None and not _in_range(no_bb):
+            self._log_ws_drop_update(ticker=ticker, reason="no_bb_out_of_range_book_fallback", context=drop_ctx)
+            return None
+        if no_ba is not None and not _in_range(no_ba):
+            self._log_ws_drop_update(ticker=ticker, reason="no_ba_out_of_range_book_fallback", context=drop_ctx)
+            return None
+
         # Drop inverted / bogus / too-tight implied spreads.
         if yes_bb is not None and yes_ba is not None and yes_bb >= yes_ba:
             self._log_ws_drop_update(ticker=ticker, reason="inverted_yes_bbo_book_fallback", context=drop_ctx)
             return None
         if yes_ba is not None and yes_bb is not None:
             try:
-                if float(yes_ba) == 0.01 and float(yes_bb) >= 0.20:
+                if float(yes_ba) <= 0.011 and float(yes_bb) >= 0.20:
                     self._log_ws_drop_update(ticker=ticker, reason="bogus_yes_ask_symptom_book_fallback", context=drop_ctx)
                     return None
             except Exception:
                 pass
         if yes_ba_is_implied and yes_ba is not None and yes_bb is not None:
             try:
-                if (float(yes_ba) - float(yes_bb)) < float(self._min_spread):
+                if (float(yes_ba) - float(yes_bb)) <= float(self._min_spread):
                     self._log_ws_drop_update(ticker=ticker, reason="implied_yes_spread_too_small_book_fallback", context=drop_ctx)
                     return None
             except Exception:
@@ -576,7 +654,7 @@ class WSMarketDataProvider(BaseMarketDataProvider):
             return None
         if no_ba_is_implied and no_ba is not None and no_bb is not None:
             try:
-                if (float(no_ba) - float(no_bb)) < float(self._min_spread):
+                if (float(no_ba) - float(no_bb)) <= float(self._min_spread):
                     self._log_ws_drop_update(ticker=ticker, reason="implied_no_spread_too_small_book_fallback", context=drop_ctx)
                     return None
             except Exception:
