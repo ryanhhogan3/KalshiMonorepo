@@ -42,7 +42,7 @@ class WSMarketDataProvider(BaseMarketDataProvider):
         self._last_truth_probe_mono: dict[str, float] = {}
 
         # Hard gating for implied asks
-        self._min_spread = float(os.getenv('MM_WS_MIN_SPREAD', '0.02'))
+        self._min_spread = float(os.getenv('MM_WS_MIN_SPREAD', '0.01'))
 
     def _best_bid_ask(self, levels: dict) -> tuple[float | None, float | None, int, int]:
         """Compute best bid/ask from a generic levels container.
@@ -514,26 +514,25 @@ class WSMarketDataProvider(BaseMarketDataProvider):
                         bbo = self._extract_bbo_from_msg(ticker=ticker, msg=msg, ingest_ms=now_ms)
                         if bbo is not None:
                             self._bbo[ticker] = bbo
-                        if ticker not in self._first_bbo_logged:
-                            self._first_bbo_logged.add(ticker)
-                            try:
-                                out = self._bbo.get(ticker) or {}
-                                log.info(
-                                    json_msg(
-                                        {
-                                            "event": "ws_first_bbo",
-                                            "ticker": ticker,
-                                            "yes_bb_px": out.get("yes_bb_px"),
-                                            "yes_ba_px": out.get("yes_ba_px"),
-                                            "no_bb_px": out.get("no_bb_px"),
-                                            "no_ba_px": out.get("no_ba_px"),
-                                            "yes_ba_is_implied": out.get("yes_ba_is_implied"),
-                                            "no_ba_is_implied": out.get("no_ba_is_implied"),
-                                        }
+                            if ticker not in self._first_bbo_logged:
+                                self._first_bbo_logged.add(ticker)
+                                try:
+                                    log.info(
+                                        json_msg(
+                                            {
+                                                "event": "ws_first_bbo",
+                                                "ticker": ticker,
+                                                "yes_bb_px": bbo.get("yes_bb_px"),
+                                                "yes_ba_px": bbo.get("yes_ba_px"),
+                                                "no_bb_px": bbo.get("no_bb_px"),
+                                                "no_ba_px": bbo.get("no_ba_px"),
+                                                "yes_ba_is_implied": bbo.get("yes_ba_is_implied"),
+                                                "no_ba_is_implied": bbo.get("no_ba_is_implied"),
+                                            }
+                                        )
                                     )
-                                )
-                            except Exception:
-                                log.info(json_msg({"event": "ws_first_bbo", "ticker": ticker}))
+                                except Exception:
+                                    log.info(json_msg({"event": "ws_first_bbo", "ticker": ticker}))
 
                 elif typ == "orderbook_delta":
                     sid = int(frame.get("sid", -1))
@@ -561,26 +560,25 @@ class WSMarketDataProvider(BaseMarketDataProvider):
                                 bbo = self._extract_bbo_from_book(ob, ingest_ms=now_ms)
                             if bbo is not None:
                                 self._bbo[ticker] = bbo
-                            if ticker not in self._first_bbo_logged:
-                                self._first_bbo_logged.add(ticker)
-                                try:
-                                    out = self._bbo.get(ticker) or {}
-                                    log.info(
-                                        json_msg(
-                                            {
-                                                "event": "ws_first_bbo",
-                                                "ticker": ticker,
-                                                "yes_bb_px": out.get("yes_bb_px"),
-                                                "yes_ba_px": out.get("yes_ba_px"),
-                                                "no_bb_px": out.get("no_bb_px"),
-                                                "no_ba_px": out.get("no_ba_px"),
-                                                "yes_ba_is_implied": out.get("yes_ba_is_implied"),
-                                                "no_ba_is_implied": out.get("no_ba_is_implied"),
-                                            }
+                                if ticker not in self._first_bbo_logged:
+                                    self._first_bbo_logged.add(ticker)
+                                    try:
+                                        log.info(
+                                            json_msg(
+                                                {
+                                                    "event": "ws_first_bbo",
+                                                    "ticker": ticker,
+                                                    "yes_bb_px": bbo.get("yes_bb_px"),
+                                                    "yes_ba_px": bbo.get("yes_ba_px"),
+                                                    "no_bb_px": bbo.get("no_bb_px"),
+                                                    "no_ba_px": bbo.get("no_ba_px"),
+                                                    "yes_ba_is_implied": bbo.get("yes_ba_is_implied"),
+                                                    "no_ba_is_implied": bbo.get("no_ba_is_implied"),
+                                                }
+                                            )
                                         )
-                                    )
-                                except Exception:
-                                    log.info(json_msg({"event": "ws_first_bbo", "ticker": ticker}))
+                                    except Exception:
+                                        log.info(json_msg({"event": "ws_first_bbo", "ticker": ticker}))
 
             except Exception:
                 log.exception("ws_loop_crash")
