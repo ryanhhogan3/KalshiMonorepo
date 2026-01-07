@@ -386,7 +386,7 @@ class WSMarketDataProvider(BaseMarketDataProvider):
 
         if yes_ba_is_implied and yes_ba_px is not None and yes_bb_px is not None:
             try:
-                if (float(yes_ba_px) - float(yes_bb_px)) <= float(self._min_spread):
+                if (float(yes_ba_px) - float(yes_bb_px)) < float(self._min_spread):
                     self._log_ws_drop_update(ticker=ticker, reason="implied_yes_spread_too_small", context=drop_ctx)
                     return None
             except Exception:
@@ -401,7 +401,7 @@ class WSMarketDataProvider(BaseMarketDataProvider):
             return None
         if no_ba_is_implied and no_ba_px is not None and no_bb_px is not None:
             try:
-                if (float(no_ba_px) - float(no_bb_px)) <= float(self._min_spread):
+                if (float(no_ba_px) - float(no_bb_px)) < float(self._min_spread):
                     self._log_ws_drop_update(ticker=ticker, reason="implied_no_spread_too_small", context=drop_ctx)
                     return None
             except Exception:
@@ -696,7 +696,7 @@ class WSMarketDataProvider(BaseMarketDataProvider):
                 pass
         if yes_ba_is_implied and yes_ba is not None and yes_bb is not None:
             try:
-                if (float(yes_ba) - float(yes_bb)) <= float(self._min_spread):
+                if (float(yes_ba) - float(yes_bb)) < float(self._min_spread):
                     self._log_ws_drop_update(ticker=ticker, reason="implied_yes_spread_too_small_book_fallback", context=drop_ctx)
                     return None
             except Exception:
@@ -706,7 +706,7 @@ class WSMarketDataProvider(BaseMarketDataProvider):
             return None
         if no_ba_is_implied and no_ba is not None and no_bb is not None:
             try:
-                if (float(no_ba) - float(no_bb)) <= float(self._min_spread):
+                if (float(no_ba) - float(no_bb)) < float(self._min_spread):
                     self._log_ws_drop_update(ticker=ticker, reason="implied_no_spread_too_small_book_fallback", context=drop_ctx)
                     return None
             except Exception:
