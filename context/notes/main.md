@@ -11,7 +11,7 @@ docker compose up -d --build
 # UP
  docker compose -f docker-compose.yml -f docker-compose.mm.yml up -d
 
- docker compose -f docker-compose.yml -f docker-compose.mm.yml up -d --build --force-recreate
+docker compose -f docker-compose.yml -f docker-compose.mm.yml up -d --build --force-recreate kalshi_mm_engine
 
 # DOWN
 docker compose -f docker-compose.yml -f docker-compose.mm.yml down
