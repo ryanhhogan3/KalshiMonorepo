@@ -606,18 +606,44 @@ class Engine:
                             client_order_id = make_client_id('B')
                             self._log_action(action_id, decision_id, m, client_order_id, 'PLACE', 'BID', 'yes', target.bid_px, new_price_cents, target.bid_sz, replace_of=(wo.client_order_id if wo else ''))
                             if not self.config.trading_enabled:
-                                # simulate place
-                                resp = {'status': 'SIMULATED', 'latency_ms': 0, 'raw': '{"simulated": true}', 'exchange_order_id': ''}
-                            else:
-                                resp = await asyncio.to_thread(
-                                    self.exec.place_order,
-                                    market_ticker=m,
-                                    side="yes",
-                                    price_cents=new_price_cents,
-                                    size=int(target.bid_sz),
+                                logger.info(json_msg({
+                                    "event": "paper_place",
+                                    "market": m,
+                                    "side": "BID",
+                                    "px_cents": int(new_price_cents),
+                                    "sz": int(target.bid_sz),
+                                }))
+                                mr.last_place_bid_ms = now
+                                sim_exch = f"SIMULATED:{client_order_id}"
+                                wo_new = WorkingOrder(
                                     client_order_id=client_order_id,
-                                    action="buy",
+                                    exchange_order_id=sim_exch,
+                                    side='BID',
+                                    price_cents=new_price_cents,
+                                    size=target.bid_sz,
+                                    status='ACKED',
+                                    placed_ts_ms=now,
+                                    remaining_size=target.bid_sz,
+                                    last_update_ts_ms=now,
                                 )
+                                mr.working_bid = wo_new
+                                last['bid_px'] = target.bid_px
+                                last['ts_ms'] = now
+                                try:
+                                    self.state.order_by_client_id[client_order_id] = OrderRef(market_ticker=m, internal_side='BID', decision_id=decision_id, client_order_id=client_order_id)
+                                except Exception:
+                                    logger.exception('failed to update order registry')
+                                continue
+
+                            resp = await asyncio.to_thread(
+                                self.exec.place_order,
+                                market_ticker=m,
+                                side="yes",
+                                price_cents=new_price_cents,
+                                size=int(target.bid_sz),
+                                client_order_id=client_order_id,
+                                action="buy",
+                            )
                             status = resp.get('status', 'ERROR')
                             exch_id = resp.get('exchange_order_id')
                             # parse reject reason for place
@@ -633,22 +659,27 @@ class Engine:
                             except Exception:
                                 reject_reason = ""
 
-                            # log response but mark simulated separately
-                            if not self.config.trading_enabled:
-                                self._log_response(action_id, m, client_order_id, 'SIMULATED', '', '', 0, json.dumps({'simulated': True}))
-                            else:
-                                self._log_response(action_id, m, client_order_id, status, exch_id, reject_reason, resp.get('latency_ms', 0), resp.get('raw', ''))
+                            self._log_response(action_id, m, client_order_id, status, exch_id, reject_reason, resp.get('latency_ms', 0), resp.get('raw', ''))
 
                             if status != 'ACK':
-                                # 2s cooldown per reject per market (tune)
-                                mr.cooldown_until_ms = now_ms() + 2000
-                                mr.rejects_rolling_counter += 1
-                                logger.error(json_msg({"event":"place_reject", "market": m, "side": "BID", "reason": reject_reason, "cooldown_ms": 2000}))
+                                if self.config.trading_enabled:
+                                    # 2s cooldown per reject per market (tune)
+                                    mr.cooldown_until_ms = now_ms() + 2000
+                                    mr.rejects_rolling_counter += 1
+                                    logger.error(json_msg({"event":"place_reject", "market": m, "side": "BID", "reason": reject_reason, "cooldown_ms": 2000}))
 
-                                # hard kill if reject spike enabled
-                                if self.config.kill_on_reject_spike and mr.rejects_rolling_counter >= self.config.max_rejects_per_min:
-                                    logger.error(json_msg({"event":"reject_spike_kill", "market": m, "rejects": mr.rejects_rolling_counter}))
-                                    self._running = False
+                                    # hard kill if reject spike enabled
+                                    if self.config.kill_on_reject_spike and mr.rejects_rolling_counter >= self.config.max_rejects_per_min:
+                                        logger.error(json_msg({"event":"reject_spike_kill", "market": m, "rejects": mr.rejects_rolling_counter}))
+                                        self._running = False
+                                else:
+                                    logger.info(json_msg({
+                                        "event": "paper_place_skip_reject_accounting",
+                                        "market": m,
+                                        "side": "BID",
+                                        "why": "trading_disabled",
+                                    }))
+
                                 # do NOT attempt the other side in same cycle after a reject
                                 continue
 
@@ -765,17 +796,44 @@ class Engine:
                             client_order_id = make_client_id('A')
                             self._log_action(action_id, decision_id, m, client_order_id, 'PLACE', 'ASK', 'yes', target.ask_px, new_price_cents, target.ask_sz, replace_of=(wo.client_order_id if wo else ''))
                             if not self.config.trading_enabled:
-                                resp = {'status': 'SIMULATED', 'latency_ms': 0, 'raw': '{"simulated": true}', 'exchange_order_id': ''}
-                            else:
-                                resp = await asyncio.to_thread(
-                                    self.exec.place_order,
-                                    market_ticker=m,
-                                    side="yes",
-                                    price_cents=new_price_cents,
-                                    size=int(target.ask_sz),
+                                logger.info(json_msg({
+                                    "event": "paper_place",
+                                    "market": m,
+                                    "side": "ASK",
+                                    "px_cents": int(new_price_cents),
+                                    "sz": int(target.ask_sz),
+                                }))
+                                mr.last_place_ask_ms = now
+                                sim_exch = f"SIMULATED:{client_order_id}"
+                                wo_new = WorkingOrder(
                                     client_order_id=client_order_id,
-                                    action="sell",
+                                    exchange_order_id=sim_exch,
+                                    side='ASK',
+                                    price_cents=new_price_cents,
+                                    size=target.ask_sz,
+                                    status='ACKED',
+                                    placed_ts_ms=now,
+                                    remaining_size=target.ask_sz,
+                                    last_update_ts_ms=now,
                                 )
+                                mr.working_ask = wo_new
+                                last['ask_px'] = target.ask_px
+                                last['ts_ms'] = now
+                                try:
+                                    self.state.order_by_client_id[client_order_id] = OrderRef(market_ticker=m, internal_side='ASK', decision_id=decision_id, client_order_id=client_order_id)
+                                except Exception:
+                                    logger.exception('failed to update order registry')
+                                continue
+
+                            resp = await asyncio.to_thread(
+                                self.exec.place_order,
+                                market_ticker=m,
+                                side="yes",
+                                price_cents=new_price_cents,
+                                size=int(target.ask_sz),
+                                client_order_id=client_order_id,
+                                action="sell",
+                            )
                             status = resp.get('status', 'ERROR')
                             exch_id = resp.get('exchange_order_id')
                             # parse reject reason for place
@@ -791,21 +849,27 @@ class Engine:
                             except Exception:
                                 reject_reason = ""
 
-                            if not self.config.trading_enabled:
-                                self._log_response(action_id, m, client_order_id, 'SIMULATED', '', '', 0, json.dumps({'simulated': True}))
-                            else:
-                                self._log_response(action_id, m, client_order_id, status, exch_id, reject_reason, resp.get('latency_ms', 0), resp.get('raw', ''))
+                            self._log_response(action_id, m, client_order_id, status, exch_id, reject_reason, resp.get('latency_ms', 0), resp.get('raw', ''))
                             
                             if status != 'ACK':
-                                # 2s cooldown per reject per market (tune)
-                                mr.cooldown_until_ms = now_ms() + 2000
-                                mr.rejects_rolling_counter += 1
-                                logger.error(json_msg({"event":"place_reject", "market": m, "side": "ASK", "reason": reject_reason, "cooldown_ms": 2000}))
+                                if self.config.trading_enabled:
+                                    # 2s cooldown per reject per market (tune)
+                                    mr.cooldown_until_ms = now_ms() + 2000
+                                    mr.rejects_rolling_counter += 1
+                                    logger.error(json_msg({"event":"place_reject", "market": m, "side": "ASK", "reason": reject_reason, "cooldown_ms": 2000}))
 
-                                # hard kill if reject spike enabled
-                                if self.config.kill_on_reject_spike and mr.rejects_rolling_counter >= self.config.max_rejects_per_min:
-                                    logger.error(json_msg({"event":"reject_spike_kill", "market": m, "rejects": mr.rejects_rolling_counter}))
-                                    self._running = False
+                                    # hard kill if reject spike enabled
+                                    if self.config.kill_on_reject_spike and mr.rejects_rolling_counter >= self.config.max_rejects_per_min:
+                                        logger.error(json_msg({"event":"reject_spike_kill", "market": m, "rejects": mr.rejects_rolling_counter}))
+                                        self._running = False
+                                else:
+                                    logger.info(json_msg({
+                                        "event": "paper_place_skip_reject_accounting",
+                                        "market": m,
+                                        "side": "ASK",
+                                        "why": "trading_disabled",
+                                    }))
+
                                 # do NOT attempt next cycle until cooldown expires
                                 continue
 
