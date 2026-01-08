@@ -547,7 +547,16 @@ class Engine:
                                 api_side = 'yes'
                                 self._log_action(action_id, decision_id, m, cancel_client, 'CANCEL', 'BID', api_side, wo.price_cents / 100.0, wo.price_cents, wo.size, replace_of='')
                                 if not self.config.trading_enabled:
-                                    resp = {'status': 'SIMULATED', 'latency_ms': 0, 'raw': '{"simulated": true}', 'exchange_order_id': ''}
+                                    self._log_response(action_id, m, cancel_client, 'SIMULATED', '', '', 0, json.dumps({'simulated': True}))
+                                    # In paper mode, treat cancel as immediate and clear local state
+                                    try:
+                                        wo.status = 'CANCELLED'
+                                        if getattr(wo, 'exchange_order_id', None):
+                                            self.state.order_by_exchange_id.pop(str(wo.exchange_order_id), None)
+                                        self.state.order_by_client_id.pop(getattr(wo, 'client_order_id', ''), None)
+                                    except Exception:
+                                        logger.exception('failed to cleanup registry on cancel')
+                                    mr.working_bid = None
                                 else:
                                     # Use exchange_order_id only; fail loudly if missing
                                     cancel_id = wo.exchange_order_id
@@ -591,9 +600,6 @@ class Engine:
                                             await asyncio.sleep(cancel_timeout_ms / 1000.0)
                                             # after wait, clear local state to avoid blocking
                                             mr.working_bid = None
-                            
-                            if not self.config.trading_enabled:
-                                self._log_response(action_id, m, cancel_client, 'SIMULATED', '', '', 0, json.dumps({'simulated': True}))
 
                             # place new order
                             action_id = uuid4_hex()
@@ -706,7 +712,16 @@ class Engine:
                                 self._log_action(action_id, decision_id, m, cancel_client, 'CANCEL', 'ASK', 'yes', wo.price_cents / 100.0, wo.price_cents, wo.size, replace_of='')
                                 # simulate cancel in paper mode
                                 if not self.config.trading_enabled:
-                                    resp = {'status': 'SIMULATED', 'latency_ms': 0, 'raw': '{"simulated": true}', 'exchange_order_id': ''}
+                                    self._log_response(action_id, m, cancel_client, 'SIMULATED', '', '', 0, json.dumps({'simulated': True}))
+                                    # In paper mode, treat cancel as immediate and clear local state
+                                    try:
+                                        wo.status = 'CANCELLED'
+                                        if getattr(wo, 'exchange_order_id', None):
+                                            self.state.order_by_exchange_id.pop(str(wo.exchange_order_id), None)
+                                        self.state.order_by_client_id.pop(getattr(wo, 'client_order_id', ''), None)
+                                    except Exception:
+                                        logger.exception('failed to cleanup registry on cancel')
+                                    mr.working_ask = None
                                 else:
                                     # Use exchange_order_id only; fail loudly if missing
                                     cancel_id = wo.exchange_order_id
@@ -745,9 +760,6 @@ class Engine:
                                             wo.status = 'PENDING_CANCEL'
                                             await asyncio.sleep(cancel_timeout_ms / 1000.0)
                                             mr.working_ask = None
-                            
-                            if not self.config.trading_enabled:
-                                self._log_response(action_id, m, cancel_client, 'SIMULATED', '', '', 0, json.dumps({'simulated': True}))
 
                             action_id = uuid4_hex()
                             client_order_id = make_client_id('A')
