@@ -43,6 +43,34 @@ class WSMarketDataProvider(BaseMarketDataProvider):
 
         # Hard gating for implied asks
         self._min_spread = float(os.getenv('MM_WS_MIN_SPREAD', '0.01'))
+        self._min_spread_cents = max(1, int(round(self._min_spread * 100.0)))
+
+    def _px_to_cents(self, px) -> int | None:
+        """Convert px to integer cents (1..99). Accepts 0.xx floats or integer cents."""
+        if px is None:
+            return None
+        try:
+            v = float(px)
+        except Exception:
+            return None
+
+        # If it looks like cents already (>= 1), treat as cents.
+        if v >= 1.0:
+            c = int(round(v))
+        else:
+            # dollars 0.xx -> cents
+            c = int(round(v * 100.0))
+
+        if c < 1 or c > 99:
+            return None
+        return c
+
+    def _spread_cents(self, bb_px, ba_px) -> int | None:
+        bb = self._px_to_cents(bb_px)
+        ba = self._px_to_cents(ba_px)
+        if bb is None or ba is None:
+            return None
+        return ba - bb
 
     def _best_bid_ask(self, levels: dict) -> tuple[float | None, float | None, int, int]:
         """Compute best bid/ask from a generic levels container.
@@ -348,8 +376,17 @@ class WSMarketDataProvider(BaseMarketDataProvider):
         }
         self._maybe_truth_probe(ticker=ticker, context=probe_ctx)
 
+        spread_yes_cents = self._spread_cents(yes_bb_px, yes_ba_px)
+        spread_no_cents = self._spread_cents(no_bb_px, no_ba_px)
+
         # Bounded drop context only (no full raw msg payload)
-        drop_ctx = probe_ctx | {"min_spread": self._min_spread, "msg_keys": list(msg.keys())[:60]}
+        drop_ctx = probe_ctx | {
+            "min_spread": self._min_spread,
+            "min_spread_cents": self._min_spread_cents,
+            "spread_yes_cents": spread_yes_cents,
+            "spread_no_cents": spread_no_cents,
+            "msg_keys": list(msg.keys())[:60],
+        }
 
         def _in_range(v):
             return v is not None and 0.0 < float(v) < 1.0
@@ -385,12 +422,17 @@ class WSMarketDataProvider(BaseMarketDataProvider):
             return None
 
         if yes_ba_is_implied and yes_ba_px is not None and yes_bb_px is not None:
-            try:
-                if (float(yes_ba_px) - float(yes_bb_px)) < float(self._min_spread):
-                    self._log_ws_drop_update(ticker=ticker, reason="implied_yes_spread_too_small", context=drop_ctx)
-                    return None
-            except Exception:
-                pass
+            spr = self._spread_cents(yes_bb_px, yes_ba_px)
+            if spr is None:
+                self._log_ws_drop_update(ticker=ticker, reason="implied_yes_spread_bad_px", context=drop_ctx)
+                return None
+            if spr < self._min_spread_cents:
+                self._log_ws_drop_update(
+                    ticker=ticker,
+                    reason="implied_yes_spread_too_small",
+                    context=drop_ctx | {"spread_cents": spr},
+                )
+                return None
 
         # Symmetric safety for NO side
         if no_bb_px is not None and no_ba_px is not None and no_bb_px >= no_ba_px:
@@ -400,12 +442,17 @@ class WSMarketDataProvider(BaseMarketDataProvider):
             self._log_ws_drop_update(ticker=ticker, reason="cannot_imply_no_ask_no_yes_bb", context=drop_ctx)
             return None
         if no_ba_is_implied and no_ba_px is not None and no_bb_px is not None:
-            try:
-                if (float(no_ba_px) - float(no_bb_px)) < float(self._min_spread):
-                    self._log_ws_drop_update(ticker=ticker, reason="implied_no_spread_too_small", context=drop_ctx)
-                    return None
-            except Exception:
-                pass
+            spr = self._spread_cents(no_bb_px, no_ba_px)
+            if spr is None:
+                self._log_ws_drop_update(ticker=ticker, reason="implied_no_spread_bad_px", context=drop_ctx)
+                return None
+            if spr < self._min_spread_cents:
+                self._log_ws_drop_update(
+                    ticker=ticker,
+                    reason="implied_no_spread_too_small",
+                    context=drop_ctx | {"spread_cents": spr},
+                )
+                return None
 
         return {
             "yes_bb_px": yes_bb_px,
@@ -665,6 +712,9 @@ class WSMarketDataProvider(BaseMarketDataProvider):
                 "no_ba_is_implied": bool(no_ba_is_implied),
             },
             "min_spread": self._min_spread,
+            "min_spread_cents": self._min_spread_cents,
+            "spread_yes_cents": self._spread_cents(yes_bb, yes_ba),
+            "spread_no_cents": self._spread_cents(no_bb, no_ba),
         }
 
         def _in_range(v):
@@ -695,22 +745,40 @@ class WSMarketDataProvider(BaseMarketDataProvider):
             except Exception:
                 pass
         if yes_ba_is_implied and yes_ba is not None and yes_bb is not None:
-            try:
-                if (float(yes_ba) - float(yes_bb)) < float(self._min_spread):
-                    self._log_ws_drop_update(ticker=ticker, reason="implied_yes_spread_too_small_book_fallback", context=drop_ctx)
-                    return None
-            except Exception:
-                pass
+            spr = self._spread_cents(yes_bb, yes_ba)
+            if spr is None:
+                self._log_ws_drop_update(
+                    ticker=ticker,
+                    reason="implied_yes_spread_bad_px_book_fallback",
+                    context=drop_ctx,
+                )
+                return None
+            if spr < self._min_spread_cents:
+                self._log_ws_drop_update(
+                    ticker=ticker,
+                    reason="implied_yes_spread_too_small_book_fallback",
+                    context=drop_ctx | {"spread_cents": spr},
+                )
+                return None
         if no_bb is not None and no_ba is not None and no_bb >= no_ba:
             self._log_ws_drop_update(ticker=ticker, reason="inverted_no_bbo_book_fallback", context=drop_ctx)
             return None
         if no_ba_is_implied and no_ba is not None and no_bb is not None:
-            try:
-                if (float(no_ba) - float(no_bb)) < float(self._min_spread):
-                    self._log_ws_drop_update(ticker=ticker, reason="implied_no_spread_too_small_book_fallback", context=drop_ctx)
-                    return None
-            except Exception:
-                pass
+            spr = self._spread_cents(no_bb, no_ba)
+            if spr is None:
+                self._log_ws_drop_update(
+                    ticker=ticker,
+                    reason="implied_no_spread_bad_px_book_fallback",
+                    context=drop_ctx,
+                )
+                return None
+            if spr < self._min_spread_cents:
+                self._log_ws_drop_update(
+                    ticker=ticker,
+                    reason="implied_no_spread_too_small_book_fallback",
+                    context=drop_ctx | {"spread_cents": spr},
+                )
+                return None
 
         return {
             "yes_bb_px": yes_bb,
