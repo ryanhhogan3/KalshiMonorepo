@@ -6,6 +6,7 @@ from databases.processing.clickhouse_sink import ClickHouseSink
 from databases.processing.parquet_sink import ParquetSink
 from kalshifolder.websocket.ws_runtime import KalshiWSRuntime
 from kalshifolder.websocket.order_book import OrderBook
+from kalshifolder.websocket.streamer_market_selector import StreamerMarketSelector
 from logging_config import get_logger, setup_session_logger
 from workflow_logger import AsyncWorkflowSession
 
@@ -44,9 +45,14 @@ def now_utc(): return datetime.now(timezone.utc)
 
 async def main():
     _dbg_env()
-    tickers = [t.strip() for t in os.getenv("MARKET_TICKERS","").split(",") if t.strip()]
+    
+    # Load markets from file (shared with MM engine) + optional extras
+    selector = StreamerMarketSelector()
+    tickers = list(selector.get_markets())
+    
     if not tickers:
-        print("Set MARKET_TICKERS in .env", file=sys.stderr); return
+        print("No markets to stream. Set MM_MARKETS_FILE, MARKET_TICKERS, or STREAMER_EXTRA_MARKETS in .env", file=sys.stderr)
+        return
     
     have_snapshot = set()  # sids with snapshot
 
