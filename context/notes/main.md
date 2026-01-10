@@ -25,6 +25,10 @@ docker compose -f docker-compose.yml -f docker-compose.mm.yml rm -f kalshi_mm_en
 docker restart
 
 # Docker clickhouse query
+1) Fast helper function (run on EC2)
+chq() { docker exec -i clickhouse clickhouse-client --query "$1"; }
+
+
 docker exec -it clickhouse clickhouse-client   --user default --password default_password --database kalshi --query 
 
 ## Logging files and info
