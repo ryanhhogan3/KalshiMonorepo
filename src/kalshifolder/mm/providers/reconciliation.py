@@ -2,6 +2,7 @@ import logging
 from typing import Optional, Dict, Any
 import time
 from ..utils.id import uuid4_hex
+from ..utils.logging import json_msg
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,19 @@ class ReconciliationService:
         }
 
     def _normalize_fill(self, f: Dict[str, Any]) -> Dict[str, Any]:
+        # Extract size/count from fill
+        # Kalshi API uses 'count' for number of contracts
+        size = f.get('count') or f.get('size') or f.get('qty') or 0
+        try:
+            size = float(size)
+        except (ValueError, TypeError):
+            size = 0.0
+        
+        # Skip fills with 0 or negative size
+        if size <= 0:
+            logger.debug(json_msg({"event": "fill_skipped_zero_size", "exchange_order_id": f.get('exchange_order_id'), "size": size}))
+            return None
+        
         return {
             'ts': int(f.get('ts') or f.get('timestamp') or int(time.time() * 1000)),
             'market_ticker': f.get('market_ticker') or f.get('market') or f.get('marketTicker'),
@@ -33,7 +47,7 @@ class ReconciliationService:
             'client_order_id': f.get('client_order_id') or f.get('clientOrderId') or f.get('client_id'),
             'side': f.get('side'),
             'price_cents': int(f.get('price') or f.get('price_cents') or 0),
-            'size': float(f.get('size') or 0),
+            'size': size,  # Now using count field instead of size
             'raw': f,
         }
 
@@ -171,24 +185,51 @@ class ReconciliationService:
 
         if not fills:
             return []
+        
+        # DEBUG: Log first fill JSON structure for field mapping validation
+        if fills:
+            logger.info(json_msg({"event": "raw_fill_sample", "fill": fills[0], "fill_keys": list(fills[0].keys())}))
 
         norm_fills = [self._normalize_fill(f) for f in fills]
+        # Filter out None values (skipped fills with zero size)
+        norm_fills = [f for f in norm_fills if f is not None]
+        
+        if not norm_fills:
+            return []
+        
+        # Get engine metadata for fills
+        engine_instance_id = getattr(self.engine, 'state', None) and getattr(self.engine.state, 'instance_id', '') or ''
+        engine_version = getattr(self.engine, 'state', None) and getattr(self.engine.state, 'version', 'dev') or 'dev'
+        
         # write to CH
         if self.ch:
             rows = []
             for f in norm_fills:
+                # Look up decision_id from engine's order registries
+                decision_id = None
+                if self.engine:
+                    exch_id = f.get('exchange_order_id')
+                    if exch_id and exch_id in self.engine.state.order_by_exchange_id:
+                        order_ref = self.engine.state.order_by_exchange_id[exch_id]
+                        decision_id = order_ref.decision_id
+                
                 rows.append({
                     'ts': time.strftime('%Y-%m-%d %H:%M:%S'),
+                    'engine_instance_id': engine_instance_id,
+                    'engine_version': engine_version,
                     'market_ticker': f['market_ticker'],
                     'exchange_order_id': f['exchange_order_id'],
                     'client_order_id': f['client_order_id'],
                     'side': f['side'],
                     'price_cents': f['price_cents'],
                     'size': f['size'],
-                    'raw': str(f['raw']),
+                    'decision_id': decision_id,
+                    'raw_json': str(f['raw']),
                 })
             try:
                 self.ch.insert('mm_fills', rows)
+                if rows:
+                    logger.info(json_msg({"event": "fills_ingested", "count": len(rows), "with_decision_id": sum(1 for r in rows if r.get('decision_id'))}))
             except Exception:
                 logger.exception('failed to write fills')
 
