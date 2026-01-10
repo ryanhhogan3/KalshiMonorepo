@@ -26,6 +26,8 @@ services:
 
       # --- Markets to quote ---
       MM_MARKETS: ${MM_MARKETS}
+      MM_MARKETS_FILE: ${MM_MARKETS_FILE:-/app/config/markets.txt}
+      MM_MARKETS_RELOAD_SECS: ${MM_MARKETS_RELOAD_SECS:-5}
 
       # --- Staleness / loop ---
       MM_POLL_MS: ${MM_POLL_MS:-250}
@@ -34,7 +36,7 @@ services:
       MM_KILL_ON_STALE: ${MM_KILL_ON_STALE:-0}
 
       # --- Trading safety defaults (paper-first) ---
-      MM_TRADING_ENABLED: ${MM_TRADING_ENABLED:-1}
+      MM_TRADING_ENABLED: ${MM_TRADING_ENABLED:-0}
       MM_SIZE: ${MM_SIZE:-1}
       MM_EDGE_TICKS: ${MM_EDGE_TICKS:-1}
       MM_MAX_POS: ${MM_MAX_POS:-1}
