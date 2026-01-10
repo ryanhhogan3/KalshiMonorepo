@@ -4,7 +4,7 @@ import logging
 import time
 import csv
 import io
-from typing import Dict
+from typing import Dict, Set
 import json
 from .config import load_config_from_env
 from .storage.ch_writer import ClickHouseWriter
@@ -18,6 +18,7 @@ from .risk.limits import RiskManager
 from .utils.id import uuid4_hex
 from .utils.time import now_ms
 from .utils.logging import setup_logging, json_msg
+from .market_selector import MarketSelector
 from collections import deque
 from datetime import datetime, timezone
 import requests
@@ -144,6 +145,11 @@ class Engine:
         self.last_sent: Dict[str, dict] = {}
         self.reject_window_s = int(os.getenv("MM_REJECT_WINDOW_S", "60"))
         self.reject_times = deque()  # store epoch seconds of rejects (global)
+        
+        # Initialize MarketSelector for hot-reload support
+        reload_secs = int(os.getenv('MM_MARKETS_RELOAD_SECS', '5'))
+        self.market_selector = MarketSelector(reload_secs=reload_secs)
+        self._last_active_markets: Set[str] = set()
 
     def _get_exchange_pos_by_ticker(self) -> dict:
         """Fetch current positions from exchange and return as dict keyed by ticker."""
@@ -252,8 +258,143 @@ class Engine:
                 logger.exception('recon loop failed')
             await asyncio.sleep(10)
 
+    def _check_and_apply_not_found_circuit_breaker(self, market: str, reject_reason: str, mr) -> bool:
+        """
+        Circuit breaker for not_found errors: if a market gets >= N not_found rejects
+        in a short window, auto-disable it for 1 hour.
+        Returns True if market is currently disabled, False otherwise.
+        """
+        now = now_ms()
+        
+        # Check if disabled and not yet expired
+        if mr.disabled_until_ms is not None and now < mr.disabled_until_ms:
+            return True  # Still disabled
+        elif mr.disabled_until_ms is not None and now >= mr.disabled_until_ms:
+            # Expiration time reached; re-enable
+            mr.disabled_until_ms = None
+            mr.not_found_count = 0
+            mr.not_found_window_start_ms = None
+            logger.info(json_msg({
+                "event": "not_found_circuit_breaker_reset",
+                "market": market,
+                "reason": "disable_duration_expired"
+            }))
+            return False
+        
+        # Check if this reject is "not_found"
+        if reject_reason and 'not_found' in reject_reason.lower():
+            # Initialize window if needed
+            if mr.not_found_window_start_ms is None:
+                mr.not_found_window_start_ms = now
+                mr.not_found_count = 1
+            else:
+                # Check if still in window (60 seconds)
+                if now - mr.not_found_window_start_ms <= 60_000:
+                    mr.not_found_count += 1
+                else:
+                    # Window expired; reset
+                    mr.not_found_window_start_ms = now
+                    mr.not_found_count = 1
+            
+            # Trigger circuit breaker if count >= N (default 3)
+            not_found_threshold = int(os.getenv('MM_NOT_FOUND_THRESHOLD', '3'))
+            if mr.not_found_count >= not_found_threshold:
+                # Disable for 1 hour
+                disable_duration_ms = int(os.getenv('MM_NOT_FOUND_DISABLE_MS', 3600_000))
+                mr.disabled_until_ms = now + disable_duration_ms
+                
+                logger.error(json_msg({
+                    "event": "not_found_circuit_breaker_triggered",
+                    "market": market,
+                    "not_found_count": mr.not_found_count,
+                    "window_ms": now - mr.not_found_window_start_ms,
+                    "disable_until_ms": mr.disabled_until_ms,
+                }))
+                
+                # Cancel working orders if trading enabled
+                if self.config.trading_enabled:
+                    try:
+                        if mr.working_bid and mr.working_bid.exchange_order_id and not mr.working_bid.exchange_order_id.startswith('SIMULATED:'):
+                            self.exec.cancel_order(mr.working_bid.exchange_order_id)
+                        if mr.working_ask and mr.working_ask.exchange_order_id and not mr.working_ask.exchange_order_id.startswith('SIMULATED:'):
+                            self.exec.cancel_order(mr.working_ask.exchange_order_id)
+                    except Exception as e:
+                        logger.error(f"Failed to cancel orders during circuit breaker activation for {market}: {e}")
+                
+                mr.working_bid = None
+                mr.working_ask = None
+                return True
+        
+        return False
+
+    def _apply_market_diffs(self, removed_markets: Set[str], added_markets: Set[str]) -> None:
+        """
+        Handle changes in active market set:
+        - For removed markets: cancel orders (if live) and clear state
+        - For added markets: initialize state if needed
+        """
+        # Handle removed markets
+        for m in removed_markets:
+            logger.warning(f"market_removed: {m}")
+            mr = self.store.get_market(m)
+            
+            # Cancel working orders if trading enabled
+            if self.config.trading_enabled:
+                try:
+                    # Cancel bid
+                    if mr.working_bid and mr.working_bid.exchange_order_id:
+                        try:
+                            cancel_id = mr.working_bid.exchange_order_id
+                            if not cancel_id.startswith('SIMULATED:'):
+                                self.exec.cancel_order(cancel_id)
+                                logger.info(json_msg({"event": "market_removal_cancel_bid", "market": m, "exchange_order_id": cancel_id}))
+                        except Exception as e:
+                            logger.error(f"Failed to cancel bid for {m}: {e}")
+                    
+                    # Cancel ask
+                    if mr.working_ask and mr.working_ask.exchange_order_id:
+                        try:
+                            cancel_id = mr.working_ask.exchange_order_id
+                            if not cancel_id.startswith('SIMULATED:'):
+                                self.exec.cancel_order(cancel_id)
+                                logger.info(json_msg({"event": "market_removal_cancel_ask", "market": m, "exchange_order_id": cancel_id}))
+                        except Exception as e:
+                            logger.error(f"Failed to cancel ask for {m}: {e}")
+                except Exception as e:
+                    logger.error(f"Error cancelling orders for removed market {m}: {e}")
+            
+            # Clear working orders from state
+            mr.working_bid = None
+            mr.working_ask = None
+            
+            # Clear order registries for this market
+            to_remove_exchange_ids = [oid for oid, oref in self.state.order_by_exchange_id.items() if oref.market_ticker == m]
+            to_remove_client_ids = [cid for cid, oref in self.state.order_by_client_id.items() if oref.market_ticker == m]
+            
+            for oid in to_remove_exchange_ids:
+                del self.state.order_by_exchange_id[oid]
+            for cid in to_remove_client_ids:
+                del self.state.order_by_client_id[cid]
+            
+            logger.info(json_msg({"event": "market_state_cleared", "market": m, "registry_exchange_ids_removed": len(to_remove_exchange_ids), "registry_client_ids_removed": len(to_remove_client_ids)}))
+        
+        # Handle added markets (no action needed; state will be initialized on first loop)
+        for m in added_markets:
+            logger.info(f"market_added: {m}")
+            # Just ensure the lock exists
+            if m not in self.market_locks:
+                self.market_locks[m] = asyncio.Lock()
+
     async def run_once(self):
-        markets = self.config.markets
+        # Hot-reload: check for market set changes
+        active_markets = self.market_selector.get_active_markets()
+        if active_markets != self._last_active_markets:
+            removed = self._last_active_markets - active_markets
+            added = active_markets - self._last_active_markets
+            self._apply_market_diffs(removed, added)
+            self._last_active_markets = active_markets
+        
+        markets = list(active_markets) if active_markets else self.config.markets
         tick_size = 0.01
         
         # Fetch exchange positions once per cycle
@@ -462,6 +603,15 @@ class Engine:
 
             target = _Target(bid_px=bid_px, ask_px=ask_px, bid_sz=float(self.config.size), ask_sz=float(self.config.size))
             allowed, reason = self.risk.check_market(mr)
+            
+            # Check if market is disabled by circuit breaker
+            if mr.disabled_until_ms is not None and now < mr.disabled_until_ms:
+                logger.warning(json_msg({
+                    "event": "quote_skip_circuit_breaker_disabled",
+                    "market": m,
+                    "disabled_until_ms": mr.disabled_until_ms,
+                }))
+                continue
 
             logger.info(json_msg({
                 "event": "quote_eval",
@@ -663,6 +813,11 @@ class Engine:
 
                             if status != 'ACK':
                                 if self.config.trading_enabled:
+                                    # Check circuit breaker for not_found
+                                    if self._check_and_apply_not_found_circuit_breaker(m, reject_reason, mr):
+                                        logger.warning(json_msg({"event": "place_skip_circuit_breaker_active", "market": m, "side": "BID"}))
+                                        continue
+                                    
                                     # 2s cooldown per reject per market (tune)
                                     mr.cooldown_until_ms = now_ms() + 2000
                                     mr.rejects_rolling_counter += 1
@@ -853,6 +1008,11 @@ class Engine:
                             
                             if status != 'ACK':
                                 if self.config.trading_enabled:
+                                    # Check circuit breaker for not_found
+                                    if self._check_and_apply_not_found_circuit_breaker(m, reject_reason, mr):
+                                        logger.warning(json_msg({"event": "place_skip_circuit_breaker_active", "market": m, "side": "ASK"}))
+                                        continue
+                                    
                                     # 2s cooldown per reject per market (tune)
                                     mr.cooldown_until_ms = now_ms() + 2000
                                     mr.rejects_rolling_counter += 1
