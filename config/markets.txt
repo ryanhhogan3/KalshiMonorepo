@@ -1,0 +1,9 @@
+# Kalshi markets to quote
+# Edit this file to add/remove markets; engine reloads every ~5 seconds
+# Blank lines and # comments ignored
+
+# Example formats:
+# KXHIGHMIA-26JAN10-B81.5
+
+
+# Add your markets below (one per line):
