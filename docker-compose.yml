@@ -36,8 +36,11 @@ services:
       PROD_KEYID: ${PROD_KEYID}
       PROD_KEYFILE: /run/secrets/prod_keys.pem
 
-      # Markets
+      # Markets (read from shared markets.txt file, or fall back to MARKET_TICKERS)
+      MM_MARKETS_FILE: ${MM_MARKETS_FILE:-/app/config/markets.txt}
       MARKET_TICKERS: ${MARKET_TICKERS}
+      # Optional: additional markets for streamer only (e.g., analytics/research)
+      STREAMER_EXTRA_MARKETS: ${STREAMER_EXTRA_MARKETS:-}
 
       # WebSocket
       WS_URL: ${WS_URL:-wss://api.elections.kalshi.com/trade-api/ws/v2}
