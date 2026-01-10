@@ -10,6 +10,14 @@ services:
       CLICKHOUSE_DB: kalshi
       CLICKHOUSE_USER: default
       CLICKHOUSE_PASSWORD: default_password
+      MAX_MEMORY_USAGE: 5000000000
+      MAX_MEMORY_USAGE_FOR_ALL_QUERIES: 20000000000
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 6G
     volumes:
       - clickhouse_data:/var/lib/clickhouse
       - ./src/databases/storage/clickhouse_ddl.sql:/docker-entrypoint-initdb.d/init.sql
