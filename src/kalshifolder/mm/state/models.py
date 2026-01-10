@@ -48,6 +48,10 @@ class MarketRuntimeState:
     last_exchange_ts_ms: Optional[int] = None
     # Optional human-readable stale reason (e.g. 'age' or other)
     stale_reason: Optional[str] = None
+    # Circuit breaker: disable market if not_found spike detected
+    disabled_until_ms: Optional[int] = None  # None if not disabled, else timestamp when disabled state expires
+    not_found_window_start_ms: Optional[int] = None
+    not_found_count: int = 0
 
 
 @dataclass
