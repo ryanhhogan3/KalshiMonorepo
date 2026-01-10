@@ -147,6 +147,8 @@ class Engine:
         self.reject_times = deque()  # store epoch seconds of rejects (global)
         
         # Initialize MarketSelector for hot-reload support
+        self.market_selector = MarketSelector()
+        self._last_active_markets: Set[str] = set()
         reload_secs = int(os.getenv('MM_MARKETS_RELOAD_SECS', '5'))
         self.market_selector = MarketSelector(reload_secs=reload_secs)
         self._last_active_markets: Set[str] = set()
@@ -380,10 +382,22 @@ class Engine:
         
         # Handle added markets (no action needed; state will be initialized on first loop)
         for m in added_markets:
-            logger.info(f"market_added: {m}")
+            logger.info(json_msg({"event": "market_added", "market": m}))
             # Just ensure the lock exists
             if m not in self.market_locks:
                 self.market_locks[m] = asyncio.Lock()
+
+    async def _apply_market_diffs_async(self, added_markets: Set[str]) -> None:
+        """
+        Async handler for market additions - subscribe to new markets on WebSocket
+        """
+        for m in added_markets:
+            if getattr(self, '_md_source', None) == 'ws' and self.md and hasattr(self.md, 'rt') and self.md.rt:
+                try:
+                    await self.md.rt.subscribe_markets([m])
+                    logger.info(json_msg({"event": "market_added_ws_subscribed", "market": m}))
+                except Exception as e:
+                    logger.error(json_msg({"event": "market_added_ws_subscribe_failed", "market": m, "error": str(e)}))
 
     async def run_once(self):
         # Hot-reload: check for market set changes
@@ -392,6 +406,9 @@ class Engine:
             removed = self._last_active_markets - active_markets
             added = active_markets - self._last_active_markets
             self._apply_market_diffs(removed, added)
+            # Handle async WebSocket resubscription for added markets
+            if added:
+                await self._apply_market_diffs_async(added)
             self._last_active_markets = active_markets
         
         markets = list(active_markets) if active_markets else self.config.markets
@@ -1183,6 +1200,12 @@ class Engine:
                     logger.exception("startup cancel all failed for market %s", m)
         # Start market data provider and wait for initial BBOs where applicable
         try:
+            # Get initial markets from MarketSelector (config file or env var)
+            initial_markets = list(self.market_selector.get_active_markets())
+            if not initial_markets:
+                # Fallback to config.markets if selector returns empty
+                initial_markets = self.config.markets
+                
             # instantiate lazy WS provider if requested
             if getattr(self, '_md_source', None) == 'ws' and not self.md:
                 try:
@@ -1194,15 +1217,15 @@ class Engine:
                     logger.exception('failed_to_instantiate_ws_provider')
             if self.md:
                 try:
-                    await self.md.start(self.config.markets)
+                    await self.md.start(initial_markets)
                 except TypeError:
                     # older providers may not accept markets param
                     await self.md.start()
             wait_ms = int(os.getenv('MM_MD_WAIT_MS', '5000'))
             if hasattr(self.md, 'wait_ready'):
-                ok = await self.md.wait_ready(self.config.markets, timeout_s=(wait_ms / 1000.0))
+                ok = await self.md.wait_ready(initial_markets, timeout_s=(wait_ms / 1000.0))
             elif hasattr(self.md, 'wait_for_initial_bbo'):
-                ok = await self.md.wait_for_initial_bbo(self.config.markets, timeout_ms=wait_ms)
+                ok = await self.md.wait_for_initial_bbo(initial_markets, timeout_ms=wait_ms)
                 if not ok:
                     logger.warning('md provider did not provide initial BBOs within timeout')
         except Exception:
