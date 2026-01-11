@@ -296,53 +296,130 @@ class ReconciliationService:
                             logger.exception('failed cancelling duplicate')
 
     def fetch_and_apply_fills(self):
-        fills = []
+        """
+        Fetch fills from Kalshi API and insert ONLY real fills into ClickHouse.
+        
+        Strict predicate: A fill must have ALL of:
+        - order_id / exchange_order_id
+        - ts / timestamp
+        - count (contract count)
+        - yes_price or no_price or price (for price_cents)
+        - Computed price_cents in [1, 99]
+        
+        Logging at each stage:
+        - n_api: Fills returned by API
+        - n_raw: After defensive type/shape handling
+        - n_real: After applying "real fill" predicate
+        - n_valid: After _normalize_fill() validation
+        - n_inserted: After ClickHouse insertion
+        """
+        
+        # Stage 0: Call API
+        fills_raw = []
         try:
-            fills = self.exec.get_fills(self._last_fills_ts) or []
+            fills_raw = self.exec.get_fills(self._last_fills_ts) or []
         except Exception:
             logger.exception('get_fills failed')
             return []
-
-        # Defensive normalization: ensure fills is a list of dicts
-        # get_fills() should return a list, but handle dict responses from API
-        if isinstance(fills, dict):
-            # Extract fills array from dict (handle various API response formats)
-            fills = fills.get("fills") or fills.get("data") or fills.get("items") or []
         
-        if isinstance(fills, str):
-            logger.error("get_fills returned str; dropping: %r", fills[:200])
-            fills = []
-        elif not isinstance(fills, list):
-            logger.error("get_fills returned %s; expected list", type(fills))
-            fills = []
+        n_api = len(fills_raw) if isinstance(fills_raw, (list, tuple)) else 0
+        
+        # Stage 1: Defensive normalization (ensure list of dicts)
+        if isinstance(fills_raw, dict):
+            # Extract fills array from dict
+            fills_raw = fills_raw.get("fills") or fills_raw.get("data") or fills_raw.get("items") or []
+        
+        if isinstance(fills_raw, str):
+            logger.error("get_fills returned str; dropping: %r", fills_raw[:200])
+            fills_raw = []
+        elif not isinstance(fills_raw, list):
+            logger.error("get_fills returned %s; expected list", type(fills_raw))
+            fills_raw = []
         
         # Ensure all items are dicts
-        fills = [f for f in fills if isinstance(f, dict)]
-
-        if not fills:
+        fills_raw = [f for f in fills_raw if isinstance(f, dict)]
+        n_raw = len(fills_raw)
+        
+        if n_api == 0:
             return []
         
-        # DEBUG: Fill source sanity check (once per batch)
-        if fills:
-            first_item = fills[0]
+        # Stage 2: Fill source sanity check
+        if fills_raw:
+            first_item = fills_raw[0]
             logger.info(json_msg({
                 "event": "fill_source_sanity",
-                "batch_size": len(fills),
-                "item_type": type(first_item).__name__,
+                "n_api": n_api,
+                "n_raw": n_raw,
                 "item_keys": list(first_item.keys()),
                 "has_fill_id": "fill_id" in first_item or "trade_id" in first_item,
                 "has_order_id": "order_id" in first_item or "orderId" in first_item,
                 "has_count": "count" in first_item,
                 "has_price_fields": any(k in first_item for k in ["price", "yes_price", "no_price"]),
+                "has_ts": "ts" in first_item or "timestamp" in first_item,
+            }))
+            logger.info(json_msg({"event": "raw_fill_sample", "fill": first_item}))
+        
+        # Stage 3: Apply "real fill" predicate
+        # CRITICAL: Only process fills that have the essential fields of a REAL fill
+        fills_real = []
+        for f in fills_raw:
+            # Must have order_id
+            if not (f.get('order_id') or f.get('orderId') or f.get('id')):
+                logger.debug("Fill dropped: missing order_id")
+                continue
+            
+            # Must have timestamp
+            if not (f.get('ts') or f.get('timestamp') or f.get('time')):
+                logger.debug("Fill dropped: missing timestamp")
+                continue
+            
+            # Must have count (number of contracts)
+            if not f.get('count') and f.get('count') != 0:
+                logger.debug("Fill dropped: missing count")
+                continue
+            
+            # Must have price information (from side-specific or float price)
+            has_price = any(k in f for k in ['price', 'yes_price', 'no_price'])
+            if not has_price:
+                logger.debug("Fill dropped: missing price fields")
+                continue
+            
+            # Looks like a real fill
+            fills_real.append(f)
+        
+        n_real = len(fills_real)
+        
+        # Log the predicate filter result
+        if n_api != n_real:
+            logger.warning(json_msg({
+                "event": "fill_predicate_filtered",
+                "n_api": n_api,
+                "n_raw": n_raw,
+                "n_real": n_real,
+                "dropped_by_predicate": n_raw - n_real,
             }))
         
-        # DEBUG: Log first fill JSON structure for field mapping validation
-        if fills:
-            logger.info(json_msg({"event": "raw_fill_sample", "fill": fills[0], "fill_keys": list(fills[0].keys())}))
-
-        norm_fills = [self._normalize_fill(f) for f in fills]
-        # Filter out None values (skipped fills with zero size, invalid price, missing fields)
+        if not fills_real:
+            logger.info(json_msg({
+                "event": "no_real_fills",
+                "n_api": n_api,
+                "n_raw": n_raw,
+            }))
+            return []
+        
+        # Stage 4: Normalize and validate
+        norm_fills = [self._normalize_fill(f) for f in fills_real]
         norm_fills = [f for f in norm_fills if f is not None]
+        n_valid = len(norm_fills)
+        
+        # Log normalization results
+        if n_real != n_valid:
+            logger.info(json_msg({
+                "event": "fill_normalization_filtered",
+                "n_real": n_real,
+                "n_valid": n_valid,
+                "dropped_by_validation": n_real - n_valid,
+            }))
         
         if not norm_fills:
             return []
@@ -351,8 +428,7 @@ class ReconciliationService:
         engine_instance_id = getattr(self.engine, 'state', None) and getattr(self.engine.state, 'instance_id', '') or ''
         engine_version = getattr(self.engine, 'state', None) and getattr(self.engine.state, 'version', 'dev') or 'dev'
         
-        # STRICT VALIDATION GATES (before insert)
-        # These are final checks to prevent bad data reaching ClickHouse
+        # Stage 5: Final strict validation gates before insert
         rows = []
         dropped_count = 0
         first_invalid_sample = None
@@ -368,8 +444,7 @@ class ReconciliationService:
             # Gate 2: fill_id non-empty (or compute it)
             fill_id = f.get('fill_id')
             if not fill_id:
-                # Compute synthetic fill_id as hash(order_id + side + price + size + ts)
-                # This prevents duplicate inserts of same fill if API returns duplicates
+                # Compute synthetic fill_id as hash
                 import hashlib
                 fill_hash = hashlib.md5(f"{f['exchange_order_id']}:{f['side']}:{f['price_cents']}:{f['size']}:{f['ts']}".encode()).hexdigest()
                 fill_id = fill_hash
@@ -404,7 +479,6 @@ class ReconciliationService:
                 continue
             
             # All gates passed, build row for insert
-            # Look up decision_id from engine's order registries
             decision_id = None
             if self.engine:
                 exch_id = f.get('exchange_order_id')
@@ -424,30 +498,44 @@ class ReconciliationService:
                 'price_cents': f['price_cents'],
                 'size': f['size'],
                 'decision_id': decision_id,
-                'fill_id': f.get('fill_id'),
+                'fill_id': fill_id,
                 'raw_json': str(f['raw']),
             })
         
-        # Log drop stats
+        n_inserted = len(rows)
+        
+        # Log insertion stats
         if dropped_count > 0:
             logger.warning(json_msg({
-                "event": "fills_dropped_invalid",
+                "event": "fills_dropped_invalid_gates",
                 "count": dropped_count,
-                "total_received": len(norm_fills),
+                "total_after_validation": len(norm_fills),
                 "first_invalid": first_invalid_sample,
             }))
+        
+        # Final comprehensive log
+        logger.info(json_msg({
+            "event": "fill_pipeline_stats",
+            "n_api": n_api,
+            "n_raw": n_raw,
+            "n_real": n_real,
+            "n_valid": n_valid,
+            "n_inserted": n_inserted,
+            "predicate_pass_rate": f"{100.0 * n_real / max(n_api, 1):.1f}%",
+            "validation_pass_rate": f"{100.0 * n_valid / max(n_real, 1):.1f}%",
+            "gate_pass_rate": f"{100.0 * n_inserted / max(n_valid, 1):.1f}%",
+        }))
         
         # Write to ClickHouse
         if self.ch and rows:
             try:
                 self.ch.insert('mm_fills', rows)
-                if rows:
-                    logger.info(json_msg({
-                        "event": "fills_ingested",
-                        "count": len(rows),
-                        "with_decision_id": sum(1 for r in rows if r.get('decision_id')),
-                        "with_side": sum(1 for r in rows if r.get('side')),
-                    }))
+                logger.info(json_msg({
+                    "event": "fills_ingested",
+                    "count": len(rows),
+                    "with_decision_id": sum(1 for r in rows if r.get('decision_id')),
+                    "with_side": sum(1 for r in rows if r.get('side')),
+                }))
             except Exception:
                 logger.exception('failed to write fills')
 

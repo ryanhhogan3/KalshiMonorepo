@@ -57,6 +57,62 @@ class ClickHouseWriter:
             if not cleaned:
                 continue
             self._exec(cleaned)
+        
+        # Apply schema migrations (column additions, etc.)
+        self._apply_schema_migrations()
+
+    def _apply_schema_migrations(self):
+        """Apply column additions and other migrations that CREATE TABLE IF NOT EXISTS doesn't handle."""
+        try:
+            # Ensure mm_fills has required columns
+            self._ensure_column('mm_fills', 'fill_id', 'String')
+            self._ensure_column('mm_fills', 'action', 'String')
+            
+            # Log current schema for debugging
+            result = self._exec_and_read(f"DESCRIBE TABLE {self.database}.mm_fills")
+            if result:
+                columns = [row.split('\t')[0] for row in result.strip().split('\n')]
+                logger.info(f"mm_fills columns: {columns}")
+        except Exception as e:
+            logger.warning(f"Schema migration warning (non-blocking): {e}")
+
+    def _ensure_column(self, table: str, column: str, column_type: str):
+        """Add a column to a table if it doesn't already exist."""
+        try:
+            # Check if column exists
+            result = self._exec_and_read(f"SELECT 1 FROM {self.database}.{table} WHERE 1=0 LIMIT 0")
+            
+            # Try to read the column - if it fails, column doesn't exist
+            try:
+                self._exec(f"SELECT {column} FROM {self.database}.{table} LIMIT 0")
+                # Column exists, nothing to do
+                logger.debug(f"{table}.{column} already exists")
+                return
+            except:
+                # Column doesn't exist, add it
+                alter_stmt = f"ALTER TABLE {self.database}.{table} ADD COLUMN {column} {column_type}"
+                logger.info(f"Running migration: {alter_stmt}")
+                self._exec(alter_stmt)
+                logger.info(f"Successfully added {table}.{column} ({column_type})")
+        except Exception as e:
+            logger.warning(f"Failed to ensure {table}.{column}: {e}")
+
+    def _exec_and_read(self, sql: str, timeout: int = 10) -> str:
+        """Execute SQL and return result as string."""
+        q = sql
+        req_params = {"database": self.database}
+        if self.user:
+            req_params["user"] = self.user
+        if self.pwd:
+            req_params["password"] = self.pwd
+
+        try:
+            resp = requests.get(self.url, params=req_params, data=q.encode("utf-8"), timeout=timeout)
+            resp.raise_for_status()
+            return resp.text
+        except requests.RequestException as e:
+            logger.error(f"CH read error: {e}")
+            raise
 
 
     def insert(self, table: str, csv_rows: str):
