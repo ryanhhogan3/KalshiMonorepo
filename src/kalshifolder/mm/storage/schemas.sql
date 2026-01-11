@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS mm_fills (
   size Float64,
   fee Float64,
   decision_id UUID,
+  fill_id String,
   raw_json String
 ) ENGINE = MergeTree()
 PARTITION BY toDate(ts)

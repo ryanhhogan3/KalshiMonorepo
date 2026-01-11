@@ -27,7 +27,54 @@ class ReconciliationService:
         }
 
     def _normalize_fill(self, f: Dict[str, Any]) -> Dict[str, Any]:
-        # Extract size/count from fill
+        """
+        Normalize a fill from Kalshi API to canonical schema.
+        
+        CANONICAL FIELD MAPPING:
+        - fill_id: fill_id or trade_id
+        - exchange_order_id: order_id or orderId
+        - size: count or size or qty
+        - price_cents: Use side-specific (yes_price if side=yes, no_price if side=no), 
+                       fallback to float price * 100
+        - timestamp_ms: ts (seconds) * 1000
+        - side: yes/no
+        - market_ticker: market_ticker or market or ticker
+        """
+        
+        # 1. Extract and validate exchange_order_id (CRITICAL for reconciliation)
+        exchange_order_id = f.get('exchange_order_id') or f.get('order_id') or f.get('orderId') or f.get('id')
+        if not exchange_order_id or not str(exchange_order_id).strip():
+            logger.warning(json_msg({
+                "event": "fill_skipped_missing_order_id",
+                "raw_keys": list(f.keys()),
+            }))
+            return None
+        
+        # 2. Extract and validate fill_id (for idempotency)
+        fill_id = f.get('fill_id') or f.get('trade_id') or None
+        if not fill_id:
+            logger.debug(json_msg({"event": "fill_missing_id", "exchange_order_id": exchange_order_id}))
+        
+        # 3. Extract side (yes/no)
+        side = f.get('side')
+        if not side:
+            logger.warning(json_msg({
+                "event": "fill_skipped_missing_side",
+                "exchange_order_id": exchange_order_id,
+            }))
+            return None
+        
+        # Normalize side
+        side = side.lower().strip()
+        if side not in ('yes', 'no'):
+            logger.warning(json_msg({
+                "event": "fill_skipped_invalid_side",
+                "exchange_order_id": exchange_order_id,
+                "side": side,
+            }))
+            return None
+        
+        # 4. Extract size/count from fill
         # Kalshi API uses 'count' for number of contracts
         size = f.get('count') or f.get('size') or f.get('qty') or 0
         try:
@@ -37,55 +84,60 @@ class ReconciliationService:
         
         # Skip fills with 0 or negative size
         if size <= 0:
-            logger.debug(json_msg({"event": "fill_skipped_zero_size", "exchange_order_id": f.get('exchange_order_id'), "size": size}))
+            logger.debug(json_msg({
+                "event": "fill_skipped_zero_size",
+                "exchange_order_id": exchange_order_id,
+                "size": size,
+            }))
             return None
         
-        # Extract price_cents
-        # Kalshi API returns 'price' as float (0.01 to 0.99), not cents!
-        # Also provides yes_price/no_price as fallback (already in cents)
+        # 5. Extract price_cents (NON-NEGOTIABLE: SIDE-SPECIFIC MAPPING)
+        # Kalshi API provides:
+        #   - price: float (0.99) <- universal, but needs conversion
+        #   - yes_price: int cents for YES side
+        #   - no_price: int cents for NO side
+        # RULE: Prefer side-specific price, fallback to float->cents conversion
         price_cents = 0
-        price_float = f.get('price')
-        if price_float is not None:
-            try:
-                price_cents = int(float(price_float) * 100)
-            except (ValueError, TypeError):
-                price_cents = 0
         
-        # Fallback: try yes_price or no_price (already in cents)
-        if price_cents == 0:
+        # Primary: use side-specific price (most reliable)
+        if side == 'yes':
             yes_price = f.get('yes_price')
-            no_price = f.get('no_price')
             if yes_price is not None:
                 try:
                     price_cents = int(yes_price)
                 except (ValueError, TypeError):
-                    pass
-            elif no_price is not None:
+                    price_cents = 0
+        else:  # side == 'no'
+            no_price = f.get('no_price')
+            if no_price is not None:
                 try:
                     price_cents = int(no_price)
                 except (ValueError, TypeError):
-                    pass
+                    price_cents = 0
+        
+        # Fallback: convert float price (dollars) to cents
+        if price_cents == 0:
+            price_float = f.get('price')
+            if price_float is not None:
+                try:
+                    price_cents = int(float(price_float) * 100)
+                except (ValueError, TypeError):
+                    price_cents = 0
         
         # Hard validity gate: price_cents must be in [1, 99]
         if price_cents < 1 or price_cents > 99:
             logger.warning(json_msg({
                 "event": "fill_skipped_invalid_price",
-                "exchange_order_id": f.get('exchange_order_id') or f.get('order_id'),
+                "exchange_order_id": exchange_order_id,
+                "side": side,
                 "price_cents": price_cents,
                 "price_raw": f.get('price'),
+                "yes_price_raw": f.get('yes_price'),
+                "no_price_raw": f.get('no_price'),
             }))
             return None
         
-        # Hard validity gate: exchange_order_id must be set
-        exchange_order_id = f.get('exchange_order_id') or f.get('order_id') or f.get('id')
-        if not exchange_order_id:
-            logger.warning(json_msg({
-                "event": "fill_skipped_missing_order_id",
-                "raw_keys": list(f.keys()),
-            }))
-            return None
-        
-        # Extract timestamp from payload (must come from API, not now())
+        # 6. Extract timestamp from payload (must come from API, not now())
         # Kalshi API returns 'ts' in SECONDS, convert to milliseconds
         ts = f.get('ts') or f.get('timestamp') or f.get('time') or f.get('created_at')
         if not ts:
@@ -108,12 +160,23 @@ class ReconciliationService:
             }))
             return None
         
+        # 7. Extract market_ticker
+        market_ticker = f.get('market_ticker') or f.get('market') or f.get('ticker')
+        if not market_ticker:
+            logger.warning(json_msg({
+                "event": "fill_skipped_missing_market",
+                "exchange_order_id": exchange_order_id,
+            }))
+            return None
+        
+        # 8. Build normalized fill dict
         return {
+            'fill_id': fill_id,
             'ts': ts,
-            'market_ticker': f.get('market_ticker') or f.get('market') or f.get('ticker'),
+            'market_ticker': market_ticker,
             'exchange_order_id': exchange_order_id,
             'client_order_id': f.get('client_order_id') or f.get('clientOrderId') or f.get('client_id'),
-            'side': f.get('side'),  # 'yes' or 'no'
+            'side': side,  # 'yes' or 'no'
             'price_cents': price_cents,
             'size': size,
             'raw': f,
@@ -259,6 +322,20 @@ class ReconciliationService:
         if not fills:
             return []
         
+        # DEBUG: Fill source sanity check (once per batch)
+        if fills:
+            first_item = fills[0]
+            logger.info(json_msg({
+                "event": "fill_source_sanity",
+                "batch_size": len(fills),
+                "item_type": type(first_item).__name__,
+                "item_keys": list(first_item.keys()),
+                "has_fill_id": "fill_id" in first_item or "trade_id" in first_item,
+                "has_order_id": "order_id" in first_item or "orderId" in first_item,
+                "has_count": "count" in first_item,
+                "has_price_fields": any(k in first_item for k in ["price", "yes_price", "no_price"]),
+            }))
+        
         # DEBUG: Log first fill JSON structure for field mapping validation
         if fills:
             logger.info(json_msg({"event": "raw_fill_sample", "fill": fills[0], "fill_keys": list(fills[0].keys())}))
@@ -274,31 +351,94 @@ class ReconciliationService:
         engine_instance_id = getattr(self.engine, 'state', None) and getattr(self.engine.state, 'instance_id', '') or ''
         engine_version = getattr(self.engine, 'state', None) and getattr(self.engine.state, 'version', 'dev') or 'dev'
         
-        # write to CH
-        if self.ch:
-            rows = []
-            for f in norm_fills:
-                # Look up decision_id from engine's order registries
-                decision_id = None
-                if self.engine:
-                    exch_id = f.get('exchange_order_id')
-                    if exch_id and exch_id in self.engine.state.order_by_exchange_id:
+        # STRICT VALIDATION GATES (before insert)
+        # These are final checks to prevent bad data reaching ClickHouse
+        rows = []
+        dropped_count = 0
+        first_invalid_sample = None
+        
+        for f in norm_fills:
+            # Gate 1: exchange_order_id non-empty
+            if not f.get('exchange_order_id') or not str(f['exchange_order_id']).strip():
+                dropped_count += 1
+                if not first_invalid_sample:
+                    first_invalid_sample = {'reason': 'empty_order_id', 'fill': f}
+                continue
+            
+            # Gate 2: fill_id non-empty (or compute it)
+            fill_id = f.get('fill_id')
+            if not fill_id:
+                # Compute synthetic fill_id as hash(order_id + side + price + size + ts)
+                # This prevents duplicate inserts of same fill if API returns duplicates
+                import hashlib
+                fill_hash = hashlib.md5(f"{f['exchange_order_id']}:{f['side']}:{f['price_cents']}:{f['size']}:{f['ts']}".encode()).hexdigest()
+                fill_id = fill_hash
+            
+            # Gate 3: size > 0
+            if f.get('size', 0) <= 0:
+                dropped_count += 1
+                if not first_invalid_sample:
+                    first_invalid_sample = {'reason': 'zero_size', 'fill': f}
+                continue
+            
+            # Gate 4: price_cents in [1, 99]
+            price_cents = f.get('price_cents', 0)
+            if price_cents < 1 or price_cents > 99:
+                dropped_count += 1
+                if not first_invalid_sample:
+                    first_invalid_sample = {'reason': 'invalid_price', 'price_cents': price_cents, 'fill': f}
+                continue
+            
+            # Gate 5: market_ticker non-empty
+            if not f.get('market_ticker') or not str(f['market_ticker']).strip():
+                dropped_count += 1
+                if not first_invalid_sample:
+                    first_invalid_sample = {'reason': 'empty_market', 'fill': f}
+                continue
+            
+            # Gate 6: side in {yes, no}
+            if f.get('side') not in ('yes', 'no'):
+                dropped_count += 1
+                if not first_invalid_sample:
+                    first_invalid_sample = {'reason': 'invalid_side', 'side': f.get('side'), 'fill': f}
+                continue
+            
+            # All gates passed, build row for insert
+            # Look up decision_id from engine's order registries
+            decision_id = None
+            if self.engine:
+                exch_id = f.get('exchange_order_id')
+                if exch_id and hasattr(self.engine, 'state') and hasattr(self.engine.state, 'order_by_exchange_id'):
+                    if exch_id in self.engine.state.order_by_exchange_id:
                         order_ref = self.engine.state.order_by_exchange_id[exch_id]
                         decision_id = order_ref.decision_id
-                
-                rows.append({
-                    'ts': time.strftime('%Y-%m-%d %H:%M:%S'),
-                    'engine_instance_id': engine_instance_id,
-                    'engine_version': engine_version,
-                    'market_ticker': f['market_ticker'],
-                    'exchange_order_id': f['exchange_order_id'],
-                    'client_order_id': f['client_order_id'],
-                    'side': f['side'],
-                    'price_cents': f['price_cents'],
-                    'size': f['size'],
-                    'decision_id': decision_id,
-                    'raw_json': str(f['raw']),
-                })
+            
+            rows.append({
+                'ts': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'engine_instance_id': engine_instance_id,
+                'engine_version': engine_version,
+                'market_ticker': f['market_ticker'],
+                'exchange_order_id': f['exchange_order_id'],
+                'client_order_id': f.get('client_order_id'),
+                'side': f['side'],
+                'price_cents': f['price_cents'],
+                'size': f['size'],
+                'decision_id': decision_id,
+                'fill_id': f.get('fill_id'),
+                'raw_json': str(f['raw']),
+            })
+        
+        # Log drop stats
+        if dropped_count > 0:
+            logger.warning(json_msg({
+                "event": "fills_dropped_invalid",
+                "count": dropped_count,
+                "total_received": len(norm_fills),
+                "first_invalid": first_invalid_sample,
+            }))
+        
+        # Write to ClickHouse
+        if self.ch and rows:
             try:
                 self.ch.insert('mm_fills', rows)
                 if rows:
