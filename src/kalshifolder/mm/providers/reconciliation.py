@@ -41,14 +41,38 @@ class ReconciliationService:
             return None
         
         # Extract price_cents
-        price_cents = int(f.get('price') or f.get('price_cents') or 0)
+        # Kalshi API returns 'price' as float (0.01 to 0.99), not cents!
+        # Also provides yes_price/no_price as fallback (already in cents)
+        price_cents = 0
+        price_float = f.get('price')
+        if price_float is not None:
+            try:
+                price_cents = int(float(price_float) * 100)
+            except (ValueError, TypeError):
+                price_cents = 0
+        
+        # Fallback: try yes_price or no_price (already in cents)
+        if price_cents == 0:
+            yes_price = f.get('yes_price')
+            no_price = f.get('no_price')
+            if yes_price is not None:
+                try:
+                    price_cents = int(yes_price)
+                except (ValueError, TypeError):
+                    pass
+            elif no_price is not None:
+                try:
+                    price_cents = int(no_price)
+                except (ValueError, TypeError):
+                    pass
         
         # Hard validity gate: price_cents must be in [1, 99]
         if price_cents < 1 or price_cents > 99:
             logger.warning(json_msg({
                 "event": "fill_skipped_invalid_price",
-                "exchange_order_id": f.get('exchange_order_id'),
+                "exchange_order_id": f.get('exchange_order_id') or f.get('order_id'),
                 "price_cents": price_cents,
+                "price_raw": f.get('price'),
             }))
             return None
         
@@ -62,6 +86,7 @@ class ReconciliationService:
             return None
         
         # Extract timestamp from payload (must come from API, not now())
+        # Kalshi API returns 'ts' in SECONDS, convert to milliseconds
         ts = f.get('ts') or f.get('timestamp') or f.get('time') or f.get('created_at')
         if not ts:
             logger.warning(json_msg({
@@ -72,6 +97,9 @@ class ReconciliationService:
         
         try:
             ts = int(ts)
+            # If ts is in seconds (< 1e11), convert to milliseconds
+            if ts < 1e11:
+                ts = ts * 1000
         except (ValueError, TypeError):
             logger.warning(json_msg({
                 "event": "fill_skipped_unparseable_timestamp",
@@ -82,12 +110,12 @@ class ReconciliationService:
         
         return {
             'ts': ts,
-            'market_ticker': f.get('market_ticker') or f.get('market') or f.get('marketTicker'),
+            'market_ticker': f.get('market_ticker') or f.get('market') or f.get('ticker'),
             'exchange_order_id': exchange_order_id,
             'client_order_id': f.get('client_order_id') or f.get('clientOrderId') or f.get('client_id'),
-            'side': f.get('side'),
+            'side': f.get('side'),  # 'yes' or 'no'
             'price_cents': price_cents,
-            'size': size,  # Now using count field instead of size
+            'size': size,
             'raw': f,
         }
 
