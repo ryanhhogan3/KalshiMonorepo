@@ -40,13 +40,53 @@ class ReconciliationService:
             logger.debug(json_msg({"event": "fill_skipped_zero_size", "exchange_order_id": f.get('exchange_order_id'), "size": size}))
             return None
         
+        # Extract price_cents
+        price_cents = int(f.get('price') or f.get('price_cents') or 0)
+        
+        # Hard validity gate: price_cents must be in [1, 99]
+        if price_cents < 1 or price_cents > 99:
+            logger.warning(json_msg({
+                "event": "fill_skipped_invalid_price",
+                "exchange_order_id": f.get('exchange_order_id'),
+                "price_cents": price_cents,
+            }))
+            return None
+        
+        # Hard validity gate: exchange_order_id must be set
+        exchange_order_id = f.get('exchange_order_id') or f.get('order_id') or f.get('id')
+        if not exchange_order_id:
+            logger.warning(json_msg({
+                "event": "fill_skipped_missing_order_id",
+                "raw_keys": list(f.keys()),
+            }))
+            return None
+        
+        # Extract timestamp from payload (must come from API, not now())
+        ts = f.get('ts') or f.get('timestamp') or f.get('time') or f.get('created_at')
+        if not ts:
+            logger.warning(json_msg({
+                "event": "fill_skipped_missing_timestamp",
+                "exchange_order_id": exchange_order_id,
+            }))
+            return None
+        
+        try:
+            ts = int(ts)
+        except (ValueError, TypeError):
+            logger.warning(json_msg({
+                "event": "fill_skipped_unparseable_timestamp",
+                "exchange_order_id": exchange_order_id,
+                "ts": ts,
+            }))
+            return None
+        
         return {
-            'ts': int(f.get('ts') or f.get('timestamp') or int(time.time() * 1000)),
+            'ts': ts,
             'market_ticker': f.get('market_ticker') or f.get('market') or f.get('marketTicker'),
-            'exchange_order_id': f.get('exchange_order_id') or f.get('order_id') or f.get('id'),
+            'exchange_order_id': exchange_order_id,
             'client_order_id': f.get('client_order_id') or f.get('clientOrderId') or f.get('client_id'),
             'side': f.get('side'),
-            'price_cents': int(f.get('price') or f.get('price_cents') or 0),
+            'price_cents': price_cents,
             'size': size,  # Now using count field instead of size
             'raw': f,
         }
@@ -173,14 +213,19 @@ class ReconciliationService:
             return []
 
         # Defensive normalization: ensure fills is a list of dicts
+        # get_fills() should return a list, but handle dict responses from API
         if isinstance(fills, dict):
-            fills = [fills]
-        elif isinstance(fills, str):
+            # Extract fills array from dict (handle various API response formats)
+            fills = fills.get("fills") or fills.get("data") or fills.get("items") or []
+        
+        if isinstance(fills, str):
             logger.error("get_fills returned str; dropping: %r", fills[:200])
             fills = []
         elif not isinstance(fills, list):
-            logger.error("get_fills returned %s; dropping", type(fills))
+            logger.error("get_fills returned %s; expected list", type(fills))
             fills = []
+        
+        # Ensure all items are dicts
         fills = [f for f in fills if isinstance(f, dict)]
 
         if not fills:
@@ -191,7 +236,7 @@ class ReconciliationService:
             logger.info(json_msg({"event": "raw_fill_sample", "fill": fills[0], "fill_keys": list(fills[0].keys())}))
 
         norm_fills = [self._normalize_fill(f) for f in fills]
-        # Filter out None values (skipped fills with zero size)
+        # Filter out None values (skipped fills with zero size, invalid price, missing fields)
         norm_fills = [f for f in norm_fills if f is not None]
         
         if not norm_fills:
@@ -229,7 +274,12 @@ class ReconciliationService:
             try:
                 self.ch.insert('mm_fills', rows)
                 if rows:
-                    logger.info(json_msg({"event": "fills_ingested", "count": len(rows), "with_decision_id": sum(1 for r in rows if r.get('decision_id'))}))
+                    logger.info(json_msg({
+                        "event": "fills_ingested",
+                        "count": len(rows),
+                        "with_decision_id": sum(1 for r in rows if r.get('decision_id')),
+                        "with_side": sum(1 for r in rows if r.get('side')),
+                    }))
             except Exception:
                 logger.exception('failed to write fills')
 
