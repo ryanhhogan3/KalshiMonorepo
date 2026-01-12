@@ -50,10 +50,27 @@ class ReconciliationService:
             }))
             return None
         
-        # 2. Extract and validate fill_id (for idempotency)
-        fill_id = f.get('fill_id') or f.get('trade_id') or None
+        # 2. Extract and validate fill_id (for idempotency) - MUST ALWAYS HAVE A VALUE
+        fill_id = f.get('fill_id') or f.get('trade_id')
         if not fill_id:
-            logger.debug(json_msg({"event": "fill_missing_id", "exchange_order_id": exchange_order_id}))
+            # CRITICAL: Generate synthetic fill_id immediately (not later)
+            # This ensures every fill has a stable, deterministic ID for deduping
+            import hashlib
+            fill_tuple = f"{exchange_order_id}:{side}:{f.get('count', 0)}:{f.get('yes_price', f.get('no_price', f.get('price', 0)))}:{f.get('ts', 0)}"
+            fill_id = hashlib.md5(fill_tuple.encode()).hexdigest()
+            logger.debug(json_msg({
+                "event": "fill_synthetic_id",
+                "exchange_order_id": exchange_order_id,
+                "synthetic_id": fill_id,
+            }))
+        
+        # Ensure fill_id is never blank
+        if not str(fill_id).strip():
+            logger.warning(json_msg({
+                "event": "fill_skipped_blank_fill_id",
+                "exchange_order_id": exchange_order_id,
+            }))
+            return None
         
         # 3. Extract side (yes/no)
         side = f.get('side')
@@ -487,8 +504,22 @@ class ReconciliationService:
                         order_ref = self.engine.state.order_by_exchange_id[exch_id]
                         decision_id = order_ref.decision_id
             
+            # CRITICAL FIX: Use the fill's actual timestamp, not now()
+            # normalized fill has ts in milliseconds; convert to DateTime string
+            from datetime import datetime, timezone
+            fill_ts_ms = f.get('ts', 0)
+            if fill_ts_ms > 0:
+                fill_ts_sec = fill_ts_ms / 1000.0 if fill_ts_ms > 1e11 else fill_ts_ms
+                try:
+                    fill_dt = datetime.fromtimestamp(fill_ts_sec, tz=timezone.utc)
+                    ts_str = fill_dt.strftime('%Y-%m-%d %H:%M:%S')
+                except:
+                    ts_str = time.strftime('%Y-%m-%d %H:%M:%S')
+            else:
+                ts_str = time.strftime('%Y-%m-%d %H:%M:%S')
+            
             rows.append({
-                'ts': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'ts': ts_str,
                 'engine_instance_id': engine_instance_id,
                 'engine_version': engine_version,
                 'market_ticker': f['market_ticker'],
@@ -514,6 +545,24 @@ class ReconciliationService:
             }))
         
         # Final comprehensive log
+        # Include timestamp verification to confirm we're using fill's ts, not now()
+        first_fill_ts_info = {}
+        if norm_fills:
+            first_fill = norm_fills[0]
+            fill_ts_ms = first_fill.get('ts', 0)
+            if fill_ts_ms > 0:
+                from datetime import datetime, timezone
+                fill_ts_sec = fill_ts_ms / 1000.0 if fill_ts_ms > 1e11 else fill_ts_ms
+                try:
+                    fill_dt = datetime.fromtimestamp(fill_ts_sec, tz=timezone.utc)
+                    first_fill_ts_info = {
+                        "first_fill_ts_iso": fill_dt.isoformat(),
+                        "now_iso": datetime.now(timezone.utc).isoformat(),
+                        "ts_age_sec": (datetime.now(timezone.utc) - fill_dt).total_seconds(),
+                    }
+                except:
+                    pass
+        
         logger.info(json_msg({
             "event": "fill_pipeline_stats",
             "n_api": n_api,
@@ -524,18 +573,62 @@ class ReconciliationService:
             "predicate_pass_rate": f"{100.0 * n_real / max(n_api, 1):.1f}%",
             "validation_pass_rate": f"{100.0 * n_valid / max(n_real, 1):.1f}%",
             "gate_pass_rate": f"{100.0 * n_inserted / max(n_valid, 1):.1f}%",
+            **first_fill_ts_info,  # Include timestamp verification
         }))
         
         # Write to ClickHouse
         if self.ch and rows:
             try:
-                self.ch.insert('mm_fills', rows)
-                logger.info(json_msg({
-                    "event": "fills_ingested",
-                    "count": len(rows),
-                    "with_decision_id": sum(1 for r in rows if r.get('decision_id')),
-                    "with_side": sum(1 for r in rows if r.get('side')),
-                }))
+                # CRITICAL: Idempotency filter - don't re-insert fills that already exist
+                # Query ClickHouse for fill_ids we already have to avoid duplicates
+                existing_fill_ids = set()
+                if rows:
+                    incoming_fill_ids = [r['fill_id'] for r in rows if r.get('fill_id')]
+                    if incoming_fill_ids:
+                        try:
+                            # Chunk the query to avoid URL length issues (max 500 at a time)
+                            for i in range(0, len(incoming_fill_ids), 500):
+                                chunk = incoming_fill_ids[i:i+500]
+                                id_list = ', '.join([f"'{fid}'" for fid in chunk])
+                                result = self.ch._exec_and_read(
+                                    f"SELECT DISTINCT fill_id FROM kalshi.mm_fills WHERE fill_id IN ({id_list})"
+                                )
+                                if result:
+                                    existing_fill_ids.update(line.strip() for line in result.strip().split('\n') if line.strip())
+                        except Exception as e:
+                            logger.warning(json_msg({
+                                "event": "idempotency_check_failed",
+                                "error": str(e),
+                                "incoming_count": len(incoming_fill_ids),
+                            }))
+                            # If idempotency check fails, still insert (better to insert duplicate than drop valid fill)
+                
+                # Filter to only new fills
+                new_rows = [r for r in rows if r.get('fill_id') not in existing_fill_ids]
+                duplicates = len(rows) - len(new_rows)
+                
+                if duplicates > 0:
+                    logger.info(json_msg({
+                        "event": "fills_deduped",
+                        "total_rows": len(rows),
+                        "new_rows": len(new_rows),
+                        "duplicates_filtered": duplicates,
+                    }))
+                
+                # Insert only new rows
+                if new_rows:
+                    self.ch.insert('mm_fills', new_rows)
+                    logger.info(json_msg({
+                        "event": "fills_ingested",
+                        "count": len(new_rows),
+                        "with_decision_id": sum(1 for r in new_rows if r.get('decision_id')),
+                        "with_side": sum(1 for r in new_rows if r.get('side')),
+                    }))
+                else:
+                    logger.info(json_msg({
+                        "event": "fills_all_duplicates",
+                        "count": len(rows),
+                    }))
             except Exception:
                 logger.exception('failed to write fills')
 
