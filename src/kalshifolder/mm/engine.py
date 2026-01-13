@@ -653,10 +653,10 @@ class Engine:
                 "risk_reason": reason,
                 "bb": bb,
                 "ba": ba,
-                "target_yes_bid_px": target.yes_bid_px,
-                "target_no_bid_px": target.no_bid_px,
-                "target_yes_bid_sz": target.yes_bid_sz,
-                "target_no_bid_sz": target.no_bid_sz,
+                "target_bid_px": target.bid_px,
+                "target_ask_px": target.ask_px,
+                "target_bid_sz": target.bid_sz,
+                "target_ask_sz": target.ask_sz,
             }))
 
             decision_id = uuid4_hex()
