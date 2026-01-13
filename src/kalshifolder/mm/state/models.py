@@ -31,9 +31,11 @@ class MarketRuntimeState:
     last_ba_px: Optional[float] = None
     last_ba_sz: Optional[float] = None
     last_ts_ms: Optional[int] = None
-    # Two-sided BUY-only quoting: track YES and NO bids separately
-    working_yes_buy: Optional[WorkingOrder] = None   # BUY YES
-    working_no_buy: Optional[WorkingOrder] = None    # BUY NO
+    # Order tracking (kept as-is for stability; semantics changed operationally)
+    # working_bid now places BUY YES (same as before)
+    # working_ask now places BUY NO (was SELL YES)
+    working_bid: Optional[WorkingOrder] = None
+    working_ask: Optional[WorkingOrder] = None
     inventory: float = 0.0
     last_quote_ts_ms: Optional[int] = None
     rejects_rolling_counter: int = 0
