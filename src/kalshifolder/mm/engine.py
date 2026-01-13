@@ -411,7 +411,7 @@ class Engine:
                 await self._apply_market_diffs_async(added)
             self._last_active_markets = active_markets
         
-        markets = list(active_markets) if active_markets else self.config.markets
+        markets = list(active_markets) if active_markets else list(self.market_selector.get_active_markets())
         tick_size = 0.01
         
         # Fetch exchange positions once per cycle
@@ -1185,7 +1185,8 @@ class Engine:
 
         # Startup safety: cancel all resting orders on configured tickers if trading enabled
         if self.config.trading_enabled and os.getenv("MM_CANCEL_ALL_ON_START", "1") == "1":
-            for m in self.config.markets:
+            startup_markets = list(self.market_selector.get_active_markets())
+            for m in startup_markets:
                 try:
                     orders = self.exec.get_open_orders(ticker=m, limit=500)
                     cancel_count = 0
@@ -1203,8 +1204,8 @@ class Engine:
             # Get initial markets from MarketSelector (config file or env var)
             initial_markets = list(self.market_selector.get_active_markets())
             if not initial_markets:
-                # Fallback to config.markets if selector returns empty
-                initial_markets = self.config.markets
+                # Fallback: if selector returns empty, use empty list (graceful degradation)
+                initial_markets = []
                 
             # instantiate lazy WS provider if requested
             if getattr(self, '_md_source', None) == 'ws' and not self.md:
