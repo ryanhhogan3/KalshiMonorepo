@@ -10,7 +10,7 @@ class RiskManager:
         self.rejects_per_min = {}
         self.kill = False
 
-    def check_market(self, market_state) -> Tuple[bool, str]:
+    def check_market(self, market_state, intended_delta: float = 0.0) -> Tuple[bool, str]:
         # returns (allowed, reason)
         # Binary gate: can we quote this market at all?
         if self.kill:
@@ -22,8 +22,10 @@ class RiskManager:
         inventory = market_state.inventory
         max_pos = self.params.get('MM_MAX_POS', 5)
         
-        if abs(inventory) > max_pos:
-            # Exceeded cap: stop quoting both sides
+        # Check if this order would push us over the cap
+        projected_inventory = inventory + intended_delta
+        if abs(projected_inventory) > max_pos:
+            # Would exceed cap: stop this order
             return False, 'MAX_POS_EXCEEDED'
         
         # If we get here, market is allowed (but may be flatten-only, see allowed_actions)

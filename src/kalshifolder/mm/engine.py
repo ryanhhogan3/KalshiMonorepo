@@ -18,6 +18,7 @@ from .risk.limits import RiskManager
 from .utils.id import uuid4_hex
 from .utils.time import now_ms
 from .utils.logging import setup_logging, json_msg
+from .utils.price import complement_100
 from .market_selector import MarketSelector
 from collections import deque
 from datetime import datetime, timezone
@@ -640,10 +641,10 @@ class Engine:
                 "risk_reason": reason,
                 "bb": bb,
                 "ba": ba,
-                "target_bid_px": target.bid_px,
-                "target_ask_px": target.ask_px,
-                "target_bid_sz": target.bid_sz,
-                "target_ask_sz": target.ask_sz,
+                "target_yes_bid_px": target.yes_bid_px,
+                "target_no_bid_px": target.no_bid_px,
+                "target_yes_bid_sz": target.yes_bid_sz,
+                "target_no_bid_sz": target.no_bid_sz,
             }))
 
             decision_id = uuid4_hex()
@@ -912,7 +913,7 @@ class Engine:
                             if wo is not None:
                                 action_id = uuid4_hex()
                                 cancel_client = wo.client_order_id
-                                self._log_action(action_id, decision_id, m, cancel_client, 'CANCEL', 'ASK', 'yes', wo.price_cents / 100.0, wo.price_cents, wo.size, replace_of='')
+                                self._log_action(action_id, decision_id, m, cancel_client, 'CANCEL', 'ASK', 'no', wo.price_cents / 100.0, wo.price_cents, wo.size, replace_of='')
                                 # simulate cancel in paper mode
                                 if not self.config.trading_enabled:
                                     self._log_response(action_id, m, cancel_client, 'SIMULATED', '', '', 0, json.dumps({'simulated': True}))
@@ -966,13 +967,16 @@ class Engine:
 
                             action_id = uuid4_hex()
                             client_order_id = make_client_id('A')
-                            self._log_action(action_id, decision_id, m, client_order_id, 'PLACE', 'ASK', 'yes', target.ask_px, new_price_cents, target.ask_sz, replace_of=(wo.client_order_id if wo else ''))
+                            # ASK side now places BUY NO (not SELL YES)
+                            # Convert YES ask price to NO bid price via complement
+                            no_price_cents = complement_100(new_price_cents)
+                            self._log_action(action_id, decision_id, m, client_order_id, 'PLACE', 'ASK', 'no', no_price_cents / 100.0, no_price_cents, target.ask_sz, replace_of=(wo.client_order_id if wo else ''))
                             if not self.config.trading_enabled:
                                 logger.info(json_msg({
                                     "event": "paper_place",
                                     "market": m,
                                     "side": "ASK",
-                                    "px_cents": int(new_price_cents),
+                                    "px_cents": int(no_price_cents),
                                     "sz": int(target.ask_sz),
                                 }))
                                 mr.last_place_ask_ms = now
@@ -981,7 +985,7 @@ class Engine:
                                     client_order_id=client_order_id,
                                     exchange_order_id=sim_exch,
                                     side='ASK',
-                                    price_cents=new_price_cents,
+                                    price_cents=no_price_cents,
                                     size=target.ask_sz,
                                     status='ACKED',
                                     placed_ts_ms=now,
@@ -1000,11 +1004,11 @@ class Engine:
                             resp = await asyncio.to_thread(
                                 self.exec.place_order,
                                 market_ticker=m,
-                                side="yes",
-                                price_cents=new_price_cents,
+                                side="no",
+                                price_cents=no_price_cents,
                                 size=int(target.ask_sz),
                                 client_order_id=client_order_id,
-                                action="sell",
+                                action="buy",
                             )
                             status = resp.get('status', 'ERROR')
                             exch_id = resp.get('exchange_order_id')
@@ -1060,7 +1064,7 @@ class Engine:
                                     client_order_id=client_order_id,
                                     exchange_order_id=sim_exch,
                                     side='ASK',
-                                    price_cents=new_price_cents,
+                                    price_cents=no_price_cents,
                                     size=target.ask_sz,
                                     status='ACKED',
                                     placed_ts_ms=now,
@@ -1068,7 +1072,7 @@ class Engine:
                                     last_update_ts_ms=now,
                                 )
                                 mr.working_ask = wo_new
-                                logger.info(json_msg({"event":"wo_set","market":m,"side":"ASK","client_order_id":client_order_id,"exchange_order_id":sim_exch,"price_cents":new_price_cents,"size":target.ask_sz}))
+                                logger.info(json_msg({"event":"wo_set","market":m,"side":"ASK","client_order_id":client_order_id,"exchange_order_id":sim_exch,"price_cents":no_price_cents,"size":target.ask_sz}))
                                 last['ask_px'] = target.ask_px
                                 last['ts_ms'] = now
                                 # register in engine order registries
