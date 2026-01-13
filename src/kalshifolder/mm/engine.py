@@ -146,6 +146,7 @@ class Engine:
         self.last_sent: Dict[str, dict] = {}
         self.reject_window_s = int(os.getenv("MM_REJECT_WINDOW_S", "60"))
         self.reject_times = deque()  # store epoch seconds of rejects (global)
+        self._last_position_source_log_ts = 0  # throttle position source logging to once per minute
         
         # Initialize MarketSelector for hot-reload support
         self.market_selector = MarketSelector()
@@ -421,6 +422,17 @@ class Engine:
             pos_by_ticker = self._get_exchange_pos_by_ticker()
         except Exception:
             pos_by_ticker = {}
+        
+        # Log position source once per minute for audit
+        now_ts = time.time()
+        if now_ts - self._last_position_source_log_ts >= 60:
+            self._last_position_source_log_ts = now_ts
+            logger.info(json_msg({
+                "event": "exchange_positions_snapshot",
+                "source": "api_get_positions",
+                "positions_by_ticker": pos_by_ticker,
+                "positions_count": len(pos_by_ticker),
+            }))
         
         try:
             batch = self.md.get_batch_best_bid_ask(markets)
@@ -772,7 +784,16 @@ class Engine:
                             # place new order
                             action_id = uuid4_hex()
                             client_order_id = make_client_id('B')
-                            self._log_action(action_id, decision_id, m, client_order_id, 'PLACE', 'BID', 'yes', target.bid_px, new_price_cents, target.bid_sz, replace_of=(wo.client_order_id if wo else ''))
+                            request_json = {
+                                "ticker": m,
+                                "client_order_id": client_order_id,
+                                "count": int(target.bid_sz),
+                                "side": "yes",
+                                "action": "buy",
+                                "type": "limit",
+                                "yes_price": new_price_cents,
+                            }
+                            self._log_action(action_id, decision_id, m, client_order_id, 'PLACE', 'BID', 'yes', target.bid_px, new_price_cents, target.bid_sz, replace_of=(wo.client_order_id if wo else ''), request_json=request_json)
                             if not self.config.trading_enabled:
                                 logger.info(json_msg({
                                     "event": "paper_place",
@@ -970,7 +991,16 @@ class Engine:
                             # ASK side now places BUY NO (not SELL YES)
                             # Convert YES ask price to NO bid price via complement
                             no_price_cents = complement_100(new_price_cents)
-                            self._log_action(action_id, decision_id, m, client_order_id, 'PLACE', 'ASK', 'no', no_price_cents / 100.0, no_price_cents, target.ask_sz, replace_of=(wo.client_order_id if wo else ''))
+                            request_json = {
+                                "ticker": m,
+                                "client_order_id": client_order_id,
+                                "count": int(target.ask_sz),
+                                "side": "no",
+                                "action": "buy",
+                                "type": "limit",
+                                "no_price": no_price_cents,
+                            }
+                            self._log_action(action_id, decision_id, m, client_order_id, 'PLACE', 'ASK', 'no', no_price_cents / 100.0, no_price_cents, target.ask_sz, replace_of=(wo.client_order_id if wo else ''), request_json=request_json)
                             if not self.config.trading_enabled:
                                 logger.info(json_msg({
                                     "event": "paper_place",
