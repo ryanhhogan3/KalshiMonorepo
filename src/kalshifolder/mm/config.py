@@ -4,7 +4,8 @@ from dataclasses import dataclass
 
 @dataclass
 class MMConfig:
-    markets: list
+    markets_file_path: str
+    markets_reload_secs: int
     poll_ms: int
     max_level_age_ms: int
     loop_jitter_ms: int
@@ -13,6 +14,8 @@ class MMConfig:
     size: float
     edge_ticks: int
     max_pos: int
+    max_long_pos: int
+    max_short_pos: int
     max_global_pos: int
     max_rejects_per_min: int
     kill_on_stale: int
@@ -32,10 +35,10 @@ class MMConfig:
 
 
 def load_config_from_env() -> MMConfig:
-    markets = os.getenv('MM_MARKETS', '')
-    markets = [m.strip() for m in markets.split(',') if m.strip()]
+    # Markets MUST come from file only - MarketSelector handles reloading
     return MMConfig(
-        markets=markets,
+        markets_file_path=os.getenv('MM_MARKETS_FILE', '/app/config/markets.txt'),
+        markets_reload_secs=int(os.getenv('MM_MARKETS_RELOAD_SECS', '5')),
         poll_ms=int(os.getenv('MM_POLL_MS', '250')),
         max_level_age_ms=int(os.getenv('MM_MAX_LEVEL_AGE_MS', '2000')),
         loop_jitter_ms=int(os.getenv('MM_LOOP_JITTER_MS', '50')),
@@ -44,6 +47,8 @@ def load_config_from_env() -> MMConfig:
         size=float(os.getenv('MM_SIZE', '1')),
         edge_ticks=int(os.getenv('MM_EDGE_TICKS', '1')),
         max_pos=int(os.getenv('MM_MAX_POS', '5')),
+        max_long_pos=int(os.getenv('MM_MAX_LONG_POS', os.getenv('MM_MAX_POS', '5'))),
+        max_short_pos=int(os.getenv('MM_MAX_SHORT_POS', os.getenv('MM_MAX_POS', '5'))),
         max_global_pos=int(os.getenv('MM_MAX_GLOBAL_POS', '25')),
         max_rejects_per_min=int(os.getenv('MM_MAX_REJECTS_PER_MIN', '10')),
         kill_on_stale=int(os.getenv('MM_KILL_ON_STALE', '1')),

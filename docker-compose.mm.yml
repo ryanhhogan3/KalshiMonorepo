@@ -26,7 +26,7 @@ services:
       MM_WS_DEBUG_LIMIT: ${MM_WS_DEBUG_LIMIT:-20}
 
       # --- Markets to quote ---
-      MM_MARKETS: ${MM_MARKETS}
+      # MM_MARKETS is DEPRECATED - use MM_MARKETS_FILE only
       MM_MARKETS_FILE: ${MM_MARKETS_FILE:-/app/config/markets.txt}
       MM_MARKETS_RELOAD_SECS: ${MM_MARKETS_RELOAD_SECS:-5}
 
