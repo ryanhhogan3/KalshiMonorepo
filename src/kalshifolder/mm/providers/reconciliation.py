@@ -739,26 +739,61 @@ class ReconciliationService:
         if self.ch and positions:
             rows = []
             for p in positions:
+                ticker = p.get('market_ticker') or p.get('market') or p.get('ticker') or ''
+                pos_val = p.get('position') or p.get('qty') or 0
+                avg_cost = p.get('avg_cost') or p.get('avgPrice') or 0
+
+                # Guardrail: never write a row with a blank ticker.
+                if not ticker:
+                    try:
+                        logger.error(json_msg({
+                            "event": "positions_write_blocked_blank_ticker",
+                            "position": pos_val,
+                            "avg_cost": avg_cost,
+                            "source": "REST_RECON",
+                            "raw_keys": list(p.keys()),
+                        }))
+                    except Exception:
+                        logger.exception('failed to log blank ticker position row')
+                    continue
+
                 rows.append({
                     'ts': time.strftime('%Y-%m-%d %H:%M:%S'),
                     'engine_instance_id': self.engine.state.instance_id,
-                    'market_ticker': p.get('market_ticker') or p.get('market'),
-                    'position': p.get('position') or p.get('qty') or 0,
-                    'avg_cost': p.get('avg_cost') or p.get('avgPrice') or 0,
+                    'market_ticker': ticker,
+                    'position': pos_val,
+                    'avg_cost': avg_cost,
                     'source': 'REST_RECON',
                 })
-            try:
-                self.ch.insert('mm_positions', rows)
-            except Exception:
-                logger.exception('failed to write positions')
 
-        # overwrite engine state
+            if rows:
+                try:
+                    self.ch.insert('mm_positions', rows)
+                except Exception:
+                    logger.exception('failed to write positions')
+
+        # Overwrite engine state and expose a deterministic snapshot for risk.
+        # This snapshot is the SINGLE source of truth used for both:
+        #   - mm_positions table writes (above)
+        #   - risk gating inside the engine (via engine.last_exchange_positions_by_ticker)
+        pos_snapshot = {}
         for p in positions:
             market = p.get('market_ticker') or p.get('market')
             if not market:
                 continue
+            pos_val = float(p.get('position') or p.get('qty') or 0)
             mr = self.engine.store.get_market(market)
-            mr.inventory = float(p.get('position') or p.get('qty') or 0)
+            # Inventory now mirrors exactly what we wrote to mm_positions
+            mr.inventory = pos_val
+            pos_snapshot[market] = pos_val
+
+        # Make latest reconciled positions available to the engine loop
+        # so risk gating uses the SAME numbers as mm_positions.
+        try:
+            self.engine.last_exchange_positions_by_ticker = pos_snapshot
+        except Exception:
+            # Never let bookkeeping crash reconciliation
+            logger.exception('failed to update engine position snapshot')
 
         return positions
 

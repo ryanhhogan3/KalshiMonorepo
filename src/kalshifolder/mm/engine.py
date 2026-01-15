@@ -147,6 +147,8 @@ class Engine:
         self.reject_window_s = int(os.getenv("MM_REJECT_WINDOW_S", "60"))
         self.reject_times = deque()  # store epoch seconds of rejects (global)
         self._last_position_source_log_ts = 0  # throttle position source logging to once per minute
+        # Latest reconciled positions snapshot (source of truth for risk & mm_positions)
+        self.last_exchange_positions_by_ticker: Dict[str, float] = {}
         
         # Initialize MarketSelector for hot-reload support
         self.market_selector = MarketSelector()
@@ -416,20 +418,18 @@ class Engine:
         markets = list(active_markets) if active_markets else list(self.market_selector.get_active_markets())
         tick_size = 0.01
         
-        # Fetch exchange positions once per cycle
-        pos_by_ticker = {}
-        try:
-            pos_by_ticker = self._get_exchange_pos_by_ticker()
-        except Exception:
-            pos_by_ticker = {}
-        
-        # Log position source once per minute for audit
+        # Use latest reconciled positions snapshot populated by ReconciliationService.
+        # This is the SAME data source that writes mm_positions, so risk gating
+        # and analytics share one consistent view of position.
+        pos_by_ticker = getattr(self, 'last_exchange_positions_by_ticker', {}) or {}
+
+        # Log position source once per minute for audit (and to prove what risk sees).
         now_ts = time.time()
         if now_ts - self._last_position_source_log_ts >= 60:
             self._last_position_source_log_ts = now_ts
             logger.info(json_msg({
                 "event": "exchange_positions_snapshot",
-                "source": "api_get_positions",
+                "source": "reconciled_mm_positions",
                 "positions_by_ticker": pos_by_ticker,
                 "positions_count": len(pos_by_ticker),
             }))
@@ -555,20 +555,9 @@ class Engine:
             bb = mr.last_bb_px
             ba = mr.last_ba_px  # may be garbage from WS
 
-            # Exchange position check: hard block if at or beyond limit.
-            # This must run even if market data is junk, so we can prove gating in logs.
-            ex_pos = int(pos_by_ticker.get(m, 0))
-            mr.exchange_position = ex_pos  # store for visibility
-            mr.inventory = ex_pos  # TEMP: until reconciliation is proven correct
-
-            if abs(ex_pos) >= int(self.config.max_pos):
-                logger.error(json_msg({
-                    "event": "risk_hard_block_exchange_pos",
-                    "market": m,
-                    "exchange_position": ex_pos,
-                    "max_pos": int(self.config.max_pos),
-                }))
-                continue
+            # Exchange position from reconciled snapshot: single source of truth.
+            ex_pos = int(pos_by_ticker.get(m, mr.inventory or 0))
+            mr.exchange_position = ex_pos  # store for visibility / logs only
 
             # Proper YES book validation: require both bid and ask, both in (0, 1), bid < ask
             if bb is None or ba is None:
@@ -632,14 +621,11 @@ class Engine:
                     self.ask_sz = ask_sz
 
             target = _Target(bid_px=bid_px, ask_px=ask_px, bid_sz=float(self.config.size), ask_sz=float(self.config.size))
-            
-            # Compute intended delta for risk check:
-            # BID side: BUY YES → inventory increases by +size
-            # ASK side: BUY NO → inventory decreases by -size (YES-equivalent exposure)
-            # Use the maximum potential delta (both sides quoted)
-            intended_delta = target.bid_sz + (-target.ask_sz)  # net if both filled
-            
-            allowed, reason = self.risk.check_market(mr, exchange_position=ex_pos, intended_delta=intended_delta)
+
+            # Global risk check here is ONLY for kill / stale gating.
+            # Position-cap enforcement (including reduce-only logic) happens per-side
+            # using explicit intended_delta values for each order.
+            allowed, reason = self.risk.check_market(mr, exchange_position=ex_pos, intended_delta=0.0)
             
             # Check if market is disabled by circuit breaker
             if mr.disabled_until_ms is not None and now < mr.disabled_until_ms:
@@ -673,7 +659,13 @@ class Engine:
             self._log_decision(decision_id, m, float(bb), float(ba), mid, spread, target, mr.inventory, mr.inventory)
 
             if not allowed:
-                logger.info(json_msg({"event": "risk_block", "market": m, "reason": reason}))
+                # Hard gates (KILL_SWITCH/STALE_MARKET) still stop quoting entirely.
+                logger.info(json_msg({
+                    "event": "risk_block_global",
+                    "market": m,
+                    "exchange_position": ex_pos,
+                    "reason": reason,
+                }))
                 continue
 
             async with self.market_locks[m]:

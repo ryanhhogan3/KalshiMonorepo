@@ -18,21 +18,31 @@ class RiskManager:
         if market_state.kill_stale and self.params.get('MM_KILL_ON_STALE', 1):
             return False, 'STALE_MARKET'
         
-        # CRITICAL FIX: Use exchange position (source of truth) not internal inventory
-        # Block if current position >= cap OR projection would exceed cap
+        # Position-cap logic:
+        # - Global calls (intended_delta == 0) only care about KILL/STALE above.
+        # - Per-order calls (non-zero intended_delta) enforce cap + reduce-only.
         max_pos = self.params.get('MM_MAX_POS', 5)
-        
-        # Hard block: already at or over the cap
-        if abs(exchange_position) >= max_pos:
-            return False, f'AT_OR_OVER_CAP (pos={exchange_position}, max={max_pos})'
-        
-        # Projection block: this order would push us over cap
-        projected_position = exchange_position + intended_delta
-        if abs(projected_position) > max_pos:
-            return False, f'WOULD_EXCEED_CAP (pos={exchange_position}, delta={intended_delta}, max={max_pos})'
-        
-        # If we get here, market is allowed (but may be flatten-only, see allowed_actions)
-        return True, ''
+        pos = float(exchange_position or 0.0)
+
+        # If no intended delta, treat as a pure health check (kill/stale only).
+        if not intended_delta:
+            return True, ''
+
+        projected_position = pos + intended_delta
+
+        # 1) Normal regime: |pos| < max_pos → block any order that would exceed cap.
+        if abs(pos) < max_pos:
+            if abs(projected_position) > max_pos:
+                return False, f'WOULD_EXCEED_CAP (pos={pos}, delta={intended_delta}, max={max_pos})'
+            return True, ''
+
+        # 2) Over-cap regime: |pos| >= max_pos → allow ONLY reduce-only moves.
+        # Reduce-only means the order moves position TOWARD zero (reduces |pos|).
+        if abs(projected_position) < abs(pos):
+            return True, f'REDUCE_ONLY_OK (pos={pos}, delta={intended_delta}, max={max_pos})'
+
+        # Any other move (same or larger |pos|) is blocked while over/at cap.
+        return False, f'REDUCE_ONLY_BLOCK (pos={pos}, delta={intended_delta}, max={max_pos})'
 
     def allowed_actions(self, market_state, exchange_position: float = 0.0):
         """
