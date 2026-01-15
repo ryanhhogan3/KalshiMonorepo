@@ -61,7 +61,7 @@ def load_config_from_env() -> MMConfig:
         kalshi_base=os.getenv('KALSHI_API_BASE', 'https://api.kalshi.com'),
         kalshi_key_id=os.getenv('KALSHI_KEY_ID', ''),
         kalshi_private_key_path=os.getenv('KALSHI_PRIVATE_KEY_PATH', ''),
-        trading_enabled=bool(int(os.getenv('MM_TRADING_ENABLED', '0'))),
+        trading_enabled=bool(int(os.getenv('MM_TRADING_ENABLED', '1'))),
         price_units=os.getenv('MM_PRICE_UNITS', 'cents'),
         cancel_strays_enabled=bool(int(os.getenv('MM_CANCEL_STRAYS_ENABLED', '0'))),
     )
