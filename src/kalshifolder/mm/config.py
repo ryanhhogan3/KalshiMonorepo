@@ -42,8 +42,8 @@ def load_config_from_env() -> MMConfig:
         poll_ms=int(os.getenv('MM_POLL_MS', '250')),
         max_level_age_ms=int(os.getenv('MM_MAX_LEVEL_AGE_MS', '2000')),
         loop_jitter_ms=int(os.getenv('MM_LOOP_JITTER_MS', '50')),
-        quote_refresh_ms=int(os.getenv('MM_QUOTE_REFRESH_MS', '1000')),
-        min_reprice_ticks=int(os.getenv('MM_MIN_REPRICE_TICKS', '1')),
+        quote_refresh_ms=int(os.getenv('MM_QUOTE_REFRESH_MS', '5000')),  # increased from 1000ms to 5000ms (5s) to reduce churn
+        min_reprice_ticks=int(os.getenv('MM_MIN_REPRICE_TICKS', '2')),  # increased from 1 to 2 ticks (0.02) minimum repricing threshold
         size=float(os.getenv('MM_SIZE', '1')),
         edge_ticks=int(os.getenv('MM_EDGE_TICKS', '1')),
         max_pos=int(os.getenv('MM_MAX_POS', '5')),

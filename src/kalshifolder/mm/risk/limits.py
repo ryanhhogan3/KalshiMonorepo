@@ -10,7 +10,7 @@ class RiskManager:
         self.rejects_per_min = {}
         self.kill = False
 
-    def check_market(self, market_state, intended_delta: float = 0.0) -> Tuple[bool, str]:
+    def check_market(self, market_state, exchange_position: float = 0.0, intended_delta: float = 0.0) -> Tuple[bool, str]:
         # returns (allowed, reason)
         # Binary gate: can we quote this market at all?
         if self.kill:
@@ -18,22 +18,27 @@ class RiskManager:
         if market_state.kill_stale and self.params.get('MM_KILL_ON_STALE', 1):
             return False, 'STALE_MARKET'
         
-        # CRITICAL FIX: Absolute cap blocks only when EXCEEDED (not at boundary)
-        inventory = market_state.inventory
+        # CRITICAL FIX: Use exchange position (source of truth) not internal inventory
+        # Block if current position >= cap OR projection would exceed cap
         max_pos = self.params.get('MM_MAX_POS', 5)
         
-        # Check if this order would push us over the cap
-        projected_inventory = inventory + intended_delta
-        if abs(projected_inventory) > max_pos:
-            # Would exceed cap: stop this order
-            return False, 'MAX_POS_EXCEEDED'
+        # Hard block: already at or over the cap
+        if abs(exchange_position) >= max_pos:
+            return False, f'AT_OR_OVER_CAP (pos={exchange_position}, max={max_pos})'
+        
+        # Projection block: this order would push us over cap
+        projected_position = exchange_position + intended_delta
+        if abs(projected_position) > max_pos:
+            return False, f'WOULD_EXCEED_CAP (pos={exchange_position}, delta={intended_delta}, max={max_pos})'
         
         # If we get here, market is allowed (but may be flatten-only, see allowed_actions)
         return True, ''
 
-    def allowed_actions(self, market_state):
+    def allowed_actions(self, market_state, exchange_position: float = 0.0):
         """
         Per-side gating to enable "flatten-only" mode when at/near position limits.
+        Uses exchange_position (source of truth) instead of internal inventory.
+        
         Returns dict with side-level permissions for safer recovery from edge positions.
         
         Structure:
@@ -44,7 +49,6 @@ class RiskManager:
             "reason": str                # explanation if restricted
         }
         """
-        inventory = market_state.inventory
         max_pos = self.params.get('MM_MAX_POS', 5)
         max_long = self.params.get('MM_MAX_LONG_POS', max_pos)
         max_short = self.params.get('MM_MAX_SHORT_POS', max_pos)
@@ -57,9 +61,9 @@ class RiskManager:
             "reason": ""
         }
         
-        # If inventory is negative (short) and at/approaching max short cap
+        # If position is negative (short) and at/approaching max short cap
         # Allow quotes but only actions that reduce short (flatten toward 0)
-        if inventory <= -max_short:
+        if exchange_position <= -max_short:
             allow["allow_quote"] = True
             # Buying NO increases short (adds to negative), so block it
             # Selling NO (buying YES) reduces short, so allow
@@ -67,9 +71,9 @@ class RiskManager:
             allow["reason"] = "MAX_SHORT_FLATTEN_ONLY"
             return allow
         
-        # If inventory is positive (long) and at/approaching max long cap
+        # If position is positive (long) and at/approaching max long cap
         # Allow quotes but only actions that reduce long (flatten toward 0)
-        if inventory >= max_long:
+        if exchange_position >= max_long:
             allow["allow_quote"] = True
             # Buying YES increases long (adds to positive), so block it
             # Selling YES (buying NO) reduces long, so allow
