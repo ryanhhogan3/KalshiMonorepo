@@ -749,6 +749,10 @@ class Engine:
                                     need_replace = False
 
                             if need_replace:
+                                # ensure status/exch_id are always defined (paper or live)
+                                status = 'SIMULATED' if not self.config.trading_enabled else 'PENDING'
+                                exch_id = None
+
                                 # if existing working order, cancel it first
                                 if wo is not None:
                                     action_id = uuid4_hex()
@@ -980,6 +984,10 @@ class Engine:
                                     need_replace = False
 
                             if need_replace:
+                                # ensure status/exch_id are always defined (paper or live)
+                                status = 'SIMULATED' if not self.config.trading_enabled else 'PENDING'
+                                exch_id = None
+
                                 if wo is not None:
                                     action_id = uuid4_hex()
                                     cancel_client = wo.client_order_id
