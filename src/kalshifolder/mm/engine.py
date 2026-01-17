@@ -725,8 +725,13 @@ class Engine:
                                 need_replace = True
                             else:
                                 # Check if price/size changed
-                                # Apply min_reprice_ticks threshold: only reprice if movement is >= threshold
-                                min_reprice_cents = self.config.min_reprice_ticks * 100
+                                # Apply min_reprice_ticks threshold in cents (1 tick = 1 cent)
+                                min_reprice_cents = int(self.config.min_reprice_ticks)
+                                # Clamp to a sane range so misconfigured values (e.g. 100) don't freeze quotes
+                                if min_reprice_cents < 0:
+                                    min_reprice_cents = 0
+                                elif min_reprice_cents > 50:
+                                    min_reprice_cents = 50
                                 price_diff = abs(new_price_cents - wo.price_cents)
                                 
                                 if int(wo.size) != int(target.bid_sz):
@@ -960,8 +965,13 @@ class Engine:
                                 need_replace = True
                             else:
                                 # Check if price/size changed
-                                # Apply min_reprice_ticks threshold: only reprice if movement is >= threshold
-                                min_reprice_cents = self.config.min_reprice_ticks * 100
+                                # Apply min_reprice_ticks threshold in cents (1 tick = 1 cent)
+                                min_reprice_cents = int(self.config.min_reprice_ticks)
+                                # Clamp to a sane range so misconfigured values (e.g. 100) don't freeze quotes
+                                if min_reprice_cents < 0:
+                                    min_reprice_cents = 0
+                                elif min_reprice_cents > 50:
+                                    min_reprice_cents = 50
                                 price_diff = abs(new_price_cents - wo.price_cents)
                                 
                                 if int(wo.size) != int(target.ask_sz):
