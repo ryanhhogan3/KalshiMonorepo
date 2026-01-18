@@ -450,6 +450,30 @@ class Engine:
         for m in markets:
             mr = self.store.get_market(m)
             md = batch.get(m)
+
+            # Auto-heal stale or missing working orders so both sides stay live.
+            # If a working order hasn't been updated for a long time, treat it as gone
+            # and let the normal "wo is None" path place a fresh order (subject to risk).
+            try:
+                stale_ms = int(os.getenv('MM_WO_STALE_MS', '60000'))  # default 60s
+            except Exception:
+                stale_ms = 60000
+            if stale_ms > 0:
+                for side_attr in ('working_bid', 'working_ask'):
+                    wo = getattr(mr, side_attr, None)
+                    if wo is None:
+                        continue
+                    last_update = getattr(wo, 'last_update_ts_ms', getattr(wo, 'placed_ts_ms', 0)) or 0
+                    if last_update and now - last_update > stale_ms:
+                        logger.info(json_msg({
+                            "event": "working_order_stale_cleared",
+                            "market": m,
+                            "side": 'BID' if side_attr == 'working_bid' else 'ASK',
+                            "age_ms": now - last_update,
+                            "stale_ms": stale_ms,
+                            "exchange_order_id": getattr(wo, 'exchange_order_id', None),
+                        }))
+                        setattr(mr, side_attr, None)
             if int(now/1000) != int((getattr(mr, "_last_wo_log_ms", 0))/1000):
                 mr._last_wo_log_ms = now
                 logger.info(json_msg({"event":"md_row","market":m,"md":md}))
@@ -605,8 +629,33 @@ class Engine:
             edge_ticks = int(self.config.edge_ticks)
             tick_size = 0.01
 
+            # Base symmetric quotes around the book
             bid_px = max(0.01, min(0.99, float(bb) - edge_ticks * tick_size))
             ask_px = max(0.01, min(0.99, float(ba) + edge_ticks * tick_size))
+
+            # Optional inventory-aware skew: nudge quotes to favor flattening
+            # exposure. Positive exchange_position = long YES; negative = short YES.
+            # NOTE: ASK places BUY NO via complement_100, so lowering the YES ask
+            # makes the NO bid more aggressive, and raising the YES ask makes the
+            # NO bid less aggressive.
+            inv = float(ex_pos or 0)
+            skew_per = getattr(self.config, 'skew_per_contract_ticks', 0) or 0
+            max_skew = getattr(self.config, 'max_skew_ticks', 0) or 0
+            if skew_per != 0 and max_skew > 0 and inv != 0:
+                skew_mag_ticks = int(min(max_skew, abs(inv) * abs(skew_per)))
+                if skew_mag_ticks > 0:
+                    skew_px = skew_mag_ticks * tick_size
+                    if inv > 0:
+                        # Long YES: de-risk by backing off BUY YES (bid down)
+                        # and making BUY NO more aggressive (YES ask down).
+                        bid_px = max(0.01, min(0.99, bid_px - skew_px))
+                        ask_px = max(0.01, min(0.99, ask_px - skew_px))
+                    elif inv < 0:
+                        # Short YES (long NO): de-risk by making BUY YES more
+                        # aggressive (bid up) and BUY NO less aggressive (YES
+                        # ask up).
+                        bid_px = max(0.01, min(0.99, bid_px + skew_px))
+                        ask_px = max(0.01, min(0.99, ask_px + skew_px))
 
             # enforce non-crossing by construction
             if bid_px >= ask_px:
@@ -800,6 +849,18 @@ class Engine:
                                                 cancel_reject_reason = ""
 
                                             self._log_response(action_id, m, cancel_client, status, exch_id, cancel_reject_reason, resp.get('latency_ms', 0), resp.get('raw', ''))
+
+                                            # Treat not_found on cancel as idempotent success: clear local state
+                                            # and do not enter cooldown or leave orders stuck pending.
+                                            if (status != 'ACK' and isinstance(cancel_reject_reason, str) and 'not_found' in cancel_reject_reason.lower()):
+                                                logger.info(json_msg({
+                                                    "event": "cancel_idempotent_not_found",
+                                                    "market": m,
+                                                    "side": "BID",
+                                                    "exchange_order_id": cancel_id,
+                                                    "reason": cancel_reject_reason,
+                                                }))
+                                                status = 'ACK'
 
                                             if status == 'ACK' or (not self.config.trading_enabled and status == 'SIMULATED'):
                                                 wo.status = 'CANCELLED'
@@ -1039,6 +1100,18 @@ class Engine:
                                                 cancel_reject_reason = ""
 
                                             self._log_response(action_id, m, cancel_client, status, exch_id, cancel_reject_reason, resp.get('latency_ms', 0), resp.get('raw', ''))
+                                            # Treat not_found on cancel as idempotent success: clear local state
+                                            # and do not enter cooldown or leave orders stuck pending.
+                                            if (status != 'ACK' and isinstance(cancel_reject_reason, str) and 'not_found' in cancel_reject_reason.lower()):
+                                                logger.info(json_msg({
+                                                    "event": "cancel_idempotent_not_found",
+                                                    "market": m,
+                                                    "side": "ASK",
+                                                    "exchange_order_id": cancel_id,
+                                                    "reason": cancel_reject_reason,
+                                                }))
+                                                status = 'ACK'
+
                                             if status == 'ACK' or (not self.config.trading_enabled and status == 'SIMULATED'):
                                                 wo.status = 'CANCELLED'
                                                 try:

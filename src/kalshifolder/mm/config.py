@@ -32,6 +32,11 @@ class MMConfig:
     ch_pwd: str = ''
     # optional explicit latest table name (may be 'latest_levels_v2' or 'kalshi.latest_levels_v2')
     latest_table: str = ''
+    # Optional inventory-based skew configuration
+    # skew_per_contract_ticks: how many ticks to skew per contract of inventory
+    # max_skew_ticks: hard cap on total skew in ticks (both directions)
+    skew_per_contract_ticks: int = 0
+    max_skew_ticks: int = 0
 
 
 def load_config_from_env() -> MMConfig:
@@ -64,4 +69,6 @@ def load_config_from_env() -> MMConfig:
         trading_enabled=bool(int(os.getenv('MM_TRADING_ENABLED', '1'))),
         price_units=os.getenv('MM_PRICE_UNITS', 'cents'),
         cancel_strays_enabled=bool(int(os.getenv('MM_CANCEL_STRAYS_ENABLED', '0'))),
+        skew_per_contract_ticks=int(os.getenv('MM_SKEW_PER_CONTRACT_TICKS', '0')),
+        max_skew_ticks=int(os.getenv('MM_MAX_SKEW_TICKS', '0')),
     )
