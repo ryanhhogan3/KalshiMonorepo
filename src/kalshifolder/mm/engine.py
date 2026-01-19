@@ -633,12 +633,13 @@ class Engine:
             bid_px = max(0.01, min(0.99, float(bb) - edge_ticks * tick_size))
             ask_px = max(0.01, min(0.99, float(ba) + edge_ticks * tick_size))
 
+            inv = float(ex_pos or 0)
+
             # Optional inventory-aware skew: nudge quotes to favor flattening
             # exposure. Positive exchange_position = long YES; negative = short YES.
             # NOTE: ASK places BUY NO via complement_100, so lowering the YES ask
             # makes the NO bid more aggressive, and raising the YES ask makes the
             # NO bid less aggressive.
-            inv = float(ex_pos or 0)
             skew_per = getattr(self.config, 'skew_per_contract_ticks', 0) or 0
             max_skew = getattr(self.config, 'max_skew_ticks', 0) or 0
             if skew_per != 0 and max_skew > 0 and inv != 0:
@@ -656,6 +657,39 @@ class Engine:
                         # ask up).
                         bid_px = max(0.01, min(0.99, bid_px + skew_px))
                         ask_px = max(0.01, min(0.99, ask_px + skew_px))
+
+            # Hard flatten-only mode: above a trigger, stop adding risk and
+            # quote only on the flattening side, at aggressive prices.
+            flatten_trigger = getattr(self.config, 'flatten_trigger_pos', 0) or 0
+            flatten_aggr_ticks = getattr(self.config, 'flatten_aggress_ticks', 0) or 0
+            if flatten_trigger > 0 and flatten_aggr_ticks > 0 and abs(inv) >= flatten_trigger:
+                try:
+                    bb_val = float(bb)
+                    ba_val = float(ba)
+                except Exception:
+                    bb_val = None
+                    ba_val = None
+
+                if inv > 0:
+                    # Long YES: do not buy more YES. Only hedge via BUY NO
+                    # (ASK side). Place YES ask close to/inside the market so
+                    # that the NO bid (complement) is competitive.
+                    bid_px = None
+                    if bb_val is not None and ba_val is not None:
+                        lower = bb_val + tick_size
+                        upper = ba_val - flatten_aggr_ticks * tick_size
+                        ask_px = max(lower, upper)
+                        ask_px = max(0.01, min(0.99, ask_px))
+                elif inv < 0:
+                    # Short YES (long NO): do not buy more NO. Only hedge via
+                    # BUY YES (BID side). Place YES bid close to/inside the
+                    # market.
+                    ask_px = None
+                    if bb_val is not None and ba_val is not None:
+                        upper = ba_val - tick_size
+                        lower = bb_val + flatten_aggr_ticks * tick_size
+                        bid_px = min(upper, lower)
+                        bid_px = max(0.01, min(0.99, bid_px))
 
             # enforce non-crossing by construction
             if bid_px >= ask_px:
@@ -704,8 +738,11 @@ class Engine:
             decision_id = uuid4_hex()
             # Compute mid and spread from actual market mid
             mid = (float(bb) + float(ba)) / 2.0
-            spread = float(target.ask_px) - float(target.bid_px)
-            self._log_decision(decision_id, m, float(bb), float(ba), mid, spread, target, mr.inventory, mr.inventory)
+            spread = float(target.ask_px) - float(target.bid_px) if (target.bid_px is not None and target.ask_px is not None) else None
+            # Use reconciled exchange position (ex_pos) as the inventory
+            # snapshot for decisions, so mm_decisions.inv_before matches the
+            # same source of truth used for risk.
+            self._log_decision(decision_id, m, float(bb), float(ba), mid, spread, target, ex_pos, ex_pos)
 
             if not allowed:
                 # Hard gates (KILL_SWITCH/STALE_MARKET) still stop quoting entirely.

@@ -37,6 +37,13 @@ class MMConfig:
     # max_skew_ticks: hard cap on total skew in ticks (both directions)
     skew_per_contract_ticks: int = 0
     max_skew_ticks: int = 0
+    # Flatten-only mode configuration
+    # flatten_trigger_pos: position (in contracts) where we stop adding risk
+    #   and quote only in the flattening direction for that market.
+    # flatten_aggress_ticks: how many ticks off the inside we are willing to
+    #   go when flattening (controls how aggressive the exit quotes are).
+    flatten_trigger_pos: int = 0
+    flatten_aggress_ticks: int = 0
 
 
 def load_config_from_env() -> MMConfig:
@@ -71,4 +78,6 @@ def load_config_from_env() -> MMConfig:
         cancel_strays_enabled=bool(int(os.getenv('MM_CANCEL_STRAYS_ENABLED', '0'))),
         skew_per_contract_ticks=int(os.getenv('MM_SKEW_PER_CONTRACT_TICKS', '0')),
         max_skew_ticks=int(os.getenv('MM_MAX_SKEW_TICKS', '0')),
+        flatten_trigger_pos=int(os.getenv('MM_FLATTEN_TRIGGER_POS', '5')),
+        flatten_aggress_ticks=int(os.getenv('MM_FLATTEN_AGGRESS_TICKS', '5')),
     )
