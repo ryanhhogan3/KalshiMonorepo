@@ -885,6 +885,77 @@ class Engine:
                         bid_px = min(upper, lower)
                         bid_px = max(0.01, min(0.99, bid_px))
 
+            # Maker-only guard: clamp prices so they never cross opposing best
+            # prices, ensuring all fills remain maker (no taker fees).
+            if getattr(self.config, 'maker_only_mode', False):
+                guard_ticks = getattr(self.config, 'maker_only_guard_ticks', 1) or 1
+                try:
+                    guard_ticks = int(guard_ticks)
+                except Exception:
+                    guard_ticks = 1
+                if guard_ticks < 1:
+                    guard_ticks = 1
+                guard_offset = guard_ticks * tick_size
+
+                # Clamp YES bid relative to YES best ask.
+                yes_best_ask = None
+                try:
+                    yes_best_ask = float(ba)
+                except Exception:
+                    yes_best_ask = None
+                if bid_px is not None and yes_best_ask is not None:
+                    max_bid_px = yes_best_ask - guard_offset
+                    if max_bid_px <= 0.0:
+                        logger.debug(json_msg({
+                            "event": "maker_only_disable_bid",
+                            "market": m,
+                            "best_ask": yes_best_ask,
+                            "guard_ticks": guard_ticks,
+                        }))
+                        bid_px = None
+                    else:
+                        if bid_px >= yes_best_ask or bid_px > max_bid_px:
+                            bid_px = min(bid_px, max_bid_px)
+                        bid_px = max(0.01, min(0.99, bid_px))
+
+                # Clamp NO buy relative to NO best ask before converting to YES ask.
+                no_best_ask = None
+                try:
+                    no_best_ask = float(getattr(mr, 'no_ba_px', None))
+                except Exception:
+                    no_best_ask = None
+                if ask_px is not None:
+                    if no_best_ask is None or no_best_ask <= 0.0:
+                        logger.debug(json_msg({
+                            "event": "maker_only_disable_ask",
+                            "market": m,
+                            "reason": "missing_no_best_ask",
+                        }))
+                        ask_px = None
+                    else:
+                        max_no_price = no_best_ask - guard_offset
+                        if max_no_price <= 0.0:
+                            logger.debug(json_msg({
+                                "event": "maker_only_disable_ask",
+                                "market": m,
+                                "reason": "no_headroom",
+                                "no_best_ask": no_best_ask,
+                                "guard_ticks": guard_ticks,
+                            }))
+                            ask_px = None
+                        else:
+                            no_price = 1.0 - ask_px
+                            if no_price >= no_best_ask or no_price > max_no_price:
+                                no_price = min(no_price, max_no_price)
+                            no_price = max(0.01, min(0.99, no_price))
+                            if no_price >= no_best_ask:
+                                no_price = max(0.01, no_best_ask - guard_offset)
+                            if no_price <= 0.0 or no_price >= 1.0:
+                                ask_px = None
+                            else:
+                                ask_px = 1.0 - no_price
+                                ask_px = max(0.01, min(0.99, ask_px))
+
             # enforce non-crossing only when both sides are present
             if bid_px is not None and ask_px is not None and bid_px >= ask_px:
                 ask_px = min(0.99, bid_px + tick_size)

@@ -35,6 +35,8 @@ services:
       MM_MAX_LEVEL_AGE_MS: ${MM_MAX_LEVEL_AGE_MS:-120000}   # tighter for WS
       MM_LOOP_JITTER_MS: ${MM_LOOP_JITTER_MS:-0}
       MM_KILL_ON_STALE: ${MM_KILL_ON_STALE:-0}
+      MM_MAKER_ONLY_MODE: ${MM_MAKER_ONLY_MODE:-1}
+      MM_MAKER_GUARD_TICKS: ${MM_MAKER_GUARD_TICKS:-1}
 
       # --- Trading safety defaults (paper-first) ---
       MM_TRADING_ENABLED: ${MM_TRADING_ENABLED:-0}
