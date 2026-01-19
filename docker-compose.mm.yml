@@ -47,6 +47,15 @@ services:
       MM_MIN_REPRICE_TICKS: ${MM_MIN_REPRICE_TICKS:-1}
       MM_QUOTE_REFRESH_MS: ${MM_QUOTE_REFRESH_MS:-1000}
 
+      # --- Inventory skew / flatten-only controls ---
+      # Skew quotes based on position to favor flattening.
+      MM_SKEW_PER_CONTRACT_TICKS: ${MM_SKEW_PER_CONTRACT_TICKS:-1}
+      MM_MAX_SKEW_TICKS: ${MM_MAX_SKEW_TICKS:-5}
+      # Above this position (per market), stop adding risk and only quote
+      # on the flattening side.
+      MM_FLATTEN_TRIGGER_POS: ${MM_FLATTEN_TRIGGER_POS:-2}
+      MM_FLATTEN_AGGRESS_TICKS: ${MM_FLATTEN_AGGRESS_TICKS:-5}
+
       # --- Singleton engine lock (per account+env) ---
       MM_SINGLETON_LOCK: ${MM_SINGLETON_LOCK:-1}
       # Use a stable per-account+env key; default ties to Kalshi key + DB
