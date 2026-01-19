@@ -44,11 +44,13 @@ class MMConfig:
     #   go when flattening (controls how aggressive the exit quotes are).
     flatten_trigger_pos: int = 0
     flatten_aggress_ticks: int = 0
-    # Maker-only guard: when enabled, ensure every order price sits at least
-    # maker_guard_ticks away from the opposing best price so we never cross
-    # and pay taker fees. The guard value is measured in ticks (cents).
-    maker_only_mode: bool = False
+    # Maker-only guard (permanently enabled): ensure every order price sits at
+    # least maker_guard_ticks away from the opposing best price so we never
+    # cross and pay taker fees. Guard value measured in ticks (cents).
+    maker_only_mode: bool = True
     maker_only_guard_ticks: int = 1
+    # Reconciliation cadence (seconds) for polling REST positions/fills backup.
+    reconcile_interval_sec: int = 3
     # Singleton engine lock configuration
     # When enabled, only one engine instance may hold the lock for a given
     # logical key and therefore trade.
@@ -96,8 +98,9 @@ def load_config_from_env() -> MMConfig:
         max_skew_ticks=int(os.getenv('MM_MAX_SKEW_TICKS', '0')),
         flatten_trigger_pos=int(os.getenv('MM_FLATTEN_TRIGGER_POS', '5')),
         flatten_aggress_ticks=int(os.getenv('MM_FLATTEN_AGGRESS_TICKS', '5')),
-        maker_only_mode=bool(int(os.getenv('MM_MAKER_ONLY_MODE', '0'))),
+        maker_only_mode=True,
         maker_only_guard_ticks=int(os.getenv('MM_MAKER_GUARD_TICKS', '1')),
+        reconcile_interval_sec=int(os.getenv('MM_RECONCILE_INTERVAL_SEC', '3')),
         singleton_lock_enabled=bool(int(os.getenv('MM_SINGLETON_LOCK', '1'))),
         lock_key=os.getenv('MM_LOCK_KEY', ''),
         lock_ttl_sec=int(os.getenv('MM_LOCK_TTL_SEC', '30')),

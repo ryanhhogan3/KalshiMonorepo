@@ -722,6 +722,16 @@ class ReconciliationService:
                     setattr(mr, side_attr, None)
             # adjust inventory
             mr.inventory = mr.inventory + delta
+            # Immediately update the shared snapshot so risk gating sees the
+            # fresh position before the next REST poll.
+            try:
+                snapshot = getattr(self.engine, 'last_exchange_positions_by_ticker', None)
+                if not isinstance(snapshot, dict):
+                    snapshot = {}
+                snapshot[market] = mr.inventory
+                self.engine.last_exchange_positions_by_ticker = snapshot
+            except Exception:
+                logger.exception('fill_snapshot_update_failed')
 
             # track last_fills_ts
             self._last_fills_ts = max(self._last_fills_ts, int(f.get('ts', 0)))

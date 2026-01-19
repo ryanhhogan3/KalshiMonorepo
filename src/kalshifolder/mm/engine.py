@@ -448,6 +448,11 @@ class Engine:
 
     async def reconcile_loop(self):
         last_fills_ts = 0
+        interval_sec = getattr(self.config, 'reconcile_interval_sec', 3) or 3
+        try:
+            interval_sec = max(1, int(interval_sec))
+        except Exception:
+            interval_sec = 3
         while self._running:
             try:
                 fills = self.recon.fetch_and_apply_fills()
@@ -456,7 +461,7 @@ class Engine:
                 self.recon.reconcile_positions()
             except Exception:
                 logger.exception('recon loop failed')
-            await asyncio.sleep(10)
+            await asyncio.sleep(interval_sec)
 
     def _check_and_apply_not_found_circuit_breaker(self, market: str, reject_reason: str, mr) -> bool:
         """
