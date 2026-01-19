@@ -6,6 +6,7 @@ import csv
 import io
 from typing import Dict, Set
 import json
+import socket
 from .config import load_config_from_env
 from .storage.ch_writer import ClickHouseWriter
 from .providers.market_data import ClickHouseMarketDataProvider
@@ -149,6 +150,11 @@ class Engine:
         self._last_position_source_log_ts = 0  # throttle position source logging to once per minute
         # Latest reconciled positions snapshot (source of truth for risk & mm_positions)
         self.last_exchange_positions_by_ticker: Dict[str, float] = {}
+        # Singleton engine lock state
+        self._lock_key = None
+        self._lock_last_holder = None
+        self._lock_last_ts = None
+        self._hostname = socket.gethostname()
         
         # Initialize MarketSelector for hot-reload support
         self.market_selector = MarketSelector()
@@ -156,6 +162,10 @@ class Engine:
         reload_secs = int(os.getenv('MM_MARKETS_RELOAD_SECS', '5'))
         self.market_selector = MarketSelector(reload_secs=reload_secs)
         self._last_active_markets: Set[str] = set()
+
+        # Precompute lock key once config is fully loaded
+        if getattr(self.config, 'singleton_lock_enabled', False):
+            self._lock_key = self._build_lock_key()
 
     def _get_exchange_pos_by_ticker(self) -> dict:
         """Fetch current positions from exchange and return as dict keyed by ticker."""
@@ -173,9 +183,193 @@ class Engine:
                 continue
         return out
 
+    @staticmethod
     def ch_utc_now_str():
-    # ClickHouse DateTime64(3,'UTC') accepts "YYYY-MM-DD HH:MM:SS.mmm"
+        """Return current UTC time formatted for ClickHouse DateTime64(3,'UTC')."""
+        # ClickHouse DateTime64(3,'UTC') accepts "YYYY-MM-DD HH:MM:SS.mmm"
         return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+    def _build_lock_key(self) -> str:
+        """Derive the logical lock key for this engine instance.
+
+        If MM_LOCK_KEY is provided it wins; otherwise derive a stable key from
+        account / DB so multiple engines on the same account collide.
+        """
+        explicit = getattr(self.config, 'lock_key', '') or ''
+        if explicit:
+            return explicit
+
+        # Fallback: use Kalshi key id + DB as a coarse account/env key.
+        account = (self.config.kalshi_key_id or '').strip() or 'no_kid'
+        db = (self.config.ch_db or '').strip() or 'default'
+        return f"mm_engine:{account}:{db}"
+
+    def _parse_lock_row(self, txt: str):
+        """Parse holder/last_ts from a ClickHouse SELECT result.
+
+        Expects TabSeparated[WithNames] with two columns: holder, last_ts.
+        Returns (holder:str|None, last_ts:str|None).
+        """
+        if not txt:
+            return None, None
+        lines = [l for l in txt.splitlines() if l.strip()]
+        if not lines:
+            return None, None
+        # If there is a header row, data will be on the last line.
+        row = lines[-1]
+        # Handle "\N" as NULL
+        parts = row.split('\t')
+        if len(parts) < 2:
+            return None, None
+        holder = parts[0] if parts[0] and parts[0] != '\\N' else None
+        last_ts = parts[1] if parts[1] and parts[1] != '\\N' else None
+        return holder, last_ts
+
+    def _engine_lock_acquire(self) -> bool:
+        """Acquire singleton engine lock in ClickHouse.
+
+        Returns True if lock is acquired (or disabled), False otherwise.
+        """
+        if not getattr(self.config, 'singleton_lock_enabled', False):
+            return True
+
+        lock_key = self._lock_key or self._build_lock_key()
+        if not lock_key:
+            return True
+
+        ttl = int(getattr(self.config, 'lock_ttl_sec', 30) or 30)
+        now_dt = datetime.now(timezone.utc)
+
+        # Check current holder
+        key_escaped = lock_key.replace("'", "''")
+        sql = (
+            f"SELECT argMax(instance_id, ts) AS holder, max(ts) AS last_ts "
+            f"FROM {self.config.ch_db}.mm_engine_lock "
+            f"WHERE lock_key = '{key_escaped}' FORMAT TabSeparatedWithNames"
+        )
+        try:
+            txt = self.ch._exec(sql)
+        except Exception:
+            logger.exception('engine_lock_acquire_select_failed')
+            # Fail-open if CH is unavailable; better to trade than to brick.
+            return True
+
+        holder, last_ts = self._parse_lock_row(txt)
+        self._lock_last_holder = holder
+        self._lock_last_ts = last_ts
+
+        # If another instance has a fresh heartbeat, deny.
+        if holder and holder != self.state.instance_id and last_ts:
+            try:
+                last_dt = datetime.fromisoformat(last_ts.replace(' ', 'T'))
+                age = (now_dt - last_dt).total_seconds()
+            except Exception:
+                age = None
+            if age is not None and age < ttl:
+                logger.error(json_msg({
+                    "event": "engine_lock_denied",
+                    "lock_key": lock_key,
+                    "holder": holder,
+                    "last_ts": last_ts,
+                }))
+                return False
+
+        # Insert our own lock row
+        try:
+            row = {
+                'lock_key': lock_key,
+                'instance_id': self.state.instance_id,
+                'owner_host': self._hostname,
+                'ts': self.ch_utc_now_str(),
+            }
+            self.ch.insert('mm_engine_lock', [row])
+        except Exception:
+            logger.exception('engine_lock_acquire_insert_failed')
+            # Fail-open on insert failure as well.
+            return True
+
+        # Re-read to confirm we are the latest holder
+        try:
+            txt2 = self.ch._exec(sql)
+        except Exception:
+            logger.exception('engine_lock_acquire_confirm_failed')
+            return True
+
+        holder2, last_ts2 = self._parse_lock_row(txt2)
+        self._lock_last_holder = holder2
+        self._lock_last_ts = last_ts2
+
+        if holder2 and holder2 != self.state.instance_id:
+            logger.error(json_msg({
+                "event": "engine_lock_denied",
+                "lock_key": lock_key,
+                "holder": holder2,
+                "last_ts": last_ts2,
+            }))
+            return False
+
+        logger.info(json_msg({
+            "event": "engine_lock_acquired",
+            "lock_key": lock_key,
+            "instance_id": self.state.instance_id,
+        }))
+        return True
+
+    def _engine_lock_heartbeat_tick(self) -> bool:
+        """Send a heartbeat and verify we still hold the lock.
+
+        Returns True if we still hold the lock (or lock disabled), False if
+        lock is lost.
+        """
+        if not getattr(self.config, 'singleton_lock_enabled', False):
+            return True
+
+        lock_key = self._lock_key or self._build_lock_key()
+        if not lock_key:
+            return True
+
+        key_escaped = lock_key.replace("'", "''")
+        sql = (
+            f"SELECT argMax(instance_id, ts) AS holder, max(ts) AS last_ts "
+            f"FROM {self.config.ch_db}.mm_engine_lock "
+            f"WHERE lock_key = '{key_escaped}' FORMAT TabSeparatedWithNames"
+        )
+
+        # Insert heartbeat row
+        try:
+            row = {
+                'lock_key': lock_key,
+                'instance_id': self.state.instance_id,
+                'owner_host': self._hostname,
+                'ts': self.ch_utc_now_str(),
+            }
+            self.ch.insert('mm_engine_lock', [row])
+        except Exception:
+            logger.exception('engine_lock_heartbeat_insert_failed')
+            # On heartbeat failure, keep running; lock semantics are best-effort.
+            return True
+
+        # Check current holder after our heartbeat
+        try:
+            txt = self.ch._exec(sql)
+        except Exception:
+            logger.exception('engine_lock_heartbeat_select_failed')
+            return True
+
+        holder, last_ts = self._parse_lock_row(txt)
+        self._lock_last_holder = holder
+        self._lock_last_ts = last_ts
+
+        if holder and holder != self.state.instance_id:
+            logger.error(json_msg({
+                "event": "engine_lock_lost",
+                "lock_key": lock_key,
+                "holder": holder,
+                "last_ts": last_ts,
+            }))
+            return False
+
+        return True
 
     async def ensure_schema(self):
         # ensure schemas exist
@@ -1394,6 +1588,14 @@ class Engine:
         except Exception:
             logger.exception('initial reconcile_cycle failed')
 
+        # Acquire singleton engine lock before entering the main trading loop.
+        if getattr(self.config, 'singleton_lock_enabled', False):
+            ok = await asyncio.to_thread(self._engine_lock_acquire)
+            if not ok:
+                # Do not start trading without the lock.
+                self._running = False
+                return
+
         # CRITICAL FIX: Startup safety - check if already over position cap
         # If so, disable trading until manually acknowledged
         if self.config.trading_enabled:
@@ -1470,6 +1672,23 @@ class Engine:
             logger.exception('failed to start market data provider')
 
         recon_task = asyncio.create_task(self.reconcile_loop())
+        # Periodic heartbeat to maintain and verify engine lock ownership.
+        heartbeat_task = None
+        if getattr(self.config, 'singleton_lock_enabled', False):
+            async def _heartbeat_loop():
+                refresh = int(getattr(self.config, 'lock_refresh_sec', 10) or 10)
+                while self._running:
+                    try:
+                        ok = await asyncio.to_thread(self._engine_lock_heartbeat_tick)
+                        if not ok:
+                            # Lost the lock; stop trading immediately.
+                            self._running = False
+                            break
+                    except Exception:
+                        logger.exception('engine_lock_heartbeat_loop_failed')
+                    await asyncio.sleep(refresh)
+
+            heartbeat_task = asyncio.create_task(_heartbeat_loop())
         try:
             # WS disconnect kill threshold (seconds)
             ws_kill_s = int(os.getenv('MM_WS_DISCONNECT_KILL_S', '150000'))
@@ -1492,6 +1711,8 @@ class Engine:
         finally:
             self._running = False
             recon_task.cancel()
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
             # ensure provider is stopped
             try:
                 if hasattr(self.md, 'stop'):

@@ -44,6 +44,17 @@ class MMConfig:
     #   go when flattening (controls how aggressive the exit quotes are).
     flatten_trigger_pos: int = 0
     flatten_aggress_ticks: int = 0
+    # Singleton engine lock configuration
+    # When enabled, only one engine instance may hold the lock for a given
+    # logical key and therefore trade.
+    singleton_lock_enabled: bool = True
+    # Optional explicit lock key; if empty, the engine will derive one from
+    # other config (e.g. account / DB).
+    lock_key: str = ''
+    # How long (in seconds) a heartbeat keeps the lock alive.
+    lock_ttl_sec: int = 30
+    # How often (in seconds) to refresh the heartbeat.
+    lock_refresh_sec: int = 10
 
 
 def load_config_from_env() -> MMConfig:
@@ -80,4 +91,8 @@ def load_config_from_env() -> MMConfig:
         max_skew_ticks=int(os.getenv('MM_MAX_SKEW_TICKS', '0')),
         flatten_trigger_pos=int(os.getenv('MM_FLATTEN_TRIGGER_POS', '5')),
         flatten_aggress_ticks=int(os.getenv('MM_FLATTEN_AGGRESS_TICKS', '5')),
+        singleton_lock_enabled=bool(int(os.getenv('MM_SINGLETON_LOCK', '1'))),
+        lock_key=os.getenv('MM_LOCK_KEY', ''),
+        lock_ttl_sec=int(os.getenv('MM_LOCK_TTL_SEC', '30')),
+        lock_refresh_sec=int(os.getenv('MM_LOCK_REFRESH_SEC', '10')),
     )

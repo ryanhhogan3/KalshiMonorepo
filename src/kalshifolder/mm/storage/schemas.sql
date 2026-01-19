@@ -106,3 +106,13 @@ CREATE TABLE IF NOT EXISTS mm_heartbeat (
 ) ENGINE = MergeTree()
 PARTITION BY toDate(ts)
 ORDER BY (ts, engine_instance_id);
+
+-- Singleton engine lock table: ensures only one engine instance trades
+-- per logical account/environment key.
+CREATE TABLE IF NOT EXISTS mm_engine_lock (
+  lock_key String,
+  instance_id String,
+  owner_host String,
+  ts DateTime64(3,'UTC')
+) ENGINE = ReplacingMergeTree(ts)
+ORDER BY lock_key;
