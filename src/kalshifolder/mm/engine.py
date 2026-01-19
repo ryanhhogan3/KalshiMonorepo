@@ -885,8 +885,8 @@ class Engine:
                         bid_px = min(upper, lower)
                         bid_px = max(0.01, min(0.99, bid_px))
 
-            # enforce non-crossing by construction
-            if bid_px >= ask_px:
+            # enforce non-crossing only when both sides are present
+            if bid_px is not None and ask_px is not None and bid_px >= ask_px:
                 ask_px = min(0.99, bid_px + tick_size)
 
             # build a target object compatible with existing downstream code
