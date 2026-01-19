@@ -47,6 +47,13 @@ services:
       MM_MIN_REPRICE_TICKS: ${MM_MIN_REPRICE_TICKS:-1}
       MM_QUOTE_REFRESH_MS: ${MM_QUOTE_REFRESH_MS:-1000}
 
+      # --- Singleton engine lock (per account+env) ---
+      MM_SINGLETON_LOCK: ${MM_SINGLETON_LOCK:-1}
+      # Use a stable per-account+env key; default ties to Kalshi key + DB
+      MM_LOCK_KEY: ${MM_LOCK_KEY:-mm_engine:${KALSHI_KEY_ID:-no_kid}:${CH_DB:-kalshi}}
+      MM_LOCK_TTL_SEC: ${MM_LOCK_TTL_SEC:-30}
+      MM_LOCK_REFRESH_SEC: ${MM_LOCK_REFRESH_SEC:-10}
+
       # --- API creds ---
       KALSHI_KEY_ID: ${KALSHI_KEY_ID}
       KALSHI_PRIVATE_KEY_PATH: /run/secrets/prod_keys.pem
