@@ -13,6 +13,8 @@ class WorkingOrder:
     placed_ts_ms: int
     remaining_size: float = 0.0
     last_update_ts_ms: Optional[int] = None
+    api_side: str = 'yes'  # 'yes' or 'no'
+    action: str = 'buy'    # 'buy' or 'sell'
 
 
 @dataclass
@@ -37,6 +39,9 @@ class MarketRuntimeState:
     working_bid: Optional[WorkingOrder] = None
     working_ask: Optional[WorkingOrder] = None
     inventory: float = 0.0
+    pos_filled: float = 0.0
+    pos_open_exposure: float = 0.0
+    pos_total_est: float = 0.0
     last_quote_ts_ms: Optional[int] = None
     rejects_rolling_counter: int = 0
     # Whether quoting is disabled due to stale data (cleared when fresh data arrives)
@@ -51,10 +56,14 @@ class MarketRuntimeState:
     last_exchange_ts_ms: Optional[int] = None
     # Optional human-readable stale reason (e.g. 'age' or other)
     stale_reason: Optional[str] = None
+    # Last time reconciliation or fill ingestion updated inventory snapshot
+    last_recon_ts_ms: Optional[int] = None
     # Circuit breaker: disable market if not_found spike detected
     disabled_until_ms: Optional[int] = None  # None if not disabled, else timestamp when disabled state expires
     not_found_window_start_ms: Optional[int] = None
     not_found_count: int = 0
+    flatten_long_active: bool = False
+    flatten_short_active: bool = False
 
 
 @dataclass

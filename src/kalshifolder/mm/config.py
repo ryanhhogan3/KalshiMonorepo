@@ -51,6 +51,10 @@ class MMConfig:
     maker_only_guard_ticks: int = 1
     # Reconciliation cadence (seconds) for polling REST positions/fills backup.
     reconcile_interval_sec: int = 3
+    # Inventory semantics / gating knobs
+    inventory_convention: str = 'BUY_YES_POSITIVE'
+    inventory_cap_exit_ratio: float = 0.9
+    max_open_exposure: float = 25.0
     # Singleton engine lock configuration
     # When enabled, only one engine instance may hold the lock for a given
     # logical key and therefore trade.
@@ -101,6 +105,9 @@ def load_config_from_env() -> MMConfig:
         maker_only_mode=True,
         maker_only_guard_ticks=int(os.getenv('MM_MAKER_GUARD_TICKS', '1')),
         reconcile_interval_sec=int(os.getenv('MM_RECONCILE_INTERVAL_SEC', '3')),
+        inventory_convention=os.getenv('MM_INVENTORY_CONVENTION', 'BUY_YES_POSITIVE').upper(),
+        inventory_cap_exit_ratio=float(os.getenv('MM_INVENTORY_CAP_EXIT_RATIO', '0.9')),
+        max_open_exposure=float(os.getenv('MM_MAX_OPEN_EXPOSURE', os.getenv('MM_MAX_POS', '25'))),
         singleton_lock_enabled=bool(int(os.getenv('MM_SINGLETON_LOCK', '1'))),
         lock_key=os.getenv('MM_LOCK_KEY', ''),
         lock_ttl_sec=int(os.getenv('MM_LOCK_TTL_SEC', '30')),

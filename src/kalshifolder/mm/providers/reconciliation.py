@@ -1,19 +1,22 @@
 import logging
 from typing import Optional, Dict, Any
 import time
+import json
 from ..utils.id import uuid4_hex
 from ..utils.logging import json_msg
+from ..utils.inventory import normalize_inventory, DEFAULT_CONVENTION
 
 logger = logging.getLogger(__name__)
 
 
 class ReconciliationService:
-    def __init__(self, engine, exec_provider, ch_writer=None):
+    def __init__(self, engine, exec_provider, ch_writer=None, inventory_convention: str = DEFAULT_CONVENTION):
         # engine: Engine instance (allows calling engine._log_action/_log_response and accessing state)
         self.engine = engine
         self.exec = exec_provider
         self.ch = ch_writer
         self._last_fills_ts = 0
+        self.inventory_convention = (inventory_convention or DEFAULT_CONVENTION).upper()
 
     def _normalize_order(self, o: Dict[str, Any]) -> Dict[str, Any]:
         # tolerate multiple key names
@@ -720,8 +723,10 @@ class ReconciliationService:
                     except Exception:
                         logger.exception('failed to cleanup registry on fill')
                     setattr(mr, side_attr, None)
-            # adjust inventory
+            # adjust inventory and keep filled snapshot in sync
             mr.inventory = mr.inventory + delta
+            mr.pos_filled = mr.inventory
+            mr.last_recon_ts_ms = int(time.time() * 1000)
             # Immediately update the shared snapshot so risk gating sees the
             # fresh position before the next REST poll.
             try:
@@ -750,7 +755,8 @@ class ReconciliationService:
             rows = []
             for p in positions:
                 ticker = p.get('market_ticker') or p.get('market') or p.get('ticker') or ''
-                pos_val = p.get('position') or p.get('qty') or 0
+                raw_pos = p.get('position') or p.get('qty') or 0
+                pos_val = normalize_inventory(raw_pos, self.inventory_convention)
                 avg_cost = p.get('avg_cost') or p.get('avgPrice') or 0
 
                 # Guardrail: never write a row with a blank ticker.
@@ -776,11 +782,31 @@ class ReconciliationService:
                     'source': 'REST_RECON',
                 })
 
+            snapshot_rows = []
+            now_ts = time.strftime('%Y-%m-%d %H:%M:%S')
+            for row in rows:
+                snapshot_rows.append({
+                    'ts': now_ts,
+                    'engine_instance_id': row['engine_instance_id'],
+                    'engine_version': row['engine_version'],
+                    'market_ticker': row['market_ticker'],
+                    'pos_filled': row['position'],
+                    'avg_cost': row['avg_cost'],
+                    'source': row['source'],
+                    'raw_json': json.dumps(row),
+                })
+
             if rows:
                 try:
                     self.ch.insert('mm_positions', rows)
                 except Exception:
                     logger.exception('failed to write positions')
+
+            if snapshot_rows:
+                try:
+                    self.ch.insert('mm_position_snapshots', snapshot_rows)
+                except Exception:
+                    logger.exception('failed to write position snapshots')
 
         # Overwrite engine state and expose a deterministic snapshot for risk.
         # This snapshot is the SINGLE source of truth used for both:
@@ -791,10 +817,13 @@ class ReconciliationService:
             market = p.get('market_ticker') or p.get('market')
             if not market:
                 continue
-            pos_val = float(p.get('position') or p.get('qty') or 0)
+            raw_pos = p.get('position') or p.get('qty') or 0
+            pos_val = normalize_inventory(raw_pos, self.inventory_convention)
             mr = self.engine.store.get_market(market)
             # Inventory now mirrors exactly what we wrote to mm_positions
             mr.inventory = pos_val
+            mr.pos_filled = pos_val
+            mr.last_recon_ts_ms = int(time.time() * 1000)
             pos_snapshot[market] = pos_val
 
         # Make latest reconciled positions available to the engine loop

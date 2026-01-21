@@ -2,34 +2,45 @@ import asyncio
 import os
 import logging
 import time
-import csv
-import io
-from typing import Dict, Set
-import json
-import socket
-from .config import load_config_from_env
-from .storage.ch_writer import ClickHouseWriter
-from .providers.market_data import ClickHouseMarketDataProvider
-from .providers.execution import KalshiExecutionProvider
-from .providers.reconciliation import ReconciliationService
-from .state.models import EngineState, WorkingOrder, OrderRef
-from .state.store import EngineStateStore
-from .strategy.simple_mm import compute_quotes
-from .risk.limits import RiskManager
-from .utils.id import uuid4_hex
-from .utils.time import now_ms
-from .utils.logging import setup_logging, json_msg
-from .utils.price import complement_100
-from .market_selector import MarketSelector
-from collections import deque
-from datetime import datetime, timezone
-import requests
-
-logger = logging.getLogger(__name__)
-
-# Ensure a default event loop is available for code/tests that call
-# `asyncio.get_event_loop().run_until_complete(...)` in older styles.
-try:
+                                status_upper = (wo.status or '').upper()
+                                if status_upper not in ('ACKED', 'SIMULATED'):
+                                    logger.info(json_msg({
+                                        "event": "skip_pending_ack",
+                                        "market": m,
+                                        "side": "BID",
+                                        "status": wo.status,
+                                        "client_order_id": wo.client_order_id,
+                                    }))
+                                    need_replace = False
+                                else:
+                                    # Check if price/size changed
+                                    # Apply min_reprice_ticks threshold in cents (1 tick = 1 cent)
+                                    min_reprice_cents = int(self.config.min_reprice_ticks)
+                                    # Clamp to a sane range so misconfigured values (e.g. 100) don't freeze quotes
+                                    if min_reprice_cents < 0:
+                                        min_reprice_cents = 0
+                                    elif min_reprice_cents > 50:
+                                        min_reprice_cents = 50
+                                    price_diff = abs(new_price_cents - wo.price_cents)
+                                    
+                                    if int(wo.size) != int(target.bid_sz):
+                                        # Size changed: always reprice
+                                        need_replace = True
+                                    elif price_diff >= min_reprice_cents:
+                                        # Price moved enough: reprice
+                                        need_replace = True
+                                    else:
+                                        # Same price/size or tiny move: no-op, don't cancel/replace
+                                        logger.info(json_msg({
+                                            "event": "skip_same_quote",
+                                            "market": m,
+                                            "side": "BID",
+                                            "old_price_cents": wo.price_cents,
+                                            "new_price_cents": new_price_cents,
+                                            "price_diff_cents": price_diff,
+                                            "min_reprice_cents": min_reprice_cents,
+                                        }))
+                                        need_replace = False
     asyncio.get_event_loop()
 except RuntimeError:
     try:
@@ -133,14 +144,22 @@ class Engine:
         except Exception:
             pass
         # pass engine reference to reconciliation service so it can update state and log via engine
-        self.recon = ReconciliationService(self, self.exec, ch_writer=self.ch)
+        self.recon = ReconciliationService(
+            self,
+            self.exec,
+            ch_writer=self.ch,
+            inventory_convention=getattr(self.config, 'inventory_convention', 'BUY_YES_POSITIVE'),
+        )
         self.state = EngineState(instance_id=uuid4_hex(), version='dev')
         self.store = EngineStateStore(self.state)
         self.risk = RiskManager(params={
             'MM_MAX_POS': self.config.max_pos,
+            'MM_MAX_LONG_POS': self.config.max_long_pos,
+            'MM_MAX_SHORT_POS': self.config.max_short_pos,
             'MM_MAX_REJECTS_PER_MIN': self.config.max_rejects_per_min,
             'MM_KILL_ON_STALE': self.config.kill_on_stale,
             'MM_KILL_ON_REJECT_SPIKE': self.config.kill_on_reject_spike,
+            'MM_INVENTORY_CAP_EXIT_RATIO': self.config.inventory_cap_exit_ratio,
         })
         self._running = False
         self.market_locks: Dict[str, asyncio.Lock] = {}
@@ -182,6 +201,66 @@ class Engine:
             except Exception:
                 continue
         return out
+
+    @staticmethod
+    def _remaining_contracts(order: Optional[WorkingOrder]) -> float:
+        """Return remaining open size for a working order (contracts)."""
+        if not order:
+            return 0.0
+        status = (order.status or '').upper()
+        if status in ('CANCELLED', 'REJECTED'):
+            return 0.0
+        remaining = getattr(order, 'remaining_size', None)
+        try:
+            remaining_val = float(remaining)
+        except (TypeError, ValueError):
+            remaining_val = None
+        if remaining_val is None or remaining_val <= 0:
+            try:
+                remaining_val = float(getattr(order, 'size', 0.0))
+            except (TypeError, ValueError):
+                remaining_val = 0.0
+        return max(0.0, remaining_val)
+
+    def _compute_open_orders_snapshot(self, mr: Optional[MarketRuntimeState]) -> dict:
+        """Return per-side open order metrics + YES exposure."""
+        snapshot = {
+            'count': 0,
+            'pos_open_exposure': 0.0,
+            'open_yes_bid_size': 0.0,
+            'open_yes_ask_size': 0.0,
+            'open_no_bid_size': 0.0,
+            'open_no_ask_size': 0.0,
+        }
+        if mr is None:
+            return snapshot
+
+        orders = [getattr(mr, 'working_bid', None), getattr(mr, 'working_ask', None)]
+        for wo in orders:
+            if not wo:
+                continue
+            status = (wo.status or '').upper()
+            if status in ('CANCELLED', 'REJECTED'):
+                continue
+            remaining = self._remaining_contracts(wo)
+            if remaining <= 0:
+                continue
+            snapshot['count'] += 1
+
+            api_side = (wo.api_side or 'yes').lower()
+            internal_side = (wo.side or '').upper()
+            if api_side == 'yes' and internal_side == 'BID':
+                snapshot['open_yes_bid_size'] += remaining
+            elif api_side == 'yes' and internal_side == 'ASK':
+                snapshot['open_yes_ask_size'] += remaining
+            elif api_side == 'no' and internal_side == 'BID':
+                snapshot['open_no_bid_size'] += remaining
+            else:
+                snapshot['open_no_ask_size'] += remaining
+
+            snapshot['pos_open_exposure'] += exposure_delta(remaining, api_side, wo.action)
+
+        return snapshot
 
     @staticmethod
     def ch_utc_now_str():
@@ -378,7 +457,30 @@ class Engine:
         except Exception:
             logger.exception('ensure_schema failed')
 
-    def _log_decision(self, decision_id: str, market: str, bb, ba, mid, spread, target, inv_before, inv_after_est):
+    def _log_decision(
+        self,
+        decision_id: str,
+        market: str,
+        bb,
+        ba,
+        mid,
+        spread,
+        target,
+        inv_before,
+        inv_after_est,
+        *,
+        pos_filled: float = 0.0,
+        pos_open_exposure: float = 0.0,
+        pos_total_est: float = 0.0,
+        allowed: bool = True,
+        block_stage: str = '',
+        block_codes: Optional[List[str]] = None,
+        inv_convention: str = DEFAULT_CONVENTION,
+        open_snapshot: Optional[dict] = None,
+        reason_codes: Optional[List[str]] = None,
+    ):
+        snap = open_snapshot or {}
+        reason_list = reason_codes if reason_codes is not None else (block_codes or [])
         row = {
             'ts': time.strftime('%Y-%m-%d %H:%M:%S'),
             'decision_id': decision_id,
@@ -396,7 +498,19 @@ class Engine:
             'target_ask_sz': target.ask_sz,
             'inv_before': inv_before,
             'inv_after_est': inv_after_est,
-            'reason_codes': [],
+            'pos_filled': pos_filled,
+            'pos_open_exposure': pos_open_exposure,
+            'pos_total_est': pos_total_est,
+            'allowed': 1 if allowed else 0,
+            'block_stage': block_stage or '',
+            'block_codes': block_codes or [],
+            'inv_convention': inv_convention or DEFAULT_CONVENTION,
+            'reason_codes': reason_list,
+            'open_orders_count': snap.get('count', 0),
+            'open_yes_bid_size': snap.get('open_yes_bid_size', 0.0),
+            'open_yes_ask_size': snap.get('open_yes_ask_size', 0.0),
+            'open_no_bid_size': snap.get('open_no_bid_size', 0.0),
+            'open_no_ask_size': snap.get('open_no_ask_size', 0.0),
             'params_json': json.dumps({}),
         }
         try:
@@ -778,9 +892,17 @@ class Engine:
             bb = mr.last_bb_px
             ba = mr.last_ba_px  # may be garbage from WS
 
-            # Exchange position from reconciled snapshot: single source of truth.
-            ex_pos = int(pos_by_ticker.get(m, mr.inventory or 0))
-            mr.exchange_position = ex_pos  # store for visibility / logs only
+            # Exchange (filled) position from reconciled snapshot.
+            pos_filled = float(pos_by_ticker.get(m, mr.inventory or 0))
+            mr.exchange_position = pos_filled  # retain legacy field for visibility
+
+            open_snapshot = self._compute_open_orders_snapshot(mr)
+            pos_open_exposure = open_snapshot.get('pos_open_exposure', 0.0)
+            pos_total_est = pos_filled + pos_open_exposure
+
+            mr.pos_filled = pos_filled
+            mr.pos_open_exposure = pos_open_exposure
+            mr.pos_total_est = pos_total_est
 
             # Proper YES book validation: require both bid and ask, both in (0, 1), bid < ask
             if bb is None or ba is None:
@@ -817,12 +939,66 @@ class Engine:
                     "ask_client": (mr.working_ask.client_order_id if mr.working_ask else None),
                     "bid_px_cents": (mr.working_bid.price_cents if mr.working_bid else None),
                     "ask_px_cents": (mr.working_ask.price_cents if mr.working_ask else None),
-                    "exchange_position": ex_pos,
+                    "exchange_position": pos_filled,
+                    "pos_open_exposure": pos_open_exposure,
+                    "pos_total_est": pos_total_est,
+                    "open_orders_count": open_snapshot.get('count', 0),
                     "md_yes_bb": bb,
                     "md_yes_ba": ba,
                     "md_no_bb": mr.no_bb_px,
                     "md_no_ba": mr.no_ba_px,
                 }))
+
+            decision_reason_codes: List[str] = []
+            max_open_exposure = float(getattr(self.config, 'max_open_exposure', self.config.max_pos) or self.config.max_pos)
+            open_orders_count = open_snapshot.get('count', 0)
+            total_open_contracts = (
+                open_snapshot.get('open_yes_bid_size', 0.0)
+                + open_snapshot.get('open_yes_ask_size', 0.0)
+                + open_snapshot.get('open_no_bid_size', 0.0)
+                + open_snapshot.get('open_no_ask_size', 0.0)
+            )
+
+            if open_orders_count == 0 and abs(pos_open_exposure) > 1e-6:
+                decision_reason_codes.append('open_exposure_without_orders')
+                logger.error(json_msg({
+                    "event": "invariant_open_exposure_without_orders",
+                    "market": m,
+                    "pos_open_exposure": pos_open_exposure,
+                }))
+
+            if abs(pos_open_exposure) > max_open_exposure:
+                decision_reason_codes.append('open_exposure_exceeds_limit')
+                logger.error(json_msg({
+                    "event": "invariant_open_exposure_limit",
+                    "market": m,
+                    "pos_open_exposure": pos_open_exposure,
+                    "limit": max_open_exposure,
+                    "open_orders_count": open_orders_count,
+                }))
+
+            if total_open_contracts + 1e-6 < abs(pos_open_exposure):
+                decision_reason_codes.append('open_exposure_out_of_bounds')
+                logger.error(json_msg({
+                    "event": "invariant_open_exposure_mismatch",
+                    "market": m,
+                    "pos_open_exposure": pos_open_exposure,
+                    "total_open_contracts": total_open_contracts,
+                }))
+
+            last_logged_pos = getattr(mr, '_last_logged_pos_filled', pos_filled)
+            last_logged_recon_ts = getattr(mr, '_last_logged_pos_recon_ts_ms', mr.last_recon_ts_ms)
+            if abs(pos_filled - last_logged_pos) > 1e-6:
+                if mr.last_recon_ts_ms == last_logged_recon_ts:
+                    decision_reason_codes.append('pos_change_without_recon')
+                    logger.error(json_msg({
+                        "event": "invariant_pos_change_without_recon",
+                        "market": m,
+                        "pos_filled_prev": last_logged_pos,
+                        "pos_filled_now": pos_filled,
+                    }))
+            mr._last_logged_pos_filled = pos_filled
+            mr._last_logged_pos_recon_ts_ms = mr.last_recon_ts_ms
 
             # Quote computation: use both bid and ask from market
             edge_ticks = int(self.config.edge_ticks)
@@ -832,10 +1008,10 @@ class Engine:
             bid_px = max(0.01, min(0.99, float(bb) - edge_ticks * tick_size))
             ask_px = max(0.01, min(0.99, float(ba) + edge_ticks * tick_size))
 
-            inv = float(ex_pos or 0)
+            inv = float(pos_total_est)
 
             # Optional inventory-aware skew: nudge quotes to favor flattening
-            # exposure. Positive exchange_position = long YES; negative = short YES.
+            # exposure. Positive pos_total_est = long YES; negative = short YES.
             # NOTE: ASK places BUY NO via complement_100, so lowering the YES ask
             # makes the NO bid more aggressive, and raising the YES ask makes the
             # NO bid less aggressive.
@@ -920,7 +1096,9 @@ class Engine:
                         bid_px = None
                     else:
                         if bid_px >= yes_best_ask or bid_px > max_bid_px:
-                            bid_px = min(bid_px, max_bid_px)
+                            "pos_filled": pos_filled,
+                            "pos_open": pos_open,
+                            "pos_total_est": pos_total_est,
                         bid_px = max(0.01, min(0.99, bid_px))
 
                 # Clamp NO buy relative to NO best ask before converting to YES ask.
@@ -975,10 +1153,36 @@ class Engine:
 
             target = _Target(bid_px=bid_px, ask_px=ask_px, bid_sz=float(self.config.size), ask_sz=float(self.config.size))
 
+            preview_bid_risk = None
+            preview_ask_risk = None
+            if target.bid_px is not None:
+                preview_bid_risk = self.risk.check_market(mr, exchange_position=pos_total_est, intended_delta=target.bid_sz)
+                if preview_bid_risk.block_codes:
+                    decision_reason_codes.extend(preview_bid_risk.block_codes)
+            if target.ask_px is not None:
+                preview_ask_risk = self.risk.check_market(mr, exchange_position=pos_total_est, intended_delta=-target.ask_sz)
+                if preview_ask_risk.block_codes:
+                    decision_reason_codes.extend(preview_ask_risk.block_codes)
+
             # Global risk check here is ONLY for kill / stale gating.
-            # Position-cap enforcement (including reduce-only logic) happens per-side
-            # using explicit intended_delta values for each order.
-            allowed, reason = self.risk.check_market(mr, exchange_position=ex_pos, intended_delta=0.0)
+            risk_global = self.risk.check_market(mr, exchange_position=pos_total_est, intended_delta=0.0)
+            decision_allowed = risk_global.allowed
+            decision_block_stage = 'risk' if not risk_global.allowed else ''
+            decision_block_codes = list(risk_global.block_codes or [])
+
+            bid_side_allowed = bool(preview_bid_risk and preview_bid_risk.allowed and target.bid_px is not None)
+            ask_side_allowed = bool(preview_ask_risk and preview_ask_risk.allowed and target.ask_px is not None)
+
+            if decision_allowed and not (bid_side_allowed or ask_side_allowed):
+                decision_allowed = False
+                decision_block_stage = 'side_risk'
+                if preview_bid_risk and preview_bid_risk.block_codes:
+                    decision_block_codes.extend(preview_bid_risk.block_codes)
+                if preview_ask_risk and preview_ask_risk.block_codes:
+                    decision_block_codes.extend(preview_ask_risk.block_codes)
+
+            decision_block_codes = list(dict.fromkeys(decision_block_codes))
+            combined_reason_codes = list(dict.fromkeys(decision_reason_codes + decision_block_codes))
             
             # Check if market is disabled by circuit breaker
             if mr.disabled_until_ms is not None and now < mr.disabled_until_ms:
@@ -995,32 +1199,58 @@ class Engine:
                 "trading_enabled": bool(self.config.trading_enabled),
                 "md_ok": bool(mr.md_ok),
                 "kill_stale": bool(mr.kill_stale),
-                "risk_allowed": bool(allowed),
-                "risk_reason": reason,
+                "risk_allowed": bool(decision_allowed),
+                "risk_reason": risk_global.reason,
                 "bb": bb,
                 "ba": ba,
                 "target_bid_px": target.bid_px,
                 "target_ask_px": target.ask_px,
                 "target_bid_sz": target.bid_sz,
                 "target_ask_sz": target.ask_sz,
+                "pos_filled": pos_filled,
+                "pos_open_exposure": pos_open_exposure,
+                "pos_total_est": pos_total_est,
+                "open_orders_count": open_orders_count,
+                "block_codes": decision_block_codes,
             }))
 
             decision_id = uuid4_hex()
             # Compute mid and spread from actual market mid
             mid = (float(bb) + float(ba)) / 2.0
             spread = float(target.ask_px) - float(target.bid_px) if (target.bid_px is not None and target.ask_px is not None) else None
-            # Use reconciled exchange position (ex_pos) as the inventory
-            # snapshot for decisions, so mm_decisions.inv_before matches the
-            # same source of truth used for risk.
-            self._log_decision(decision_id, m, float(bb), float(ba), mid, spread, target, ex_pos, ex_pos)
+            # Log filled/open/total position snapshots so ClickHouse matches
+            # the exact state the risk layer used for this decision.
+            self._log_decision(
+                decision_id,
+                m,
+                float(bb),
+                float(ba),
+                mid,
+                spread,
+                target,
+                pos_total_est,
+                pos_total_est,
+                pos_filled=pos_filled,
+                pos_open_exposure=pos_open_exposure,
+                pos_total_est=pos_total_est,
+                allowed=decision_allowed,
+                block_stage=decision_block_stage,
+                block_codes=decision_block_codes,
+                inv_convention=getattr(self.config, 'inventory_convention', DEFAULT_CONVENTION),
+                open_snapshot=open_snapshot,
+                reason_codes=combined_reason_codes,
+            )
 
-            if not allowed:
+            if not decision_allowed:
                 # Hard gates (KILL_SWITCH/STALE_MARKET) still stop quoting entirely.
                 logger.info(json_msg({
                     "event": "risk_block_global",
                     "market": m,
-                    "exchange_position": ex_pos,
-                    "reason": reason,
+                    "pos_filled": pos_filled,
+                    "pos_open_exposure": pos_open_exposure,
+                    "pos_total_est": pos_total_est,
+                    "reason": risk_global.reason,
+                    "block_codes": decision_block_codes,
                 }))
                 continue
 
@@ -1056,17 +1286,19 @@ class Engine:
 
                 # BID side replace semantics
                 if target.bid_px is not None:
-                    # Per-side risk check: BID = BUY YES = +delta
                     bid_intended_delta = target.bid_sz
-                    bid_allowed, bid_reason = self.risk.check_market(mr, exchange_position=ex_pos, intended_delta=bid_intended_delta)
-                    
-                    if not bid_allowed:
+                    bid_risk = preview_bid_risk
+
+                    if not bid_risk or not bid_risk.allowed:
                         logger.info(json_msg({
                             "event": "risk_block_bid_side",
                             "market": m,
-                            "exchange_position": ex_pos,
+                            "pos_filled": pos_filled,
+                            "pos_open_exposure": pos_open_exposure,
+                            "pos_total_est": pos_total_est,
                             "bid_intended_delta": bid_intended_delta,
-                            "reason": bid_reason
+                            "block_codes": (bid_risk.block_codes if bid_risk else []),
+                            "reason": (bid_risk.reason if bid_risk else 'NO_RISK_PREVIEW'),
                         }))
                     else:
                         # Check minimum replace interval
@@ -1220,6 +1452,8 @@ class Engine:
                                         placed_ts_ms=now,
                                         remaining_size=target.bid_sz,
                                         last_update_ts_ms=now,
+                                        api_side='yes',
+                                        action='buy',
                                     )
                                     mr.working_bid = wo_new
                                     last['bid_px'] = target.bid_px
@@ -1290,6 +1524,8 @@ class Engine:
                                         placed_ts_ms=now,
                                         remaining_size=target.bid_sz,
                                         last_update_ts_ms=now,
+                                        api_side='yes',
+                                        action='buy',
                                     )
                                     mr.working_bid = wo_new
                                     logger.info(json_msg({"event":"wo_set","market":m,"side":"BID","client_order_id":client_order_id,"exchange_order_id":sim_exch,"price_cents":new_price_cents,"size":target.bid_sz}))
@@ -1308,17 +1544,19 @@ class Engine:
 
                 # ASK side replace semantics
                 if target.ask_px is not None:
-                    # Per-side risk check: ASK = BUY NO = -delta (reduces YES exposure)
                     ask_intended_delta = -target.ask_sz
-                    ask_allowed, ask_reason = self.risk.check_market(mr, exchange_position=ex_pos, intended_delta=ask_intended_delta)
-                    
-                    if not ask_allowed:
+                    ask_risk = preview_ask_risk
+
+                    if not ask_risk or not ask_risk.allowed:
                         logger.info(json_msg({
                             "event": "risk_block_ask_side",
                             "market": m,
-                            "exchange_position": ex_pos,
+                            "pos_filled": pos_filled,
+                            "pos_open_exposure": pos_open_exposure,
+                            "pos_total_est": pos_total_est,
                             "ask_intended_delta": ask_intended_delta,
-                            "reason": ask_reason
+                            "block_codes": (ask_risk.block_codes if ask_risk else []),
+                            "reason": (ask_risk.reason if ask_risk else 'NO_RISK_PREVIEW'),
                         }))
                     else:
                         # Check minimum replace interval
@@ -1332,34 +1570,45 @@ class Engine:
                             if wo is None:
                                 need_replace = True
                             else:
-                                # Check if price/size changed
-                                # Apply min_reprice_ticks threshold in cents (1 tick = 1 cent)
-                                min_reprice_cents = int(self.config.min_reprice_ticks)
-                                # Clamp to a sane range so misconfigured values (e.g. 100) don't freeze quotes
-                                if min_reprice_cents < 0:
-                                    min_reprice_cents = 0
-                                elif min_reprice_cents > 50:
-                                    min_reprice_cents = 50
-                                price_diff = abs(new_price_cents - wo.price_cents)
-                                
-                                if int(wo.size) != int(target.ask_sz):
-                                    # Size changed: always reprice
-                                    need_replace = True
-                                elif price_diff >= min_reprice_cents:
-                                    # Price moved enough: reprice
-                                    need_replace = True
-                                else:
-                                    # Same price/size or tiny move: no-op, don't cancel/replace
+                                status_upper = (wo.status or '').upper()
+                                if status_upper not in ('ACKED', 'SIMULATED'):
                                     logger.info(json_msg({
-                                        "event": "skip_same_quote",
+                                        "event": "skip_pending_ack",
                                         "market": m,
                                         "side": "ASK",
-                                        "old_price_cents": wo.price_cents,
-                                        "new_price_cents": new_price_cents,
-                                        "price_diff_cents": price_diff,
-                                        "min_reprice_cents": min_reprice_cents,
+                                        "status": wo.status,
+                                        "client_order_id": wo.client_order_id,
                                     }))
                                     need_replace = False
+                                else:
+                                    # Check if price/size changed
+                                    # Apply min_reprice_ticks threshold in cents (1 tick = 1 cent)
+                                    min_reprice_cents = int(self.config.min_reprice_ticks)
+                                    # Clamp to a sane range so misconfigured values (e.g. 100) don't freeze quotes
+                                    if min_reprice_cents < 0:
+                                        min_reprice_cents = 0
+                                    elif min_reprice_cents > 50:
+                                        min_reprice_cents = 50
+                                    price_diff = abs(new_price_cents - wo.price_cents)
+                                    
+                                    if int(wo.size) != int(target.ask_sz):
+                                        # Size changed: always reprice
+                                        need_replace = True
+                                    elif price_diff >= min_reprice_cents:
+                                        # Price moved enough: reprice
+                                        need_replace = True
+                                    else:
+                                        # Same price/size or tiny move: no-op, don't cancel/replace
+                                        logger.info(json_msg({
+                                            "event": "skip_same_quote",
+                                            "market": m,
+                                            "side": "ASK",
+                                            "old_price_cents": wo.price_cents,
+                                            "new_price_cents": new_price_cents,
+                                            "price_diff_cents": price_diff,
+                                            "min_reprice_cents": min_reprice_cents,
+                                        }))
+                                        need_replace = False
 
                             if need_replace:
                                 # ensure status/exch_id are always defined (paper or live)
@@ -1469,6 +1718,8 @@ class Engine:
                                         placed_ts_ms=now,
                                         remaining_size=target.ask_sz,
                                         last_update_ts_ms=now,
+                                        api_side='no',
+                                        action='buy',
                                     )
                                     mr.working_ask = wo_new
                                     last['ask_px'] = target.ask_px
@@ -1547,6 +1798,8 @@ class Engine:
                                         placed_ts_ms=now,
                                         remaining_size=target.ask_sz,
                                         last_update_ts_ms=now,
+                                        api_side='no',
+                                        action='buy',
                                     )
                                     mr.working_ask = wo_new
                                     logger.info(json_msg({"event":"wo_set","market":m,"side":"ASK","client_order_id":client_order_id,"exchange_order_id":sim_exch,"price_cents":no_price_cents,"size":target.ask_sz}))

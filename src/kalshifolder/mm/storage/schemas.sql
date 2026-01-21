@@ -16,8 +16,33 @@ CREATE TABLE IF NOT EXISTS mm_decisions (
   target_ask_sz Float64,
   inv_before Float64,
   inv_after_est Float64,
-  reason_codes Array(String),
+  pos_filled Float64 DEFAULT 0,
+  pos_open_exposure Float64 DEFAULT 0,
+  pos_total_est Float64 DEFAULT 0,
+  allowed UInt8 DEFAULT 1,
+  block_stage LowCardinality(String) DEFAULT '',
+  block_codes Array(LowCardinality(String)) DEFAULT [],
+  inv_convention LowCardinality(String) DEFAULT '',
+  reason_codes Array(String) DEFAULT [],
+  open_orders_count UInt32 DEFAULT 0,
+  open_yes_bid_size Float64 DEFAULT 0,
+  open_yes_ask_size Float64 DEFAULT 0,
+  open_no_bid_size Float64 DEFAULT 0,
+  open_no_ask_size Float64 DEFAULT 0,
   params_json String
+) ENGINE = MergeTree()
+PARTITION BY toDate(ts)
+ORDER BY (market_ticker, ts);
+
+CREATE TABLE IF NOT EXISTS mm_position_snapshots (
+  ts DateTime64(3,'UTC'),
+  engine_instance_id String,
+  engine_version String,
+  market_ticker String,
+  pos_filled Float64,
+  avg_cost Float64,
+  source LowCardinality(String),
+  raw_json String
 ) ENGINE = MergeTree()
 PARTITION BY toDate(ts)
 ORDER BY (market_ticker, ts);

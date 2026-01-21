@@ -1,7 +1,17 @@
-from typing import Dict, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class RiskDecision:
+    allowed: bool
+    block_stage: str = ''
+    block_codes: List[str] = field(default_factory=list)
+    flatten_only: bool = False
+    reason: str = ''
 
 
 class RiskManager:
@@ -10,39 +20,70 @@ class RiskManager:
         self.rejects_per_min = {}
         self.kill = False
 
-    def check_market(self, market_state, exchange_position: float = 0.0, intended_delta: float = 0.0) -> Tuple[bool, str]:
-        # returns (allowed, reason)
-        # Binary gate: can we quote this market at all?
+    def _inventory_bounds(self, market_state) -> Dict[str, float]:
+        max_long = float(self.params.get('MM_MAX_LONG_POS', self.params.get('MM_MAX_POS', 5)))
+        max_short = float(self.params.get('MM_MAX_SHORT_POS', self.params.get('MM_MAX_POS', 5)))
+        exit_ratio = float(self.params.get('MM_INVENTORY_CAP_EXIT_RATIO', 0.9))
+        exit_ratio = max(0.0, min(exit_ratio, 1.0))
+        return {
+            'enter_long': max_long,
+            'exit_long': max_long * exit_ratio,
+            'enter_short': -max_short,
+            'exit_short': -max_short * exit_ratio,
+        }
+
+    def _update_hysteresis_flags(self, market_state, pos: float):
+        bounds = self._inventory_bounds(market_state)
+        if pos >= bounds['enter_long']:
+            market_state.flatten_long_active = True
+        elif pos <= bounds['exit_long']:
+            market_state.flatten_long_active = False
+
+        if pos <= bounds['enter_short']:
+            market_state.flatten_short_active = True
+        elif pos >= bounds['exit_short']:
+            market_state.flatten_short_active = False
+
+    def check_market(self, market_state, exchange_position: float = 0.0, intended_delta: float = 0.0) -> RiskDecision:
         if self.kill:
-            return False, 'KILL_SWITCH'
+            return RiskDecision(False, block_stage='risk', block_codes=['kill_switch'], reason='KILL_SWITCH')
         if market_state.kill_stale and self.params.get('MM_KILL_ON_STALE', 1):
-            return False, 'STALE_MARKET'
-        
-        # Position-cap logic:
-        # - Global calls (intended_delta == 0) only care about KILL/STALE above.
-        # - Per-order calls (non-zero intended_delta) enforce cap + reduce-only.
-        max_pos = self.params.get('MM_MAX_POS', 5)
+            return RiskDecision(False, block_stage='risk', block_codes=['stale_market'], reason='STALE_MARKET')
+
         pos = float(exchange_position or 0.0)
+        self._update_hysteresis_flags(market_state, pos)
 
-        # If no intended delta, treat as a pure health check (kill/stale only).
+        # Pure health check (global call) just reports whether general gating is ok.
         if not intended_delta:
-            return True, ''
+            return RiskDecision(True, reason='')
 
-        projected_position = pos + intended_delta
+        projected = pos + intended_delta
+        bounds = self._inventory_bounds(market_state)
+        max_pos = float(self.params.get('MM_MAX_POS', bounds['enter_long']))
 
-        # 1) Normal regime: |pos| < max_pos → block any order that would exceed cap.
-        if abs(pos) < max_pos:
-            if abs(projected_position) > max_pos:
-                return False, f'WOULD_EXCEED_CAP (pos={pos}, delta={intended_delta}, max={max_pos})'
-            return True, ''
+        block_codes: List[str] = []
+        flatten_only = False
 
-        # 2) Over-cap regime: |pos| >= max_pos → allow ONLY reduce-only moves.
-        # Reduce-only means the order moves position TOWARD zero (reduces |pos|).
-        if abs(projected_position) < abs(pos):
-            return True, f'REDUCE_ONLY_OK (pos={pos}, delta={intended_delta}, max={max_pos})'
+        if market_state.flatten_long_active:
+            flatten_only = True
+            if intended_delta > 0:
+                block_codes.append('inventory_limit_long')
+        if market_state.flatten_short_active:
+            flatten_only = True
+            if intended_delta < 0:
+                block_codes.append('inventory_limit_short')
 
-        # Any other move (same or larger |pos|) is blocked while over/at cap.
-        return False, f'REDUCE_ONLY_BLOCK (pos={pos}, delta={intended_delta}, max={max_pos})'
+        if block_codes:
+            reduce_only_ok = abs(projected) < abs(pos)
+            if reduce_only_ok:
+                return RiskDecision(True, block_codes=block_codes, flatten_only=True, reason='REDUCE_ONLY_OK')
+            return RiskDecision(False, block_stage='risk', block_codes=block_codes, flatten_only=True, reason='REDUCE_ONLY_BLOCK')
+
+        if abs(projected) > max_pos:
+            block_codes.append('would_exceed_cap')
+            return RiskDecision(False, block_stage='risk', block_codes=block_codes, reason=f'WOULD_EXCEED_CAP pos={pos} delta={intended_delta}')
+
+        return RiskDecision(True, reason='')
 
     def allowed_actions(self, market_state, exchange_position: float = 0.0):
         """
