@@ -776,6 +776,7 @@ class ReconciliationService:
                 rows.append({
                     'ts': time.strftime('%Y-%m-%d %H:%M:%S'),
                     'engine_instance_id': self.engine.state.instance_id,
+                    'engine_version': getattr(self.engine.state, 'version', ''),
                     'market_ticker': ticker,
                     'position': pos_val,
                     'avg_cost': avg_cost,
