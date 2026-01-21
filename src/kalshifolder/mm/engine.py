@@ -18,7 +18,7 @@ from .state.models import EngineState, MarketRuntimeState, WorkingOrder
 from .state.store import EngineStateStore
 from .storage.ch_writer import ClickHouseWriter
 from .utils.id import uuid4_hex
-from .utils.inventory import exposure_delta
+from .utils.inventory import DEFAULT_CONVENTION, exposure_delta
 from .utils.logging import json_msg, setup_logging
 from .utils.time import now_ms
 
