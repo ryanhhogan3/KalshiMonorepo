@@ -1059,10 +1059,18 @@ class Engine:
                         bid_px = None
                     else:
                         if bid_px >= yes_best_ask or bid_px > max_bid_px:
-                            "pos_filled": pos_filled,
-                            "pos_open": pos_open,
-                            "pos_total_est": pos_total_est,
-                        bid_px = max(0.01, min(0.99, bid_px))
+                            logger.debug(json_msg({
+                                "event": "maker_only_clamp_bid",
+                                "market": m,
+                                "best_ask": yes_best_ask,
+                                "guard_ticks": guard_ticks,
+                                "original_bid": bid_px,
+                                "max_bid": max_bid_px,
+                                "pos_filled": pos_filled,
+                                "pos_open": pos_open,
+                                "pos_total_est": pos_total_est,
+                            }))
+                        bid_px = max(0.01, min(0.99, min(bid_px, max_bid_px)))
 
                 # Clamp NO buy relative to NO best ask before converting to YES ask.
                 no_best_ask = None
