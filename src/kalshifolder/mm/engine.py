@@ -4,6 +4,7 @@ import logging
 import os
 import socket
 import time
+import requests
 from collections import deque
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set
@@ -14,7 +15,7 @@ from .providers.execution import KalshiExecutionProvider
 from .providers.market_data import ClickHouseMarketDataProvider
 from .providers.reconciliation import ReconciliationService
 from .risk.limits import RiskManager
-from .state.models import EngineState, MarketRuntimeState, WorkingOrder
+from .state.models import EngineState, MarketRuntimeState, OrderRef, WorkingOrder
 from .state.store import EngineStateStore
 from .storage.ch_writer import ClickHouseWriter
 from .utils.id import uuid4_hex
