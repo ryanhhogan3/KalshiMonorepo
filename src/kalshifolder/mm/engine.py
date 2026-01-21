@@ -2,45 +2,8 @@ import asyncio
 import os
 import logging
 import time
-                                status_upper = (wo.status or '').upper()
-                                if status_upper not in ('ACKED', 'SIMULATED'):
-                                    logger.info(json_msg({
-                                        "event": "skip_pending_ack",
-                                        "market": m,
-                                        "side": "BID",
-                                        "status": wo.status,
-                                        "client_order_id": wo.client_order_id,
-                                    }))
-                                    need_replace = False
-                                else:
-                                    # Check if price/size changed
-                                    # Apply min_reprice_ticks threshold in cents (1 tick = 1 cent)
-                                    min_reprice_cents = int(self.config.min_reprice_ticks)
-                                    # Clamp to a sane range so misconfigured values (e.g. 100) don't freeze quotes
-                                    if min_reprice_cents < 0:
-                                        min_reprice_cents = 0
-                                    elif min_reprice_cents > 50:
-                                        min_reprice_cents = 50
-                                    price_diff = abs(new_price_cents - wo.price_cents)
-                                    
-                                    if int(wo.size) != int(target.bid_sz):
-                                        # Size changed: always reprice
-                                        need_replace = True
-                                    elif price_diff >= min_reprice_cents:
-                                        # Price moved enough: reprice
-                                        need_replace = True
-                                    else:
-                                        # Same price/size or tiny move: no-op, don't cancel/replace
-                                        logger.info(json_msg({
-                                            "event": "skip_same_quote",
-                                            "market": m,
-                                            "side": "BID",
-                                            "old_price_cents": wo.price_cents,
-                                            "new_price_cents": new_price_cents,
-                                            "price_diff_cents": price_diff,
-                                            "min_reprice_cents": min_reprice_cents,
-                                        }))
-                                        need_replace = False
+
+try:
     asyncio.get_event_loop()
 except RuntimeError:
     try:
