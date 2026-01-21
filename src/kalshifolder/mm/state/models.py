@@ -15,6 +15,7 @@ class WorkingOrder:
     last_update_ts_ms: Optional[int] = None
     api_side: str = 'yes'  # 'yes' or 'no'
     action: str = 'buy'    # 'buy' or 'sell'
+    force_refresh: bool = False  # set when auto-heal wants a fresh quote
 
 
 @dataclass

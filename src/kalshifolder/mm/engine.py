@@ -765,15 +765,16 @@ class Engine:
                         continue
                     last_update = getattr(wo, 'last_update_ts_ms', getattr(wo, 'placed_ts_ms', 0)) or 0
                     if last_update and now - last_update > stale_ms:
-                        logger.info(json_msg({
-                            "event": "working_order_stale_cleared",
-                            "market": m,
-                            "side": 'BID' if side_attr == 'working_bid' else 'ASK',
-                            "age_ms": now - last_update,
-                            "stale_ms": stale_ms,
-                            "exchange_order_id": getattr(wo, 'exchange_order_id', None),
-                        }))
-                        setattr(mr, side_attr, None)
+                        if not getattr(wo, 'force_refresh', False):
+                            logger.info(json_msg({
+                                "event": "working_order_stale_refresh",
+                                "market": m,
+                                "side": 'BID' if side_attr == 'working_bid' else 'ASK',
+                                "age_ms": now - last_update,
+                                "stale_ms": stale_ms,
+                                "exchange_order_id": getattr(wo, 'exchange_order_id', None),
+                            }))
+                        wo.force_refresh = True
             if int(now/1000) != int((getattr(mr, "_last_wo_log_ms", 0))/1000):
                 mr._last_wo_log_ms = now
                 logger.info(json_msg({"event":"md_row","market":m,"md":md}))
@@ -1336,7 +1337,12 @@ class Engine:
                                     }))
                                     need_replace = False
 
+                                if getattr(wo, 'force_refresh', False):
+                                    need_replace = True
+
                             if need_replace:
+                                if wo is not None:
+                                    wo.force_refresh = False
                                 # ensure status/exch_id are always defined (paper or live)
                                 status = 'SIMULATED' if not self.config.trading_enabled else 'PENDING'
                                 exch_id = None
@@ -1605,7 +1611,12 @@ class Engine:
                                         }))
                                         need_replace = False
 
+                                    if getattr(wo, 'force_refresh', False):
+                                        need_replace = True
+
                             if need_replace:
+                                if wo is not None:
+                                    wo.force_refresh = False
                                 # ensure status/exch_id are always defined (paper or live)
                                 status = 'SIMULATED' if not self.config.trading_enabled else 'PENDING'
                                 exch_id = None
