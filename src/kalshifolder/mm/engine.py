@@ -118,6 +118,28 @@ class Engine:
         setup_logging()
         self.ch = ClickHouseWriter(
             self.config.ch_url,
+            user=self.config.ch_user,
+            pwd=self.config.ch_pwd,
+            database=self.config.ch_db,
+        )
+        # Market data source: prefer WS for live quoting unless overridden
+        md_source = os.getenv('MM_MD_SOURCE', 'ws').lower()
+        if md_source == 'clickhouse':
+            self.md = ClickHouseMarketDataProvider(
+                self.config.ch_url,
+                user=self.config.ch_user,
+                pwd=self.config.ch_pwd,
+                db=self.config.ch_db,
+            )
+        else:
+            # default: websocket provider (instantiate lazily at run-time)
+            self.md = None
+            self._md_source = 'ws'
+        self.exec = KalshiExecutionProvider(
+            self.config.kalshi_base,
+            key_id=self.config.kalshi_key_id,
+            private_key_path=self.config.kalshi_private_key_path,
+        )
         # configure execution provider price units from config
         try:
             self.exec.set_price_units(self.config.price_units)
