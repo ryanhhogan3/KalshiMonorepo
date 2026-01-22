@@ -11,6 +11,9 @@ class MMConfig:
     loop_jitter_ms: int
     quote_refresh_ms: int
     min_reprice_ticks: int
+    min_requote_move_cents: int
+    min_requote_age_ms: int
+    max_quote_ttl_ms: int
     size: float
     edge_ticks: int
     max_pos: int
@@ -78,6 +81,9 @@ def load_config_from_env() -> MMConfig:
         loop_jitter_ms=int(os.getenv('MM_LOOP_JITTER_MS', '50')),
         quote_refresh_ms=int(os.getenv('MM_QUOTE_REFRESH_MS', '5000')),  # increased from 1000ms to 5000ms (5s) to reduce churn
         min_reprice_ticks=int(os.getenv('MM_MIN_REPRICE_TICKS', '2')),  # increased from 1 to 2 ticks (0.02) minimum repricing threshold
+        min_requote_move_cents=int(os.getenv('MM_MIN_REQUOTE_MOVE_CENTS', '2')),
+        min_requote_age_ms=int(os.getenv('MM_MIN_REQUOTE_AGE_MS', '20000')),
+        max_quote_ttl_ms=int(os.getenv('MM_MAX_QUOTE_TTL_MS', os.getenv('MM_WO_STALE_MS', '60000'))),
         size=float(os.getenv('MM_SIZE', '1')),
         edge_ticks=int(os.getenv('MM_EDGE_TICKS', '1')),
         max_pos=int(os.getenv('MM_MAX_POS', '1')),

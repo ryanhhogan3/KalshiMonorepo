@@ -101,6 +101,17 @@ def to_ms(val):
     return None
 
 
+def _to_cents(px):
+    """Convert float price (0-1) to integer cents (1-99)."""
+    if px is None:
+        return None
+    try:
+        cents = int(round(float(px) * 100))
+    except (TypeError, ValueError):
+        return None
+    return max(1, min(99, cents))
+
+
 class Engine:
     def __init__(self, config=None):
         self.config = config or load_config_from_env()
@@ -1272,6 +1283,9 @@ class Engine:
                 # Use configured quote_refresh_ms so MM_QUOTE_REFRESH_MS env is honored.
                 min_replace_ms = int(self.config.quote_refresh_ms)
                 now = now_ms()
+                min_move_cents = max(1, int(getattr(self.config, 'min_requote_move_cents', 1)))
+                min_age_ms = max(0, int(getattr(self.config, 'min_requote_age_ms', 0)))
+                max_ttl_ms = max(0, int(getattr(self.config, 'max_quote_ttl_ms', 0)))
 
                 # Helper to create deterministic client_order_id
                 # Keep it short (32 chars max) to avoid Kalshi API client_order_id constraints.
@@ -1297,35 +1311,45 @@ class Engine:
                             "reason": (bid_risk.reason if bid_risk else 'NO_RISK_PREVIEW'),
                         }))
                     else:
-                        # Check minimum replace interval
                         last_bid = getattr(mr, "last_place_bid_ms", 0) or 0
-                        if now - last_bid < min_replace_ms:
-                            logger.info(json_msg({"event": "throttle_bid", "market": m, "dt_ms": now - last_bid, "min_ms": min_replace_ms}))
+                        wo = mr.working_bid
+                        new_price_cents = _to_cents(target.bid_px)
+                        if new_price_cents is None:
+                            continue
+                        need_replace = False
+                        replace_reason = None
+                        bypass_throttle = False
+                        wo_age_ms = 0
+                        working_price_cents = wo.price_cents if wo else None
+                        working_size = wo.size if wo else None
+                        min_reprice_cents = int(self.config.min_reprice_ticks)
+                        if min_reprice_cents < 0:
+                            min_reprice_cents = 0
+                        elif min_reprice_cents > 50:
+                            min_reprice_cents = 50
+                        price_threshold = max(min_reprice_cents, min_move_cents)
+
+                        if wo is None:
+                            replace_reason = 'MISSING'
+                            bypass_throttle = True
                         else:
-                            wo = mr.working_bid
-                            new_price_cents = int(round(target.bid_px * 100))
-                            need_replace = False
-                            if wo is None:
-                                need_replace = True
+                            placed_ms = getattr(wo, 'placed_ts_ms', now) or now
+                            wo_age_ms = max(0, now - placed_ms)
+                            if getattr(wo, 'force_refresh', False):
+                                replace_reason = 'FORCE_REFRESH'
+                                bypass_throttle = True
                             else:
-                                # Check if price/size changed
-                                # Apply min_reprice_ticks threshold in cents (1 tick = 1 cent)
-                                min_reprice_cents = int(self.config.min_reprice_ticks)
-                                # Clamp to a sane range so misconfigured values (e.g. 100) don't freeze quotes
-                                if min_reprice_cents < 0:
-                                    min_reprice_cents = 0
-                                elif min_reprice_cents > 50:
-                                    min_reprice_cents = 50
                                 price_diff = abs(new_price_cents - wo.price_cents)
-                                
-                                if int(wo.size) != int(target.bid_sz):
-                                    # Size changed: always reprice
-                                    need_replace = True
-                                elif price_diff >= min_reprice_cents:
-                                    # Price moved enough: reprice
-                                    need_replace = True
+                                size_changed = int(round(wo.size)) != int(round(target.bid_sz))
+                                ttl_expired = bool(max_ttl_ms and wo_age_ms >= max_ttl_ms)
+                                if ttl_expired:
+                                    replace_reason = 'TTL_EXPIRED'
+                                    bypass_throttle = True
+                                elif size_changed:
+                                    replace_reason = 'SIZE_MOVE'
+                                elif price_diff >= price_threshold:
+                                    replace_reason = 'PRICE_MOVE'
                                 else:
-                                    # Same price/size or tiny move: no-op, don't cancel/replace
                                     logger.info(json_msg({
                                         "event": "skip_same_quote",
                                         "market": m,
@@ -1333,16 +1357,51 @@ class Engine:
                                         "old_price_cents": wo.price_cents,
                                         "new_price_cents": new_price_cents,
                                         "price_diff_cents": price_diff,
-                                        "min_reprice_cents": min_reprice_cents,
+                                        "min_reprice_cents": price_threshold,
                                     }))
-                                    need_replace = False
 
-                                if getattr(wo, 'force_refresh', False):
-                                    need_replace = True
+                                if replace_reason in ('PRICE_MOVE', 'SIZE_MOVE') and min_age_ms and wo_age_ms < min_age_ms:
+                                    logger.info(json_msg({
+                                        "event": "skip_young_order",
+                                        "market": m,
+                                        "side": "BID",
+                                        "age_ms": wo_age_ms,
+                                        "min_age_ms": min_age_ms,
+                                    }))
+                                    replace_reason = None
 
-                            if need_replace:
-                                if wo is not None:
-                                    wo.force_refresh = False
+                        refresh_elapsed = (now - last_bid) >= min_replace_ms
+                        if replace_reason:
+                            if refresh_elapsed or bypass_throttle:
+                                need_replace = True
+                                logger.info(json_msg({
+                                    "event": "quote_replace_trigger",
+                                    "market": m,
+                                    "side": "BID",
+                                    "api_side": "yes",
+                                    "reason": replace_reason,
+                                    "working_price_cents": working_price_cents,
+                                    "target_price_cents": new_price_cents,
+                                    "working_size": working_size,
+                                    "target_size": target.bid_sz,
+                                    "age_ms": wo_age_ms,
+                                    "min_replace_ms": min_replace_ms,
+                                    "refresh_elapsed": refresh_elapsed,
+                                }))
+                            else:
+                                logger.info(json_msg({
+                                    "event": "throttle_bid",
+                                    "market": m,
+                                    "dt_ms": now - last_bid,
+                                    "min_ms": min_replace_ms,
+                                    "reason": replace_reason,
+                                }))
+                        else:
+                            need_replace = False
+
+                        if need_replace:
+                            if wo is not None:
+                                wo.force_refresh = False
                                 # ensure status/exch_id are always defined (paper or live)
                                 status = 'SIMULATED' if not self.config.trading_enabled else 'PENDING'
                                 exch_id = None
@@ -1560,63 +1619,106 @@ class Engine:
                             "reason": (ask_risk.reason if ask_risk else 'NO_RISK_PREVIEW'),
                         }))
                     else:
-                        # Check minimum replace interval
                         last_ask = getattr(mr, "last_place_ask_ms", 0) or 0
-                        if now - last_ask < min_replace_ms:
-                            logger.info(json_msg({"event": "throttle_ask", "market": m, "dt_ms": now - last_ask, "min_ms": min_replace_ms}))
+                        wo = mr.working_ask
+                        new_yes_price_cents = _to_cents(target.ask_px)
+                        if new_yes_price_cents is None:
+                            continue
+                        need_replace = False
+                        replace_reason = None
+                        bypass_throttle = False
+                        wo_age_ms = 0
+                        working_price_cents = wo.price_cents if wo else None
+                        working_size = wo.size if wo else None
+                        min_reprice_cents = int(self.config.min_reprice_ticks)
+                        if min_reprice_cents < 0:
+                            min_reprice_cents = 0
+                        elif min_reprice_cents > 50:
+                            min_reprice_cents = 50
+                        price_threshold = max(min_reprice_cents, min_move_cents)
+
+                        if wo is None:
+                            replace_reason = 'MISSING'
+                            bypass_throttle = True
                         else:
-                            wo = mr.working_ask
-                            new_price_cents = int(round(target.ask_px * 100))
-                            need_replace = False
-                            if wo is None:
-                                need_replace = True
+                            status_upper = (wo.status or '').upper()
+                            placed_ms = getattr(wo, 'placed_ts_ms', now) or now
+                            wo_age_ms = max(0, now - placed_ms)
+                            if status_upper not in ('ACKED', 'SIMULATED'):
+                                logger.info(json_msg({
+                                    "event": "skip_pending_ack",
+                                    "market": m,
+                                    "side": "ASK",
+                                    "status": wo.status,
+                                    "client_order_id": wo.client_order_id,
+                                }))
+                            elif getattr(wo, 'force_refresh', False):
+                                replace_reason = 'FORCE_REFRESH'
+                                bypass_throttle = True
                             else:
-                                status_upper = (wo.status or '').upper()
-                                if status_upper not in ('ACKED', 'SIMULATED'):
+                                price_diff = abs(new_yes_price_cents - wo.price_cents)
+                                size_changed = int(round(wo.size)) != int(round(target.ask_sz))
+                                ttl_expired = bool(max_ttl_ms and wo_age_ms >= max_ttl_ms)
+                                if ttl_expired:
+                                    replace_reason = 'TTL_EXPIRED'
+                                    bypass_throttle = True
+                                elif size_changed:
+                                    replace_reason = 'SIZE_MOVE'
+                                elif price_diff >= price_threshold:
+                                    replace_reason = 'PRICE_MOVE'
+                                else:
                                     logger.info(json_msg({
-                                        "event": "skip_pending_ack",
+                                        "event": "skip_same_quote",
                                         "market": m,
                                         "side": "ASK",
-                                        "status": wo.status,
-                                        "client_order_id": wo.client_order_id,
+                                        "old_price_cents": wo.price_cents,
+                                        "new_price_cents": new_yes_price_cents,
+                                        "price_diff_cents": price_diff,
+                                        "min_reprice_cents": price_threshold,
                                     }))
-                                    need_replace = False
-                                else:
-                                    # Check if price/size changed
-                                    # Apply min_reprice_ticks threshold in cents (1 tick = 1 cent)
-                                    min_reprice_cents = int(self.config.min_reprice_ticks)
-                                    # Clamp to a sane range so misconfigured values (e.g. 100) don't freeze quotes
-                                    if min_reprice_cents < 0:
-                                        min_reprice_cents = 0
-                                    elif min_reprice_cents > 50:
-                                        min_reprice_cents = 50
-                                    price_diff = abs(new_price_cents - wo.price_cents)
-                                    
-                                    if int(wo.size) != int(target.ask_sz):
-                                        # Size changed: always reprice
-                                        need_replace = True
-                                    elif price_diff >= min_reprice_cents:
-                                        # Price moved enough: reprice
-                                        need_replace = True
-                                    else:
-                                        # Same price/size or tiny move: no-op, don't cancel/replace
-                                        logger.info(json_msg({
-                                            "event": "skip_same_quote",
-                                            "market": m,
-                                            "side": "ASK",
-                                            "old_price_cents": wo.price_cents,
-                                            "new_price_cents": new_price_cents,
-                                            "price_diff_cents": price_diff,
-                                            "min_reprice_cents": min_reprice_cents,
-                                        }))
-                                        need_replace = False
 
-                                    if getattr(wo, 'force_refresh', False):
-                                        need_replace = True
+                                if replace_reason in ('PRICE_MOVE', 'SIZE_MOVE') and min_age_ms and wo_age_ms < min_age_ms:
+                                    logger.info(json_msg({
+                                        "event": "skip_young_order",
+                                        "market": m,
+                                        "side": "ASK",
+                                        "age_ms": wo_age_ms,
+                                        "min_age_ms": min_age_ms,
+                                    }))
+                                    replace_reason = None
 
-                            if need_replace:
-                                if wo is not None:
-                                    wo.force_refresh = False
+                        refresh_elapsed = (now - last_ask) >= min_replace_ms
+                        if replace_reason:
+                            if refresh_elapsed or bypass_throttle:
+                                need_replace = True
+                                logger.info(json_msg({
+                                    "event": "quote_replace_trigger",
+                                    "market": m,
+                                    "side": "ASK",
+                                    "api_side": "no",
+                                    "reason": replace_reason,
+                                    "working_price_cents": working_price_cents,
+                                    "target_price_cents": new_yes_price_cents,
+                                    "working_size": working_size,
+                                    "target_size": target.ask_sz,
+                                    "age_ms": wo_age_ms,
+                                    "min_replace_ms": min_replace_ms,
+                                    "refresh_elapsed": refresh_elapsed,
+                                }))
+                            else:
+                                logger.info(json_msg({
+                                    "event": "throttle_ask",
+                                    "market": m,
+                                    "dt_ms": now - last_ask,
+                                    "min_ms": min_replace_ms,
+                                    "reason": replace_reason,
+                                }))
+                        else:
+                            need_replace = False
+
+                        if need_replace:
+                            if wo is not None:
+                                wo.force_refresh = False
                                 # ensure status/exch_id are always defined (paper or live)
                                 status = 'SIMULATED' if not self.config.trading_enabled else 'PENDING'
                                 exch_id = None
@@ -1693,7 +1795,7 @@ class Engine:
                                 client_order_id = make_client_id('A')
                                 # ASK side now places BUY NO (not SELL YES)
                                 # Convert YES ask price to NO bid price via complement
-                                no_price_cents = complement_100(new_price_cents)
+                                no_price_cents = complement_100(new_yes_price_cents)
                                 request_json = {
                                     "ticker": m,
                                     "client_order_id": client_order_id,
