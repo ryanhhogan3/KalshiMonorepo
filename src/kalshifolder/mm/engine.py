@@ -36,7 +36,7 @@ except RuntimeError:
     except Exception:
         pass
 else:
-    # Make get_event_loop resilient in test environments that clear the loop.
+    # Make get_event_loop resilient in test environments that clear the loop.    
     # Replace only if not already patched.
     if not hasattr(asyncio, '_orig_get_event_loop'):
         asyncio._orig_get_event_loop = asyncio.get_event_loop
@@ -118,24 +118,6 @@ class Engine:
         setup_logging()
         self.ch = ClickHouseWriter(
             self.config.ch_url,
-            user=self.config.ch_user,
-            pwd=self.config.ch_pwd,
-            database=self.config.ch_db,
-        )
-        # Market data source: prefer WS for live quoting unless overridden
-        md_source = os.getenv('MM_MD_SOURCE', 'ws').lower()
-        if md_source == 'clickhouse':
-            self.md = ClickHouseMarketDataProvider(
-                self.config.ch_url,
-                user=self.config.ch_user,
-                pwd=self.config.ch_pwd,
-                db=self.config.ch_db,
-            )
-        else:
-            # default: websocket provider (instantiate lazily at run-time)
-            self.md = None
-            self._md_source = 'ws'
-        self.exec = KalshiExecutionProvider(self.config.kalshi_base, key_id=self.config.kalshi_key_id, private_key_path=self.config.kalshi_private_key_path)
         # configure execution provider price units from config
         try:
             self.exec.set_price_units(self.config.price_units)
@@ -1479,128 +1461,128 @@ class Engine:
                                                 # after wait, clear local state to avoid blocking
                                                 mr.working_bid = None
 
-                                # place new order only when we actually need to replace
-                                action_id = uuid4_hex()
-                                client_order_id = make_client_id('B')
-                                request_json = {
-                                    "ticker": m,
-                                    "client_order_id": client_order_id,
-                                    "count": int(target.bid_sz),
-                                    "side": "yes",
-                                    "action": "buy",
-                                    "type": "limit",
-                                    "yes_price": new_price_cents,
-                                }
-                                self._log_action(action_id, decision_id, m, client_order_id, 'PLACE', 'BID', 'yes', target.bid_px, new_price_cents, target.bid_sz, replace_of=(wo.client_order_id if wo else ''), request_json=request_json)
-                                if not self.config.trading_enabled:
-                                    logger.info(json_msg({
-                                        "event": "paper_place",
-                                        "market": m,
-                                        "side": "BID",
-                                        "px_cents": int(new_price_cents),
-                                        "sz": int(target.bid_sz),
-                                    }))
-                                    mr.last_place_bid_ms = now
-                                    sim_exch = f"SIMULATED:{client_order_id}"
-                                    wo_new = WorkingOrder(
-                                        client_order_id=client_order_id,
-                                        exchange_order_id=sim_exch,
-                                        side='BID',
-                                        price_cents=new_price_cents,
-                                        size=target.bid_sz,
-                                        status='ACKED',
-                                        placed_ts_ms=now,
-                                        remaining_size=target.bid_sz,
-                                        last_update_ts_ms=now,
-                                        api_side='yes',
-                                        action='buy',
-                                    )
-                                    mr.working_bid = wo_new
-                                    last['bid_px'] = target.bid_px
-                                    last['ts_ms'] = now
-                                    try:
-                                        self.state.order_by_client_id[client_order_id] = OrderRef(market_ticker=m, internal_side='BID', decision_id=decision_id, client_order_id=client_order_id)
-                                    except Exception:
-                                        logger.exception('failed to update order registry')
-                                else:
-                                    resp = await asyncio.to_thread(
-                                        self.exec.place_order,
-                                        market_ticker=m,
-                                        side="yes",
-                                        price_cents=new_price_cents,
-                                        size=int(target.bid_sz),
-                                        client_order_id=client_order_id,
-                                        action="buy",
-                                    )
-                                    status = resp.get('status', 'ERROR')
-                                    exch_id = resp.get('exchange_order_id')
-                                    # parse reject reason for place
-                                    reject_reason = ""
-                                    try:
-                                        raw = resp.get('raw') or ''
-                                        j = json.loads(raw) if raw and raw.lstrip().startswith('{') else None
-                                        if isinstance(j, dict):
-                                            err = j.get('error') or {}
-                                            reject_reason = err.get('code') or err.get('message') or err.get('details') or ''
-                                            if err.get('details'):
-                                                reject_reason = f"{reject_reason} | {err.get('details')}"
-                                    except Exception:
-                                        reject_reason = ""
-
-                                    self._log_response(action_id, m, client_order_id, status, exch_id, reject_reason, resp.get('latency_ms', 0), resp.get('raw', ''))
-
-                                    if status != 'ACK':
-                                        if self.config.trading_enabled:
-                                            # Check circuit breaker for not_found
-                                            if self._check_and_apply_not_found_circuit_breaker(m, reject_reason, mr):
-                                                logger.warning(json_msg({"event": "place_skip_circuit_breaker_active", "market": m, "side": "BID"}))
-                                                continue
-                                            
-                                            # 2s cooldown per reject per market (tune)
-                                            mr.cooldown_until_ms = now_ms() + 2000
-                                            mr.rejects_rolling_counter += 1
-                                            logger.error(json_msg({"event":"place_reject", "market": m, "side": "BID", "reason": reject_reason, "cooldown_ms": 2000}))
-
-                                        # hard kill if reject spike enabled
-                                        if self.config.kill_on_reject_spike and mr.rejects_rolling_counter >= self.config.max_rejects_per_min:
-                                            logger.error(json_msg({"event":"reject_spike_kill", "market": m, "rejects": mr.rejects_rolling_counter}))
-                                            self._running = False
-                                        # On reject, skip updating working order and try again after cooldown
-                                        continue
-
-                                # update working order (only if ACK and we actually placed)
+                            # place new order only when we actually need to replace
+                            action_id = uuid4_hex()
+                            client_order_id = make_client_id('B')
+                            request_json = {
+                                "ticker": m,
+                                "client_order_id": client_order_id,
+                                "count": int(target.bid_sz),
+                                "side": "yes",
+                                "action": "buy",
+                                "type": "limit",
+                                "yes_price": new_price_cents,
+                            }
+                            self._log_action(action_id, decision_id, m, client_order_id, 'PLACE', 'BID', 'yes', target.bid_px, new_price_cents, target.bid_sz, replace_of=(wo.client_order_id if wo else ''), request_json=request_json)
+                            if not self.config.trading_enabled:
+                                logger.info(json_msg({
+                                    "event": "paper_place",
+                                    "market": m,
+                                    "side": "BID",
+                                    "px_cents": int(new_price_cents),
+                                    "sz": int(target.bid_sz),
+                                }))
                                 mr.last_place_bid_ms = now
-                                wo_new = None
-                                if status == 'ACK' or (not self.config.trading_enabled and status == 'SIMULATED'):
-                                    # for simulated, set exchange id to a simulated token
-                                    sim_exch = exch_id or (f"SIMULATED:{client_order_id}" if not self.config.trading_enabled else None)
-                                    wo_new = WorkingOrder(
-                                        client_order_id=client_order_id,
-                                        exchange_order_id=sim_exch,
-                                        side='BID',
-                                        price_cents=new_price_cents,
-                                        size=target.bid_sz,
-                                        status='ACKED',
-                                        placed_ts_ms=now,
-                                        remaining_size=target.bid_sz,
-                                        last_update_ts_ms=now,
-                                        api_side='yes',
-                                        action='buy',
-                                    )
-                                    mr.working_bid = wo_new
-                                    logger.info(json_msg({"event":"wo_set","market":m,"side":"BID","client_order_id":client_order_id,"exchange_order_id":sim_exch,"price_cents":new_price_cents,"size":target.bid_sz}))
-                                    last['bid_px'] = target.bid_px
-                                    last['ts_ms'] = now
-                                    # register in engine order registries
-                                    try:
-                                        if exch_id:
-                                            self.state.order_by_exchange_id[str(exch_id)] = OrderRef(market_ticker=m, internal_side='BID', decision_id=decision_id, client_order_id=client_order_id)
-                                        self.state.order_by_client_id[client_order_id] = OrderRef(market_ticker=m, internal_side='BID', decision_id=decision_id, client_order_id=client_order_id)
-                                    except Exception:
-                                        logger.exception('failed to update order registry')
-                                else:
-                                    # record rejection
-                                    mr.rejects_rolling_counter += 1
+                                sim_exch = f"SIMULATED:{client_order_id}"
+                                wo_new = WorkingOrder(
+                                    client_order_id=client_order_id,
+                                    exchange_order_id=sim_exch,
+                                    side='BID',
+                                    price_cents=new_price_cents,
+                                    size=target.bid_sz,
+                                    status='ACKED',
+                                    placed_ts_ms=now,
+                                    remaining_size=target.bid_sz,
+                                    last_update_ts_ms=now,
+                                    api_side='yes',
+                                    action='buy',
+                                )
+                                mr.working_bid = wo_new
+                                last['bid_px'] = target.bid_px
+                                last['ts_ms'] = now
+                                try:
+                                    self.state.order_by_client_id[client_order_id] = OrderRef(market_ticker=m, internal_side='BID', decision_id=decision_id, client_order_id=client_order_id)
+                                except Exception:
+                                    logger.exception('failed to update order registry')
+                            else:
+                                resp = await asyncio.to_thread(
+                                    self.exec.place_order,
+                                    market_ticker=m,
+                                    side="yes",
+                                    price_cents=new_price_cents,
+                                    size=int(target.bid_sz),
+                                    client_order_id=client_order_id,
+                                    action="buy",
+                                )
+                                status = resp.get('status', 'ERROR')
+                                exch_id = resp.get('exchange_order_id')
+                                # parse reject reason for place
+                                reject_reason = ""
+                                try:
+                                    raw = resp.get('raw') or ''
+                                    j = json.loads(raw) if raw and raw.lstrip().startswith('{') else None
+                                    if isinstance(j, dict):
+                                        err = j.get('error') or {}
+                                        reject_reason = err.get('code') or err.get('message') or err.get('details') or ''
+                                        if err.get('details'):
+                                            reject_reason = f"{reject_reason} | {err.get('details')}"
+                                except Exception:
+                                    reject_reason = ""
+
+                                self._log_response(action_id, m, client_order_id, status, exch_id, reject_reason, resp.get('latency_ms', 0), resp.get('raw', ''))
+
+                                if status != 'ACK':
+                                    if self.config.trading_enabled:
+                                        # Check circuit breaker for not_found
+                                        if self._check_and_apply_not_found_circuit_breaker(m, reject_reason, mr):
+                                            logger.warning(json_msg({"event": "place_skip_circuit_breaker_active", "market": m, "side": "BID"}))
+                                            continue
+                                        
+                                        # 2s cooldown per reject per market (tune)
+                                        mr.cooldown_until_ms = now_ms() + 2000
+                                        mr.rejects_rolling_counter += 1
+                                        logger.error(json_msg({"event":"place_reject", "market": m, "side": "BID", "reason": reject_reason, "cooldown_ms": 2000}))
+
+                                    # hard kill if reject spike enabled
+                                    if self.config.kill_on_reject_spike and mr.rejects_rolling_counter >= self.config.max_rejects_per_min:
+                                        logger.error(json_msg({"event":"reject_spike_kill", "market": m, "rejects": mr.rejects_rolling_counter}))
+                                        self._running = False
+                                    # On reject, skip updating working order and try again after cooldown
+                                    continue
+
+                            # update working order (only if ACK and we actually placed)
+                            mr.last_place_bid_ms = now
+                            wo_new = None
+                            if status == 'ACK' or (not self.config.trading_enabled and status == 'SIMULATED'):
+                                # for simulated, set exchange id to a simulated token
+                                sim_exch = exch_id or (f"SIMULATED:{client_order_id}" if not self.config.trading_enabled else None)
+                                wo_new = WorkingOrder(
+                                    client_order_id=client_order_id,
+                                    exchange_order_id=sim_exch,
+                                    side='BID',
+                                    price_cents=new_price_cents,
+                                    size=target.bid_sz,
+                                    status='ACKED',
+                                    placed_ts_ms=now,
+                                    remaining_size=target.bid_sz,
+                                    last_update_ts_ms=now,
+                                    api_side='yes',
+                                    action='buy',
+                                )
+                                mr.working_bid = wo_new
+                                logger.info(json_msg({"event":"wo_set","market":m,"side":"BID","client_order_id":client_order_id,"exchange_order_id":sim_exch,"price_cents":new_price_cents,"size":target.bid_sz}))
+                                last['bid_px'] = target.bid_px
+                                last['ts_ms'] = now
+                                # register in engine order registries
+                                try:
+                                    if exch_id:
+                                        self.state.order_by_exchange_id[str(exch_id)] = OrderRef(market_ticker=m, internal_side='BID', decision_id=decision_id, client_order_id=client_order_id)
+                                    self.state.order_by_client_id[client_order_id] = OrderRef(market_ticker=m, internal_side='BID', decision_id=decision_id, client_order_id=client_order_id)
+                                except Exception:
+                                    logger.exception('failed to update order registry')
+                            else:
+                                # record rejection
+                                mr.rejects_rolling_counter += 1
 
                 # ASK side replace semantics
                 if target.ask_px is not None:
