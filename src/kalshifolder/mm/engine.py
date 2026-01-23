@@ -7,6 +7,7 @@ import time
 import requests
 from collections import deque
 from datetime import datetime, timezone
+from threading import RLock
 from typing import Dict, List, Optional, Set
 
 from .config import load_config_from_env
@@ -21,7 +22,6 @@ from .storage.ch_writer import ClickHouseWriter
 from .utils.id import uuid4_hex
 from .utils.inventory import DEFAULT_CONVENTION, exposure_delta
 from .utils.logging import json_msg, setup_logging
-from .utils.price import complement_100
 from .utils.time import now_ms
 
 
@@ -112,10 +112,38 @@ def _to_cents(px):
     return max(1, min(99, cents))
 
 
+def compute_no_bid_px(target_yes_ask_px: Optional[float]) -> Optional[float]:
+    """Return the BUY NO price (float) that complements a YES ask quote."""
+    if target_yes_ask_px is None:
+        return None
+    try:
+        yes_px = float(target_yes_ask_px)
+    except (TypeError, ValueError):
+        return None
+    no_px = 1.0 - yes_px
+    # keep maker quotes in valid range and snap to cents for determinism
+    no_px = round(no_px, 2)
+    if no_px <= 0.0 or no_px >= 1.0:
+        return None
+    return max(0.01, min(0.99, no_px))
+
+
 class Engine:
     def __init__(self, config=None):
         self.config = config or load_config_from_env()
         setup_logging()
+        prefix = (getattr(self.config, 'client_order_prefix', 'MM') or 'MM').upper().strip()
+        self._client_id_prefix = ''.join(ch for ch in prefix if ch.isalnum())[:6] or 'MM'
+        sync_interval = getattr(self.config, 'open_order_sync_sec', 30) or 30
+        try:
+            sync_interval = int(sync_interval)
+        except Exception:
+            sync_interval = 30
+        self._open_order_sync_interval = max(15, sync_interval)
+        self._open_orders_by_market: Dict[str, Dict[str, dict]] = {}
+        self._open_orders_lock = RLock()
+        self._open_order_sync_task = None
+        self._risk_cancel_cooldown_ms = 1000
         self.ch = ClickHouseWriter(
             self.config.ch_url,
             user=self.config.ch_user,
@@ -263,6 +291,190 @@ class Engine:
             snapshot['pos_open_exposure'] += exposure_delta(remaining, api_side, wo.action)
 
         return snapshot
+
+    def _copy_open_orders_for_market(self, market: str) -> Dict[str, dict]:
+        with self._open_orders_lock:
+            market_orders = self._open_orders_by_market.get(market, {})
+            return dict(market_orders) if market_orders else {}
+
+    def _fetch_open_orders_snapshot(self, market_whitelist: Set[str]):
+        orders = self.exec.get_open_orders(limit=500)
+        grouped: Dict[str, Dict[str, dict]] = {}
+        tracked = 0
+        prefix = self._client_id_prefix
+        for order in orders or []:
+            if not isinstance(order, dict):
+                continue
+            ticker = order.get('ticker') or order.get('market_ticker')
+            if not ticker or (market_whitelist and ticker not in market_whitelist):
+                continue
+            client_id = str(order.get('client_order_id') or '')
+            if prefix and client_id and not client_id.startswith(prefix):
+                continue
+            exchange_order_id = str(order.get('order_id') or order.get('id') or order.get('orderId') or order.get('exchange_order_id') or '')
+            if not exchange_order_id:
+                continue
+            api_side = (order.get('side') or '').lower()
+            api_side = 'yes' if api_side == 'yes' else 'no'
+            internal_side = 'BID' if api_side == 'yes' else 'ASK'
+            price_field = 'yes_price' if api_side == 'yes' else 'no_price'
+            price_cents = order.get(price_field)
+            if price_cents is None:
+                price_cents = order.get('price_cents') or order.get('price')
+            try:
+                price_cents = int(round(float(price_cents))) if price_cents is not None else 0
+            except Exception:
+                price_cents = 0
+            try:
+                remaining = float(order.get('remaining_count') or order.get('count') or 0.0)
+            except Exception:
+                remaining = 0.0
+            grouped.setdefault(ticker, {})[exchange_order_id] = {
+                'client_order_id': client_id,
+                'exchange_order_id': exchange_order_id,
+                'api_side': api_side,
+                'internal_side': internal_side,
+                'price_cents': price_cents,
+                'remaining': remaining,
+                'raw': order,
+            }
+            tracked += 1
+        return grouped, len(orders or []), tracked
+
+    async def _sync_open_orders_once(self):
+        market_whitelist = set(self.market_selector.get_active_markets())
+        try:
+            grouped, fetched, tracked = await asyncio.to_thread(self._fetch_open_orders_snapshot, market_whitelist)
+        except Exception:
+            logger.exception('open_order_sync_fetch_failed')
+            return
+        with self._open_orders_lock:
+            self._open_orders_by_market = grouped
+        orphan_count = 0
+        for ticker, orders in grouped.items():
+            for exchange_order_id, info in orders.items():
+                if exchange_order_id not in self.state.order_by_exchange_id:
+                    orphan_count += 1
+                    logger.warning(json_msg({
+                        'event': 'open_order_orphan_detected',
+                        'market': ticker,
+                        'exchange_order_id': exchange_order_id,
+                        'client_order_id': info.get('client_order_id'),
+                        'api_side': info.get('api_side'),
+                    }))
+        logger.info(json_msg({
+            'event': 'open_order_sync_summary',
+            'fetched': fetched,
+            'tracked': tracked,
+            'markets': len(grouped),
+            'orphans': orphan_count,
+        }))
+
+    async def _open_order_sync_loop(self):
+        await self._sync_open_orders_once()
+        while self._running:
+            await asyncio.sleep(self._open_order_sync_interval)
+            if not self._running:
+                break
+            await self._sync_open_orders_once()
+
+    async def _risk_block_cancel_sweep(self, market: str, mr: MarketRuntimeState, block_codes: List[str], decision_id: str):
+        now_val = now_ms()
+        last_run = getattr(mr, 'last_risk_cancel_ts_ms', None)
+        if last_run and now_val - last_run < self._risk_cancel_cooldown_ms:
+            return
+        mr.last_risk_cancel_ts_ms = now_val
+
+        tracked_orders = self._copy_open_orders_for_market(market)
+        to_cancel = []
+        seen_exchange_ids: Set[str] = set()
+
+        for wo, side in [(mr.working_bid, 'BID'), (mr.working_ask, 'ASK')]:
+            if not wo or not getattr(wo, 'exchange_order_id', None):
+                continue
+            entry = {
+                'source': 'state',
+                'client_order_id': wo.client_order_id,
+                'exchange_order_id': wo.exchange_order_id,
+                'api_side': getattr(wo, 'api_side', 'yes') or ('yes' if side == 'BID' else 'no'),
+                'internal_side': side,
+                'price_cents': int(getattr(wo, 'price_cents', 0) or 0),
+                'size': float(getattr(wo, 'remaining_size', wo.size) or wo.size or 0),
+                'working_order': wo,
+            }
+            to_cancel.append(entry)
+            seen_exchange_ids.add(str(wo.exchange_order_id))
+
+        for exchange_order_id, info in tracked_orders.items():
+            if exchange_order_id in seen_exchange_ids:
+                continue
+            entry = {
+                'source': 'orphan',
+                'client_order_id': info.get('client_order_id') or f"ORPHAN_{exchange_order_id[:8]}",
+                'exchange_order_id': exchange_order_id,
+                'api_side': info.get('api_side') or 'yes',
+                'internal_side': info.get('internal_side') or ('BID' if info.get('api_side') == 'yes' else 'ASK'),
+                'price_cents': int(info.get('price_cents') or 0),
+                'size': float(info.get('remaining') or 0.0),
+                'working_order': None,
+            }
+            to_cancel.append(entry)
+
+        cancel_sent = 0
+        cancel_fail = 0
+        for entry in to_cancel:
+            ok = await self._cancel_order_entry(market, mr, entry, decision_id)
+            if ok:
+                cancel_sent += 1
+            else:
+                cancel_fail += 1
+
+        logger.info(json_msg({
+            'event': 'risk_block_cancel_sweep',
+            'market': market,
+            'block_codes': block_codes,
+            'found': len(to_cancel),
+            'cancelled': cancel_sent,
+            'failed': cancel_fail,
+        }))
+
+    async def _cancel_order_entry(self, market: str, mr: MarketRuntimeState, entry: dict, decision_id: str) -> bool:
+        exchange_order_id = entry.get('exchange_order_id')
+        if not exchange_order_id:
+            return False
+        client_order_id = entry.get('client_order_id') or f"CANCEL_{uuid4_hex()[:8]}"
+        api_side = entry.get('api_side') or 'yes'
+        internal_side = entry.get('internal_side') or ('BID' if api_side == 'yes' else 'ASK')
+        price_cents = int(entry.get('price_cents') or 0)
+        price = price_cents / 100.0 if price_cents else 0.0
+        size = float(entry.get('size') or 0.0)
+        action_id = uuid4_hex()
+        self._log_action(action_id, decision_id, market, client_order_id, 'CANCEL', internal_side, api_side, price, price_cents, size)
+
+        resp = await asyncio.to_thread(self.exec.cancel_order, exchange_order_id)
+        status = resp.get('status', 'ERROR')
+        reject_reason = ''
+        raw = resp.get('raw')
+        if status != 'ACK':
+            reject_reason = self.extract_reject_reason(raw)
+            if reject_reason and 'not_found' in reject_reason.lower():
+                status = 'ACK'
+        self._log_response(action_id, market, client_order_id, status, resp.get('exchange_order_id') or exchange_order_id, reject_reason, resp.get('latency_ms', 0), raw)
+
+        if status == 'ACK':
+            if entry.get('working_order') is mr.working_bid:
+                mr.working_bid = None
+            if entry.get('working_order') is mr.working_ask:
+                mr.working_ask = None
+            self.state.order_by_exchange_id.pop(str(exchange_order_id), None)
+            if client_order_id:
+                self.state.order_by_client_id.pop(client_order_id, None)
+            with self._open_orders_lock:
+                market_orders = self._open_orders_by_market.get(market)
+                if market_orders and exchange_order_id in market_orders:
+                    market_orders.pop(exchange_order_id, None)
+            return True
+        return False
 
     @staticmethod
     def ch_utc_now_str():
@@ -1015,9 +1227,9 @@ class Engine:
 
             # Optional inventory-aware skew: nudge quotes to favor flattening
             # exposure. Positive pos_total_est = long YES; negative = short YES.
-            # NOTE: ASK places BUY NO via complement_100, so lowering the YES ask
-            # makes the NO bid more aggressive, and raising the YES ask makes the
-            # NO bid less aggressive.
+            # NOTE: ASK places BUY NO via compute_no_bid_px, so lowering the
+            # YES ask makes the NO bid more aggressive, and raising the YES ask
+            # makes the NO bid less aggressive.
             skew_per = getattr(self.config, 'skew_per_contract_ticks', 0) or 0
             max_skew = getattr(self.config, 'max_skew_ticks', 0) or 0
             if skew_per != 0 and max_skew > 0 and inv != 0:
@@ -1119,36 +1331,36 @@ class Engine:
                 except Exception:
                     no_best_ask = None
                 if ask_px is not None:
-                    if no_best_ask is None or no_best_ask <= 0.0:
+                    no_price = compute_no_bid_px(ask_px)
+                    if no_price is None:
                         logger.debug(json_msg({
                             "event": "maker_only_disable_ask",
                             "market": m,
-                            "reason": "missing_no_best_ask",
+                            "reason": "invalid_no_price",
+                            "yes_ask": ask_px,
                         }))
                         ask_px = None
                     else:
-                        max_no_price = no_best_ask - guard_offset
-                        if max_no_price <= 0.0:
-                            logger.debug(json_msg({
-                                "event": "maker_only_disable_ask",
-                                "market": m,
-                                "reason": "no_headroom",
-                                "no_best_ask": no_best_ask,
-                                "guard_ticks": guard_ticks,
-                            }))
-                            ask_px = None
-                        else:
-                            no_price = 1.0 - ask_px
-                            if no_price >= no_best_ask or no_price > max_no_price:
-                                no_price = min(no_price, max_no_price)
-                            no_price = max(0.01, min(0.99, no_price))
-                            if no_price >= no_best_ask:
-                                no_price = max(0.01, no_best_ask - guard_offset)
-                            if no_price <= 0.0 or no_price >= 1.0:
+                        if no_best_ask is not None and no_best_ask > 0.0:
+                            max_no_price = no_best_ask - guard_offset
+                            if max_no_price <= 0.0:
+                                logger.debug(json_msg({
+                                    "event": "maker_only_disable_ask",
+                                    "market": m,
+                                    "reason": "no_headroom",
+                                    "no_best_ask": no_best_ask,
+                                    "guard_ticks": guard_ticks,
+                                }))
                                 ask_px = None
                             else:
-                                ask_px = 1.0 - no_price
-                                ask_px = max(0.01, min(0.99, ask_px))
+                                if no_price >= no_best_ask or no_price > max_no_price:
+                                    no_price = min(no_price, max_no_price)
+                                if no_price <= 0.0:
+                                    ask_px = None
+                        if ask_px is not None:
+                            no_price = max(0.01, min(0.99, no_price))
+                            ask_px = 1.0 - no_price
+                            ask_px = max(0.01, min(0.99, ask_px))
 
             # enforce non-crossing only when both sides are present
             if bid_px is not None and ask_px is not None and bid_px >= ask_px:
@@ -1253,6 +1465,7 @@ class Engine:
             )
 
             if not decision_allowed:
+                await self._risk_block_cancel_sweep(m, mr, decision_block_codes, decision_id)
                 # Hard gates (KILL_SWITCH/STALE_MARKET) still stop quoting entirely.
                 logger.info(json_msg({
                     "event": "risk_block_global",
@@ -1296,7 +1509,10 @@ class Engine:
                 # Metadata (instance, market, side, timestamp) stored in state/logs instead.
                 def make_client_id(side_char: str) -> str:
                     # Format: B_<30-char-hex> or A_<30-char-hex> = 32 chars total
-                    return f"{side_char}_{uuid4_hex()[:30]}"
+                    side_char = (side_char or 'X')[:1].upper()
+                    base = f"{self._client_id_prefix}{side_char}_"
+                    rand_len = max(1, 32 - len(base))
+                    return f"{base}{uuid4_hex()[:rand_len]}"
 
                 # BID side replace semantics
                 if target.bid_px is not None:
@@ -1625,8 +1841,14 @@ class Engine:
                     else:
                         last_ask = getattr(mr, "last_place_ask_ms", 0) or 0
                         wo = mr.working_ask
-                        new_yes_price_cents = _to_cents(target.ask_px)
-                        if new_yes_price_cents is None:
+                        no_bid_px = compute_no_bid_px(target.ask_px)
+                        no_price_cents = _to_cents(no_bid_px)
+                        if no_price_cents is None:
+                            logger.debug(json_msg({
+                                "event": "skip_invalid_no_price",
+                                "market": m,
+                                "yes_ask": target.ask_px,
+                            }))
                             continue
                         need_replace = False
                         replace_reason = None
@@ -1660,7 +1882,7 @@ class Engine:
                                 replace_reason = 'FORCE_REFRESH'
                                 bypass_throttle = True
                             else:
-                                price_diff = abs(new_yes_price_cents - wo.price_cents)
+                                price_diff = abs(no_price_cents - wo.price_cents)
                                 size_changed = int(round(wo.size)) != int(round(target.ask_sz))
                                 ttl_expired = bool(max_ttl_ms and wo_age_ms >= max_ttl_ms)
                                 if ttl_expired:
@@ -1676,7 +1898,7 @@ class Engine:
                                         "market": m,
                                         "side": "ASK",
                                         "old_price_cents": wo.price_cents,
-                                        "new_price_cents": new_yes_price_cents,
+                                        "new_price_cents": no_price_cents,
                                         "price_diff_cents": price_diff,
                                         "min_reprice_cents": price_threshold,
                                     }))
@@ -1702,7 +1924,7 @@ class Engine:
                                     "api_side": "no",
                                     "reason": replace_reason,
                                     "working_price_cents": working_price_cents,
-                                    "target_price_cents": new_yes_price_cents,
+                                    "target_price_cents": no_price_cents,
                                     "working_size": working_size,
                                     "target_size": target.ask_sz,
                                     "age_ms": wo_age_ms,
@@ -1799,7 +2021,14 @@ class Engine:
                                 client_order_id = make_client_id('A')
                                 # ASK side now places BUY NO (not SELL YES)
                                 # Convert YES ask price to NO bid price via complement
-                                no_price_cents = complement_100(new_yes_price_cents)
+                                logger.info(json_msg({
+                                    "event": "quote_place_no_bid",
+                                    "market": m,
+                                    "yes_ask_px": target.ask_px,
+                                    "no_bid_px": no_bid_px,
+                                    "no_price_cents": no_price_cents,
+                                    "size": int(target.ask_sz),
+                                }))
                                 request_json = {
                                     "ticker": m,
                                     "client_order_id": client_order_id,
@@ -1947,7 +2176,7 @@ class Engine:
             }))
             self._running = False
 
-
+    @staticmethod
     def extract_reject_reason(raw: str) -> str:
         if not raw:
             return ""
@@ -2113,6 +2342,8 @@ class Engine:
             logger.exception('failed to start market data provider')
 
         recon_task = asyncio.create_task(self.reconcile_loop())
+        open_orders_task = asyncio.create_task(self._open_order_sync_loop())
+        self._open_order_sync_task = open_orders_task
         # Periodic heartbeat to maintain and verify engine lock ownership.
         heartbeat_task = None
         if getattr(self.config, 'singleton_lock_enabled', False):
@@ -2152,6 +2383,7 @@ class Engine:
         finally:
             self._running = False
             recon_task.cancel()
+            open_orders_task.cancel()
             if heartbeat_task is not None:
                 heartbeat_task.cancel()
             # ensure provider is stopped

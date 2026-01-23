@@ -65,6 +65,7 @@ class MarketRuntimeState:
     not_found_count: int = 0
     flatten_long_active: bool = False
     flatten_short_active: bool = False
+    last_risk_cancel_ts_ms: Optional[int] = None
 
 
 @dataclass

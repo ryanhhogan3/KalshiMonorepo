@@ -69,6 +69,8 @@ class MMConfig:
     lock_ttl_sec: int = 30
     # How often (in seconds) to refresh the heartbeat.
     lock_refresh_sec: int = 10
+    open_order_sync_sec: int = 30
+    client_order_prefix: str = 'MM'
 
 
 def load_config_from_env() -> MMConfig:
@@ -118,4 +120,6 @@ def load_config_from_env() -> MMConfig:
         lock_key=os.getenv('MM_LOCK_KEY', ''),
         lock_ttl_sec=int(os.getenv('MM_LOCK_TTL_SEC', '30')),
         lock_refresh_sec=int(os.getenv('MM_LOCK_REFRESH_SEC', '10')),
+        open_order_sync_sec=int(os.getenv('MM_OPEN_ORDER_SYNC_SEC', '30')),
+        client_order_prefix=os.getenv('MM_CLIENT_ID_PREFIX', 'MM'),
     )
