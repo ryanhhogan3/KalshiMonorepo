@@ -80,7 +80,13 @@ class RiskManager:
             return RiskDecision(False, block_stage='risk', block_codes=block_codes, flatten_only=True, reason='REDUCE_ONLY_BLOCK')
 
         if abs(projected) > max_pos:
+            # If we're already over the cap, still allow "reduce-only" actions
+            # that decrease absolute exposure. This enables self-healing back
+            # under limits instead of halting quoting entirely.
+            reduce_only_ok = abs(projected) < abs(pos)
             block_codes.append('would_exceed_cap')
+            if reduce_only_ok:
+                return RiskDecision(True, block_codes=block_codes, flatten_only=True, reason='REDUCE_ONLY_OK_OVER_CAP')
             return RiskDecision(False, block_stage='risk', block_codes=block_codes, reason=f'WOULD_EXCEED_CAP pos={pos} delta={intended_delta}')
 
         return RiskDecision(True, reason='')
