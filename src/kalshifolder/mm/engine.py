@@ -1319,7 +1319,7 @@ class Engine:
                                 "original_bid": bid_px,
                                 "max_bid": max_bid_px,
                                 "pos_filled": pos_filled,
-                                "pos_open": pos_open,
+                                "pos_open_exposure": pos_open_exposure,
                                 "pos_total_est": pos_total_est,
                             }))
                         bid_px = max(0.01, min(0.99, min(bid_px, max_bid_px)))
@@ -1943,165 +1943,146 @@ class Engine:
                             need_replace = False
 
                         if need_replace:
+                            prior_client_order_id = wo.client_order_id if wo else ''
+
                             if wo is not None:
                                 wo.force_refresh = False
                                 # ensure status/exch_id are always defined (paper or live)
                                 status = 'SIMULATED' if not self.config.trading_enabled else 'PENDING'
                                 exch_id = None
 
-                                if wo is not None:
-                                    action_id = uuid4_hex()
-                                    cancel_client = wo.client_order_id
-                                    self._log_action(action_id, decision_id, m, cancel_client, 'CANCEL', 'ASK', 'no', wo.price_cents / 100.0, wo.price_cents, wo.size, replace_of='')
-                                    # simulate cancel in paper mode
-                                    if not self.config.trading_enabled:
-                                        self._log_response(action_id, m, cancel_client, 'SIMULATED', '', '', 0, json.dumps({'simulated': True}))
-                                        # In paper mode, treat cancel as immediate and clear local state
-                                        try:
-                                            wo.status = 'CANCELLED'
-                                            if getattr(wo, 'exchange_order_id', None):
-                                                self.state.order_by_exchange_id.pop(str(wo.exchange_order_id), None)
-                                            self.state.order_by_client_id.pop(getattr(wo, 'client_order_id', ''), None)
-                                        except Exception:
-                                            logger.exception('failed to cleanup registry on cancel')
+                                action_id = uuid4_hex()
+                                cancel_client = wo.client_order_id
+                                self._log_action(action_id, decision_id, m, cancel_client, 'CANCEL', 'ASK', 'no', wo.price_cents / 100.0, wo.price_cents, wo.size, replace_of='')
+                                # simulate cancel in paper mode
+                                if not self.config.trading_enabled:
+                                    self._log_response(action_id, m, cancel_client, 'SIMULATED', '', '', 0, json.dumps({'simulated': True}))
+                                    # In paper mode, treat cancel as immediate and clear local state
+                                    try:
+                                        wo.status = 'CANCELLED'
+                                        if getattr(wo, 'exchange_order_id', None):
+                                            self.state.order_by_exchange_id.pop(str(wo.exchange_order_id), None)
+                                        self.state.order_by_client_id.pop(getattr(wo, 'client_order_id', ''), None)
+                                    except Exception:
+                                        logger.exception('failed to cleanup registry on cancel')
+                                    mr.working_ask = None
+                                else:
+                                    # Use exchange_order_id only; fail loudly if missing
+                                    cancel_id = wo.exchange_order_id
+                                    if not cancel_id:
+                                        logger.error(json_msg({"event":"cancel_missing_exchange_order_id", "market": m, "client_order_id": wo.client_order_id}))
+                                        wo.status = 'PENDING_CANCEL'
                                         mr.working_ask = None
                                     else:
-                                        # Use exchange_order_id only; fail loudly if missing
-                                        cancel_id = wo.exchange_order_id
-                                        if not cancel_id:
-                                            logger.error(json_msg({"event":"cancel_missing_exchange_order_id", "market": m, "client_order_id": wo.client_order_id}))
-                                            wo.status = 'PENDING_CANCEL'
+                                        resp = await asyncio.to_thread(self.exec.cancel_order, cancel_id)
+                                        status = resp.get('status', 'ERROR')
+                                        exch_id = resp.get('exchange_order_id')
+                                        # parse reject reason for cancel
+                                        cancel_reject_reason = ""
+                                        try:
+                                            raw = resp.get('raw') or ''
+                                            j = json.loads(raw) if raw and raw.lstrip().startswith('{') else None
+                                            if isinstance(j, dict):
+                                                err = j.get('error') or {}
+                                                cancel_reject_reason = err.get('code') or err.get('message') or err.get('details') or ''
+                                                if err.get('details'):
+                                                    cancel_reject_reason = f"{cancel_reject_reason} | {err.get('details')}"
+                                        except Exception:
+                                            cancel_reject_reason = ""
+
+                                        self._log_response(action_id, m, cancel_client, status, exch_id, cancel_reject_reason, resp.get('latency_ms', 0), resp.get('raw', ''))
+                                        # Treat not_found on cancel as idempotent success: clear local state
+                                        # and do not enter cooldown or leave orders stuck pending.
+                                        if (status != 'ACK' and isinstance(cancel_reject_reason, str) and 'not_found' in cancel_reject_reason.lower()):
+                                            logger.info(json_msg({
+                                                "event": "cancel_idempotent_not_found",
+                                                "market": m,
+                                                "side": "ASK",
+                                                "exchange_order_id": cancel_id,
+                                                "reason": cancel_reject_reason,
+                                            }))
+                                            status = 'ACK'
+
+                                        if status == 'ACK' or (not self.config.trading_enabled and status == 'SIMULATED'):
+                                            wo.status = 'CANCELLED'
+                                            try:
+                                                if getattr(wo, 'exchange_order_id', None):
+                                                    self.state.order_by_exchange_id.pop(str(wo.exchange_order_id), None)
+                                                self.state.order_by_client_id.pop(getattr(wo, 'client_order_id', ''), None)
+                                            except Exception:
+                                                logger.exception('failed to cleanup registry on cancel')
                                             mr.working_ask = None
                                         else:
-                                            resp = await asyncio.to_thread(self.exec.cancel_order, cancel_id)
-                                            status = resp.get('status', 'ERROR')
-                                            exch_id = resp.get('exchange_order_id')
-                                            # parse reject reason for cancel
-                                            cancel_reject_reason = ""
-                                            try:
-                                                raw = resp.get('raw') or ''
-                                                j = json.loads(raw) if raw and raw.lstrip().startswith('{') else None
-                                                if isinstance(j, dict):
-                                                    err = j.get('error') or {}
-                                                    cancel_reject_reason = err.get('code') or err.get('message') or err.get('details') or ''
-                                                    if err.get('details'):
-                                                        cancel_reject_reason = f"{cancel_reject_reason} | {err.get('details')}"
-                                            except Exception:
-                                                cancel_reject_reason = ""
+                                            wo.status = 'PENDING_CANCEL'
+                                            await asyncio.sleep(cancel_timeout_ms / 1000.0)
+                                            mr.working_ask = None
 
-                                            self._log_response(action_id, m, cancel_client, status, exch_id, cancel_reject_reason, resp.get('latency_ms', 0), resp.get('raw', ''))
-                                            # Treat not_found on cancel as idempotent success: clear local state
-                                            # and do not enter cooldown or leave orders stuck pending.
-                                            if (status != 'ACK' and isinstance(cancel_reject_reason, str) and 'not_found' in cancel_reject_reason.lower()):
-                                                logger.info(json_msg({
-                                                    "event": "cancel_idempotent_not_found",
-                                                    "market": m,
-                                                    "side": "ASK",
-                                                    "exchange_order_id": cancel_id,
-                                                    "reason": cancel_reject_reason,
-                                                }))
-                                                status = 'ACK'
-
-                                            if status == 'ACK' or (not self.config.trading_enabled and status == 'SIMULATED'):
-                                                wo.status = 'CANCELLED'
-                                                try:
-                                                    if getattr(wo, 'exchange_order_id', None):
-                                                        self.state.order_by_exchange_id.pop(str(wo.exchange_order_id), None)
-                                                    self.state.order_by_client_id.pop(getattr(wo, 'client_order_id', ''), None)
-                                                except Exception:
-                                                    logger.exception('failed to cleanup registry on cancel')
-                                                mr.working_ask = None
-                                            else:
-                                                wo.status = 'PENDING_CANCEL'
-                                                await asyncio.sleep(cancel_timeout_ms / 1000.0)
-                                                mr.working_ask = None
-
-                                # place new order only when we actually need to replace
-                                action_id = uuid4_hex()
-                                client_order_id = make_client_id('A')
-                                # ASK side now places BUY NO (not SELL YES)
-                                # Convert YES ask price to NO bid price via complement
+                            # place new order only when we actually need to replace
+                            action_id = uuid4_hex()
+                            client_order_id = make_client_id('A')
+                            # ASK side now places BUY NO (not SELL YES)
+                            # Convert YES ask price to NO bid price via complement
+                            logger.info(json_msg({
+                                "event": "quote_place_no_bid",
+                                "market": m,
+                                "yes_ask_px": target.ask_px,
+                                "no_bid_px": no_bid_px,
+                                "no_price_cents": no_price_cents,
+                                "size": int(target.ask_sz),
+                            }))
+                            request_json = {
+                                "ticker": m,
+                                "client_order_id": client_order_id,
+                                "count": int(target.ask_sz),
+                                "side": "no",
+                                "action": "buy",
+                                "type": "limit",
+                                "no_price": no_price_cents,
+                            }
+                            self._log_action(action_id, decision_id, m, client_order_id, 'PLACE', 'ASK', 'no', no_price_cents / 100.0, no_price_cents, target.ask_sz, replace_of=prior_client_order_id, request_json=request_json)
+                            if not self.config.trading_enabled:
                                 logger.info(json_msg({
-                                    "event": "quote_place_no_bid",
+                                    "event": "paper_place",
                                     "market": m,
-                                    "yes_ask_px": target.ask_px,
-                                    "no_bid_px": no_bid_px,
-                                    "no_price_cents": no_price_cents,
-                                    "size": int(target.ask_sz),
+                                    "side": "ASK",
+                                    "px_cents": int(no_price_cents),
+                                    "sz": int(target.ask_sz),
                                 }))
-                                request_json = {
-                                    "ticker": m,
-                                    "client_order_id": client_order_id,
-                                    "count": int(target.ask_sz),
-                                    "side": "no",
-                                    "action": "buy",
-                                    "type": "limit",
-                                    "no_price": no_price_cents,
-                                }
-                                self._log_action(action_id, decision_id, m, client_order_id, 'PLACE', 'ASK', 'no', no_price_cents / 100.0, no_price_cents, target.ask_sz, replace_of=(wo.client_order_id if wo else ''), request_json=request_json)
-                                if not self.config.trading_enabled:
-                                    logger.info(json_msg({
-                                        "event": "paper_place",
-                                        "market": m,
-                                        "side": "ASK",
-                                        "px_cents": int(no_price_cents),
-                                        "sz": int(target.ask_sz),
-                                    }))
-                                    mr.last_place_ask_ms = now
-                                    sim_exch = f"SIMULATED:{client_order_id}"
-                                    wo_new = WorkingOrder(
-                                        client_order_id=client_order_id,
-                                        exchange_order_id=sim_exch,
-                                        side='ASK',
-                                        price_cents=no_price_cents,
-                                        size=target.ask_sz,
-                                        status='ACKED',
-                                        placed_ts_ms=now,
-                                        remaining_size=target.ask_sz,
-                                        last_update_ts_ms=now,
-                                        api_side='no',
-                                        action='buy',
-                                    )
-                                    mr.working_ask = wo_new
-                                    last['ask_px'] = target.ask_px
-                                    last['ts_ms'] = now
-                                    try:
-                                        self.state.order_by_client_id[client_order_id] = OrderRef(market_ticker=m, internal_side='ASK', decision_id=decision_id, client_order_id=client_order_id)
-                                    except Exception:
-                                        logger.exception('failed to update order registry')
-                                else:
-                                    resp = await asyncio.to_thread(
-                                        self.exec.place_order,
-                                        market_ticker=m,
-                                        side="no",
-                                        price_cents=no_price_cents,
-                                        size=int(target.ask_sz),
-                                        client_order_id=client_order_id,
-                                        action="buy",
-                                    )
-                                    status = resp.get('status', 'ERROR')
-                                    exch_id = resp.get('exchange_order_id')
-                                    # parse reject reason for place
+                                status = 'SIMULATED'
+                                exch_id = ''
+                            else:
+                                resp = await asyncio.to_thread(
+                                    self.exec.place_order,
+                                    market_ticker=m,
+                                    side="no",
+                                    price_cents=no_price_cents,
+                                    size=int(target.ask_sz),
+                                    client_order_id=client_order_id,
+                                    action="buy",
+                                )
+                                status = resp.get('status', 'ERROR')
+                                exch_id = resp.get('exchange_order_id')
+                                # parse reject reason for place
+                                reject_reason = ""
+                                try:
+                                    raw = resp.get('raw') or ''
+                                    j = json.loads(raw) if raw and raw.lstrip().startswith('{') else None
+                                    if isinstance(j, dict):
+                                        err = j.get('error') or {}
+                                        reject_reason = err.get('code') or err.get('message') or err.get('details') or ''
+                                        if err.get('details'):
+                                            reject_reason = f"{reject_reason} | {err.get('details')}"
+                                except Exception:
                                     reject_reason = ""
-                                    try:
-                                        raw = resp.get('raw') or ''
-                                        j = json.loads(raw) if raw and raw.lstrip().startswith('{') else None
-                                        if isinstance(j, dict):
-                                            err = j.get('error') or {}
-                                            reject_reason = err.get('code') or err.get('message') or err.get('details') or ''
-                                            if err.get('details'):
-                                                reject_reason = f"{reject_reason} | {err.get('details')}"
-                                    except Exception:
-                                        reject_reason = ""
 
-                                    self._log_response(action_id, m, client_order_id, status, exch_id, reject_reason, resp.get('latency_ms', 0), resp.get('raw', ''))
-                                    
-                                    if status != 'ACK':
-                                        if self.config.trading_enabled:
-                                            # Check circuit breaker for not_found
-                                            if self._check_and_apply_not_found_circuit_breaker(m, reject_reason, mr):
-                                                logger.warning(json_msg({"event": "place_skip_circuit_breaker_active", "market": m, "side": "ASK"}))
-                                                continue
+                                self._log_response(action_id, m, client_order_id, status, exch_id, reject_reason, resp.get('latency_ms', 0), resp.get('raw', ''))
+
+                                if status != 'ACK':
+                                    if self.config.trading_enabled:
+                                        # Check circuit breaker for not_found
+                                        if self._check_and_apply_not_found_circuit_breaker(m, reject_reason, mr):
+                                            logger.warning(json_msg({"event": "place_skip_circuit_breaker_active", "market": m, "side": "ASK"}))
+                                            continue
                                             
                                             # 2s cooldown per reject per market (tune)
                                             mr.cooldown_until_ms = now_ms() + 2000
@@ -2120,13 +2101,13 @@ class Engine:
                                                 "why": "trading_disabled",
                                             }))
 
-                                        # do NOT attempt next cycle until cooldown expires
-                                        continue
+                                    # do NOT attempt next cycle until cooldown expires
+                                    continue
 
-                                # update working order (only if ACK and we actually placed)
-                                mr.last_place_ask_ms = now
-                                wo_new = None
-                                if status == 'ACK' or (not self.config.trading_enabled and status == 'SIMULATED'):
+                            # update working order (only if ACK and we actually placed)
+                            mr.last_place_ask_ms = now
+                            wo_new = None
+                            if status == 'ACK' or (not self.config.trading_enabled and status == 'SIMULATED'):
                                     # for simulated, set exchange id to a simulated token
                                     sim_exch = exch_id or (f"SIMULATED:{client_order_id}" if not self.config.trading_enabled else None)
                                     wo_new = WorkingOrder(
@@ -2153,8 +2134,8 @@ class Engine:
                                         self.state.order_by_client_id[client_order_id] = OrderRef(market_ticker=m, internal_side='ASK', decision_id=decision_id, client_order_id=client_order_id)
                                     except Exception:
                                         logger.exception('failed to update order registry')
-                                else:
-                                    mr.rejects_rolling_counter += 1
+                            else:
+                                mr.rejects_rolling_counter += 1
 
     
     def _record_reject_and_maybe_kill(self):
