@@ -1551,7 +1551,10 @@ class Engine:
 
                         if wo is None:
                             replace_reason = 'MISSING'
-                            bypass_throttle = True
+                            # Do not bypass throttle on MISSING: if an order just
+                            # filled immediately, bypassing here can cause a rapid
+                            # sequence of new orders (multiple per second).
+                            bypass_throttle = False
                         else:
                             placed_ms = getattr(wo, 'placed_ts_ms', now) or now
                             wo_age_ms = max(0, now - placed_ms)
@@ -1865,7 +1868,10 @@ class Engine:
 
                         if wo is None:
                             replace_reason = 'MISSING'
-                            bypass_throttle = True
+                            # Do not bypass throttle on MISSING: if an order just
+                            # filled immediately, bypassing here can cause a rapid
+                            # sequence of new orders (multiple per second).
+                            bypass_throttle = False
                         else:
                             status_upper = (wo.status or '').upper()
                             placed_ms = getattr(wo, 'placed_ts_ms', now) or now
@@ -2083,23 +2089,23 @@ class Engine:
                                         if self._check_and_apply_not_found_circuit_breaker(m, reject_reason, mr):
                                             logger.warning(json_msg({"event": "place_skip_circuit_breaker_active", "market": m, "side": "ASK"}))
                                             continue
-                                            
-                                            # 2s cooldown per reject per market (tune)
-                                            mr.cooldown_until_ms = now_ms() + 2000
-                                            mr.rejects_rolling_counter += 1
-                                            logger.error(json_msg({"event":"place_reject", "market": m, "side": "ASK", "reason": reject_reason, "cooldown_ms": 2000}))
 
-                                            # hard kill if reject spike enabled
-                                            if self.config.kill_on_reject_spike and mr.rejects_rolling_counter >= self.config.max_rejects_per_min:
-                                                logger.error(json_msg({"event":"reject_spike_kill", "market": m, "rejects": mr.rejects_rolling_counter}))
-                                                self._running = False
-                                        else:
-                                            logger.info(json_msg({
-                                                "event": "paper_place_skip_reject_accounting",
-                                                "market": m,
-                                                "side": "ASK",
-                                                "why": "trading_disabled",
-                                            }))
+                                        # 2s cooldown per reject per market (tune)
+                                        mr.cooldown_until_ms = now_ms() + 2000
+                                        mr.rejects_rolling_counter += 1
+                                        logger.error(json_msg({"event":"place_reject", "market": m, "side": "ASK", "reason": reject_reason, "cooldown_ms": 2000}))
+
+                                        # hard kill if reject spike enabled
+                                        if self.config.kill_on_reject_spike and mr.rejects_rolling_counter >= self.config.max_rejects_per_min:
+                                            logger.error(json_msg({"event":"reject_spike_kill", "market": m, "rejects": mr.rejects_rolling_counter}))
+                                            self._running = False
+                                    else:
+                                        logger.info(json_msg({
+                                            "event": "paper_place_skip_reject_accounting",
+                                            "market": m,
+                                            "side": "ASK",
+                                            "why": "trading_disabled",
+                                        }))
 
                                     # do NOT attempt next cycle until cooldown expires
                                     continue
