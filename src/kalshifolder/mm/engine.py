@@ -2178,6 +2178,29 @@ class Engine:
     async def run(self):
         self._running = True
         await self.ensure_schema()
+        # Log key runtime config at startup for ops debugging.
+        try:
+            logger.info(json_msg({
+                "event": "engine_config",
+                "trading_enabled": bool(getattr(self.config, 'trading_enabled', False)),
+                "md_source": getattr(self, '_md_source', None),
+                "maker_only_mode": bool(getattr(self.config, 'maker_only_mode', False)),
+                "maker_only_guard_ticks": int(getattr(self.config, 'maker_only_guard_ticks', 0) or 0),
+                "kill_on_stale": bool(getattr(self.config, 'kill_on_stale', False)),
+                "max_level_age_ms": int(getattr(self.config, 'max_level_age_ms', 0) or 0),
+                "poll_ms": int(getattr(self.config, 'poll_ms', 0) or 0),
+                "quote_refresh_ms": int(getattr(self.config, 'quote_refresh_ms', 0) or 0),
+                "kill_on_reject_spike": bool(getattr(self.config, 'kill_on_reject_spike', False)),
+                "max_rejects_per_min": int(getattr(self.config, 'max_rejects_per_min', 0) or 0),
+                "singleton_lock_enabled": bool(getattr(self.config, 'singleton_lock_enabled', False)),
+                "lock_key": getattr(self.config, 'lock_key', ''),
+                "lock_ttl_sec": int(getattr(self.config, 'lock_ttl_sec', 0) or 0),
+                "lock_refresh_sec": int(getattr(self.config, 'lock_refresh_sec', 0) or 0),
+                "open_order_sync_sec": int(getattr(self.config, 'open_order_sync_sec', 0) or 0),
+                "client_order_prefix": getattr(self.config, 'client_order_prefix', ''),
+            }))
+        except Exception:
+            logger.exception('engine_config_log_failed')
         # log latest_levels freshness to detect mismatched streamer writes
         # ---- trading preflight ----
         API_PREFIX = "/trade-api/v2"
