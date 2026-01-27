@@ -168,6 +168,14 @@ class Engine:
             key_id=self.config.kalshi_key_id,
             private_key_path=self.config.kalshi_private_key_path,
         )
+        # Latest balance snapshot (cents). Used to avoid draining cash.
+        self.last_balance_cents: Optional[int] = None
+        self._last_balance_check_ms: int = 0
+        # How frequently to refresh balance when trading is enabled.
+        try:
+            self._balance_refresh_ms = max(1000, int(float(os.getenv('MM_BALANCE_REFRESH_SEC', '10'))) * 1000)
+        except Exception:
+            self._balance_refresh_ms = 10_000
         # configure execution provider price units from config
         try:
             self.exec.set_price_units(self.config.price_units)
@@ -215,6 +223,52 @@ class Engine:
         # Precompute lock key once config is fully loaded
         if getattr(self.config, 'singleton_lock_enabled', False):
             self._lock_key = self._build_lock_key()
+
+    def _fetch_balance_cents(self) -> Optional[int]:
+        """Fetch account balance (cents) from Kalshi. Best-effort; returns None on failure."""
+        try:
+            API_PREFIX = "/trade-api/v2"
+            path = f"{API_PREFIX}/portfolio/balance"
+            r = requests.get(
+                self.exec.base_url + path,
+                headers=self.exec._signed_headers("GET", path, ""),
+                timeout=10,
+            )
+            if r.status_code != 200:
+                return None
+            j = r.json() if r.text else {}
+            bal = j.get("balance")
+            if bal is None:
+                return None
+            return int(bal)
+        except Exception:
+            return None
+
+    async def _refresh_balance_if_due(self) -> None:
+        """Refresh balance snapshot periodically when trading is enabled."""
+        if not getattr(self.config, 'trading_enabled', False):
+            return
+        now_val = now_ms()
+        if self._last_balance_check_ms and (now_val - self._last_balance_check_ms) < self._balance_refresh_ms:
+            return
+        self._last_balance_check_ms = now_val
+        bal = await asyncio.to_thread(self._fetch_balance_cents)
+        if bal is not None:
+            self.last_balance_cents = bal
+
+    def _cash_reserve_allows(self, *, order_cost_cents: int) -> bool:
+        """True iff placing an order with this cost keeps us above reserve."""
+        try:
+            min_bal = int(os.getenv("MM_MIN_BALANCE_CENTS", "100"))
+        except Exception:
+            min_bal = 100
+        if self.last_balance_cents is None:
+            return False
+        try:
+            cost = int(order_cost_cents or 0)
+        except Exception:
+            cost = 0
+        return (self.last_balance_cents - cost) >= min_bal
 
     def _get_exchange_pos_by_ticker(self) -> dict:
         """Fetch current positions from exchange and return as dict keyed by ticker."""
@@ -291,6 +345,46 @@ class Engine:
             snapshot['pos_open_exposure'] += exposure_delta(remaining, api_side, wo.action)
 
         return snapshot
+
+    @staticmethod
+    def _get_recent_place_hold_ms(default_ms: int) -> int:
+        """How long to reserve placed exposure deltas before reconciliation catches up."""
+        raw = os.getenv('MM_RECENT_PLACE_HOLD_MS', '')
+        if not raw:
+            return max(0, int(default_ms or 0))
+        try:
+            return max(0, int(float(raw)))
+        except Exception:
+            return max(0, int(default_ms or 0))
+
+    def _recent_place_delta(self, mr: MarketRuntimeState, now_val_ms: int, hold_ms: int) -> float:
+        if hold_ms <= 0:
+            return 0.0
+        dq = getattr(mr, '_recent_place_deltas', None)
+        if dq is None:
+            dq = deque()
+            setattr(mr, '_recent_place_deltas', dq)
+        cutoff = now_val_ms - hold_ms
+        try:
+            while dq and dq[0][0] < cutoff:
+                dq.popleft()
+        except Exception:
+            # if malformed, reset
+            dq.clear()
+        total = 0.0
+        for _, delta in dq:
+            try:
+                total += float(delta)
+            except Exception:
+                continue
+        return total
+
+    def _record_recent_place(self, mr: MarketRuntimeState, now_val_ms: int, delta: float) -> None:
+        dq = getattr(mr, '_recent_place_deltas', None)
+        if dq is None:
+            dq = deque()
+            setattr(mr, '_recent_place_deltas', dq)
+        dq.append((int(now_val_ms), float(delta)))
 
     def _copy_open_orders_for_market(self, market: str) -> Dict[str, dict]:
         with self._open_orders_lock:
@@ -931,6 +1025,12 @@ class Engine:
                     logger.error(json_msg({"event": "market_added_ws_subscribe_failed", "market": m, "error": str(e)}))
 
     async def run_once(self):
+        # Keep an up-to-date balance snapshot so we can stop adding risk before
+        # draining cash and tripping the startup balance preflight on restart.
+        try:
+            await self._refresh_balance_if_due()
+        except Exception:
+            pass
         # Hot-reload: check for market set changes
         active_markets = self.market_selector.get_active_markets()
         if active_markets != self._last_active_markets:
@@ -1113,7 +1213,16 @@ class Engine:
 
             open_snapshot = self._compute_open_orders_snapshot(mr)
             pos_open_exposure = open_snapshot.get('pos_open_exposure', 0.0)
-            pos_total_est = pos_filled + pos_open_exposure
+
+            # Conservative reserve: count recently-placed deltas for a short window,
+            # even if the exchange fill hasn't shown up in the reconciled snapshot yet.
+            # This prevents rapid accumulation when fills happen faster than reconcile.
+            default_hold_ms = max(5000, int(getattr(self.config, 'reconcile_interval_sec', 3) or 3) * 2000)
+            hold_ms = self._get_recent_place_hold_ms(default_hold_ms)
+            pos_recent_place_delta = self._recent_place_delta(mr, now, hold_ms)
+            pos_total_est = pos_filled + pos_open_exposure + pos_recent_place_delta
+
+            mr.pos_recent_place_delta = pos_recent_place_delta
 
             mr.pos_filled = pos_filled
             mr.pos_open_exposure = pos_open_exposure
@@ -1156,6 +1265,7 @@ class Engine:
                     "ask_px_cents": (mr.working_ask.price_cents if mr.working_ask else None),
                     "exchange_position": pos_filled,
                     "pos_open_exposure": pos_open_exposure,
+                    "pos_recent_place_delta": pos_recent_place_delta,
                     "pos_total_est": pos_total_est,
                     "open_orders_count": open_snapshot.get('count', 0),
                     "md_yes_bb": bb,
@@ -1420,6 +1530,7 @@ class Engine:
                 "event": "quote_eval",
                 "market": m,
                 "trading_enabled": bool(self.config.trading_enabled),
+                "balance_cents": self.last_balance_cents,
                 "md_ok": bool(mr.md_ok),
                 "kill_stale": bool(mr.kill_stale),
                 "risk_allowed": bool(decision_allowed),
@@ -1477,6 +1588,33 @@ class Engine:
                     "block_codes": decision_block_codes,
                 }))
                 continue
+
+            # Cash reserve gate: if we don't know balance or are below reserve,
+            # do not keep quoting (cancel open orders) to avoid runaway buying.
+            # This is separate from risk_allowed so you can see it explicitly.
+            if self.config.trading_enabled:
+                if self.last_balance_cents is None:
+                    await self._risk_block_cancel_sweep(m, mr, ['balance_unknown'], decision_id)
+                    logger.error(json_msg({
+                        "event": "balance_unknown_block",
+                        "market": m,
+                        "action": "cancel_and_skip",
+                    }))
+                    continue
+                try:
+                    min_bal = int(os.getenv("MM_MIN_BALANCE_CENTS", "100"))
+                except Exception:
+                    min_bal = 100
+                if self.last_balance_cents < min_bal:
+                    await self._risk_block_cancel_sweep(m, mr, ['low_balance_reserve'], decision_id)
+                    logger.error(json_msg({
+                        "event": "low_balance_reserve_block",
+                        "market": m,
+                        "balance_cents": self.last_balance_cents,
+                        "min_required_cents": min_bal,
+                        "action": "cancel_and_skip",
+                    }))
+                    continue
 
             async with self.market_locks[m]:
                 # cancellation timeout (ms)
@@ -1723,29 +1861,24 @@ class Engine:
                                     "px_cents": int(new_price_cents),
                                     "sz": int(target.bid_sz),
                                 }))
-                                mr.last_place_bid_ms = now
-                                sim_exch = f"SIMULATED:{client_order_id}"
-                                wo_new = WorkingOrder(
-                                    client_order_id=client_order_id,
-                                    exchange_order_id=sim_exch,
-                                    side='BID',
-                                    price_cents=new_price_cents,
-                                    size=target.bid_sz,
-                                    status='ACKED',
-                                    placed_ts_ms=now,
-                                    remaining_size=target.bid_sz,
-                                    last_update_ts_ms=now,
-                                    api_side='yes',
-                                    action='buy',
-                                )
-                                mr.working_bid = wo_new
-                                last['bid_px'] = target.bid_px
-                                last['ts_ms'] = now
-                                try:
-                                    self.state.order_by_client_id[client_order_id] = OrderRef(market_ticker=m, internal_side='BID', decision_id=decision_id, client_order_id=client_order_id)
-                                except Exception:
-                                    logger.exception('failed to update order registry')
+                                status = 'SIMULATED'
+                                exch_id = ''
+                                # Log a simulated response so CH joins work in paper mode.
+                                self._log_response(action_id, m, client_order_id, status, exch_id, '', 0, json.dumps({'simulated': True}))
                             else:
+                                # Cash reserve check: do not place if it would drop below reserve.
+                                # Approximate order cost as max possible cash outlay.
+                                est_cost = int(new_price_cents) * int(target.bid_sz)
+                                if not self._cash_reserve_allows(order_cost_cents=est_cost):
+                                    await self._risk_block_cancel_sweep(m, mr, ['low_balance_reserve'], decision_id)
+                                    logger.error(json_msg({
+                                        "event": "balance_block_place",
+                                        "market": m,
+                                        "side": "BID",
+                                        "balance_cents": self.last_balance_cents,
+                                        "est_cost_cents": est_cost,
+                                    }))
+                                    continue
                                 resp = await asyncio.to_thread(
                                     self.exec.place_order,
                                     market_ticker=m,
@@ -1811,6 +1944,12 @@ class Engine:
                                     action='buy',
                                 )
                                 mr.working_bid = wo_new
+                                # Reserve exposure briefly to avoid runaway buying when fills are faster
+                                # than reconciliation updates.
+                                try:
+                                    self._record_recent_place(mr, now, float(target.bid_sz))
+                                except Exception:
+                                    pass
                                 logger.info(json_msg({"event":"wo_set","market":m,"side":"BID","client_order_id":client_order_id,"exchange_order_id":sim_exch,"price_cents":new_price_cents,"size":target.bid_sz}))
                                 last['bid_px'] = target.bid_px
                                 last['ts_ms'] = now
@@ -2057,6 +2196,18 @@ class Engine:
                                 status = 'SIMULATED'
                                 exch_id = ''
                             else:
+                                # Cash reserve check: do not place if it would drop below reserve.
+                                est_cost = int(no_price_cents) * int(target.ask_sz)
+                                if not self._cash_reserve_allows(order_cost_cents=est_cost):
+                                    await self._risk_block_cancel_sweep(m, mr, ['low_balance_reserve'], decision_id)
+                                    logger.error(json_msg({
+                                        "event": "balance_block_place",
+                                        "market": m,
+                                        "side": "ASK",
+                                        "balance_cents": self.last_balance_cents,
+                                        "est_cost_cents": est_cost,
+                                    }))
+                                    continue
                                 resp = await asyncio.to_thread(
                                     self.exec.place_order,
                                     market_ticker=m,
@@ -2130,6 +2281,11 @@ class Engine:
                                         action='buy',
                                     )
                                     mr.working_ask = wo_new
+                                    # Buying NO reduces YES exposure.
+                                    try:
+                                        self._record_recent_place(mr, now, -float(target.ask_sz))
+                                    except Exception:
+                                        pass
                                     logger.info(json_msg({"event":"wo_set","market":m,"side":"ASK","client_order_id":client_order_id,"exchange_order_id":sim_exch,"price_cents":no_price_cents,"size":target.ask_sz}))
                                     last['ask_px'] = target.ask_px
                                     last['ts_ms'] = now
@@ -2241,6 +2397,12 @@ class Engine:
                 if r.status_code == 200:
                     j = r.json()
                     bal = int(j.get("balance", 0))
+                    # Seed balance snapshot for downstream cash gating.
+                    try:
+                        self.last_balance_cents = bal
+                        self._last_balance_check_ms = now_ms()
+                    except Exception:
+                        pass
                     logger.info(json_msg({"event": "balance_check", "balance_cents": bal, "min_required_cents": min_bal}))
                     if bal < min_bal:
                         logger.error("Insufficient balance for trading. Disabling trading.")

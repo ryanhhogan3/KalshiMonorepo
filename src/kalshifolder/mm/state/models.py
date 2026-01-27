@@ -42,6 +42,10 @@ class MarketRuntimeState:
     inventory: float = 0.0
     pos_filled: float = 0.0
     pos_open_exposure: float = 0.0
+    # Conservative short-term reserve of recently-placed exposure deltas.
+    # This prevents runaway accumulation when fills happen faster than
+    # reconciliation updates the filled position snapshot.
+    pos_recent_place_delta: float = 0.0
     pos_total_est: float = 0.0
     last_quote_ts_ms: Optional[int] = None
     rejects_rolling_counter: int = 0
