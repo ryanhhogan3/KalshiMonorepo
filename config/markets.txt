@@ -7,3 +7,6 @@
 
 
 # Add your markets below (one per line):
+
+# BTC Daily - verified active ticker (Jan 27, 2026)
+KXBTCD-26JAN3017-T88749.99

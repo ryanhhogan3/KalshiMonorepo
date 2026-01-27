@@ -1526,6 +1526,13 @@ class Engine:
                 }))
                 continue
 
+            md_age_ms = None
+            try:
+                if mr.last_ingest_ts_ms is not None:
+                    md_age_ms = int(now - int(mr.last_ingest_ts_ms))
+            except Exception:
+                md_age_ms = None
+
             logger.info(json_msg({
                 "event": "quote_eval",
                 "market": m,
@@ -1533,6 +1540,10 @@ class Engine:
                 "balance_cents": self.last_balance_cents,
                 "md_ok": bool(mr.md_ok),
                 "kill_stale": bool(mr.kill_stale),
+                "kill_on_stale": int(getattr(self.config, 'kill_on_stale', 1) or 0),
+                "max_level_age_ms": int(getattr(self.config, 'max_level_age_ms', 0) or 0),
+                "last_ingest_ts_ms": mr.last_ingest_ts_ms,
+                "md_age_ms": md_age_ms,
                 "risk_allowed": bool(decision_allowed),
                 "risk_reason": risk_global.reason,
                 "bb": bb,
@@ -2194,7 +2205,8 @@ class Engine:
                                     "sz": int(target.ask_sz),
                                 }))
                                 status = 'SIMULATED'
-                                exch_id = ''
+                                exch_id = f"SIMULATED:{client_order_id}"
+                                self._log_response(action_id, m, client_order_id, status, exch_id, "", 0, "SIMULATED")
                             else:
                                 # Cash reserve check: do not place if it would drop below reserve.
                                 est_cost = int(no_price_cents) * int(target.ask_sz)

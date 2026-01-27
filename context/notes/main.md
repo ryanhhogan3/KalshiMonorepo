@@ -28,6 +28,9 @@ docker restart
 1) Fast helper function (run on EC2)
 chq() { docker exec -i clickhouse clickhouse-client --query "$1"; }
 
+Windows PowerShell equivalent (local dev):
+function chq { param([string]$q) docker exec -i clickhouse clickhouse-client --query $q }
+
 
 docker exec -it clickhouse clickhouse-client   --user default --password default_password --database kalshi --query 
 
