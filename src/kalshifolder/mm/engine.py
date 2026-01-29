@@ -270,6 +270,31 @@ class Engine:
             cost = 0
         return (self.last_balance_cents - cost) >= min_bal
 
+    def _balance_allows_place(self, *, order_cost_cents: int, current_pos: float, intended_delta: float) -> bool:
+        """Allow placing if above reserve, or if the order is reduce-only and affordable.
+
+        Reserve blocks adding new risk when cash is low, but we still want to allow
+        reduce-only orders so the engine can flatten out of trouble.
+        """
+        if self.last_balance_cents is None:
+            return False
+        try:
+            cost = int(order_cost_cents or 0)
+        except Exception:
+            cost = 0
+        # Normal case: keep above reserve.
+        if self._cash_reserve_allows(order_cost_cents=cost):
+            return True
+        # Emergency case: allow reduce-only as long as we can pay the cost.
+        try:
+            pos = float(current_pos or 0.0)
+            delta = float(intended_delta or 0.0)
+        except Exception:
+            pos = 0.0
+            delta = 0.0
+        reduce_only_ok = abs(pos + delta) < abs(pos)
+        return bool(reduce_only_ok) and (self.last_balance_cents >= cost)
+
     def _get_exchange_pos_by_ticker(self) -> dict:
         """Fetch current positions from exchange and return as dict keyed by ticker."""
         try:
@@ -1880,7 +1905,14 @@ class Engine:
                                 # Cash reserve check: do not place if it would drop below reserve.
                                 # Approximate order cost as max possible cash outlay.
                                 est_cost = int(new_price_cents) * int(target.bid_sz)
-                                if not self._cash_reserve_allows(order_cost_cents=est_cost):
+                                intended_delta = float(target.bid_sz)
+                                reduce_only_ok = False
+                                try:
+                                    reduce_only_ok = abs(float(pos_total_est) + intended_delta) < abs(float(pos_total_est))
+                                except Exception:
+                                    reduce_only_ok = False
+
+                                if not self._balance_allows_place(order_cost_cents=est_cost, current_pos=pos_total_est, intended_delta=intended_delta):
                                     await self._risk_block_cancel_sweep(m, mr, ['low_balance_reserve'], decision_id)
                                     logger.error(json_msg({
                                         "event": "balance_block_place",
@@ -1888,6 +1920,7 @@ class Engine:
                                         "side": "BID",
                                         "balance_cents": self.last_balance_cents,
                                         "est_cost_cents": est_cost,
+                                        "reduce_only_ok": bool(reduce_only_ok),
                                     }))
                                     continue
                                 resp = await asyncio.to_thread(
@@ -2210,7 +2243,14 @@ class Engine:
                             else:
                                 # Cash reserve check: do not place if it would drop below reserve.
                                 est_cost = int(no_price_cents) * int(target.ask_sz)
-                                if not self._cash_reserve_allows(order_cost_cents=est_cost):
+                                intended_delta = -float(target.ask_sz)
+                                reduce_only_ok = False
+                                try:
+                                    reduce_only_ok = abs(float(pos_total_est) + intended_delta) < abs(float(pos_total_est))
+                                except Exception:
+                                    reduce_only_ok = False
+
+                                if not self._balance_allows_place(order_cost_cents=est_cost, current_pos=pos_total_est, intended_delta=intended_delta):
                                     await self._risk_block_cancel_sweep(m, mr, ['low_balance_reserve'], decision_id)
                                     logger.error(json_msg({
                                         "event": "balance_block_place",
@@ -2218,6 +2258,7 @@ class Engine:
                                         "side": "ASK",
                                         "balance_cents": self.last_balance_cents,
                                         "est_cost_cents": est_cost,
+                                        "reduce_only_ok": bool(reduce_only_ok),
                                     }))
                                     continue
                                 resp = await asyncio.to_thread(
