@@ -1,0 +1,3 @@
+# One ticker per line
+# Example:
+# KXBTCD-26JAN3017-T88749.99
